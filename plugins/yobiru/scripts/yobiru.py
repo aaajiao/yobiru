@@ -1205,7 +1205,7 @@ def cmd_codex_bridge(home, home_source, argv):
     replies = pi.add_mutually_exclusive_group()
     replies.add_argument("--allow-replies", action="store_true", help="only with the user's explicit authorization")
     replies.add_argument("--no-allow-replies", action="store_true",
-                         help="Linux: turn automatic replies off (upgrades otherwise keep the installed setting)")
+                         help="turn automatic replies off (upgrades otherwise keep the installed setting)")
     pi.add_argument("--no-start", action="store_true", help="write files only; never touch services")
     pi.add_argument("--dry-run", action="store_true", help="run all checks and print the plan only")
     pr = sub.add_parser("rollback", help="restore an installation backup (inbox and queue are kept)")
@@ -1219,8 +1219,8 @@ def cmd_codex_bridge(home, home_source, argv):
         die("host capability missing: the Codex bridge manages a macOS LaunchAgent or a Linux user systemd "
             "service; on %s use `%s wake-config --agent codex --exec ...` instead" % (sys.platform, PRODUCT), 3)
     linux = sys.platform == "linux"
-    if a.action == "install" and not linux and (a.codex_remote or a.codex_home or a.no_allow_replies):
-        die("--codex-remote, --codex-home and --no-allow-replies belong to the Linux bridge", 2)
+    if a.action == "install" and not linux and (a.codex_remote or a.codex_home):
+        die("--codex-remote and --codex-home belong to the Linux bridge", 2)
     if a.action == "install" and linux and not a.codex_remote:
         die("the Linux bridge needs --codex-remote unix:///absolute/socket: the socket of your running local Codex "
             "app-server (this plugin does not start Codex)", 2)
@@ -1281,6 +1281,11 @@ def bridge_status(home):
             db = Path(cfg.get("bridge_home") or str(home / "codex-bridge")) / "bridge.sqlite3"
         except (OSError, ValueError, AttributeError) as e:
             out["error"] = "cannot read bridge config: %s" % e
+        if isinstance(cfg, dict) and cfg.get("excluded_kinds"):
+            handler = cfg.get("excluded_kind_adapter")
+            out["kind_routing"] = {"excluded_kinds": cfg.get("excluded_kinds"),
+                                   "handler": handler[0] if isinstance(handler, list) and handler else None,
+                                   "timeout_seconds": cfg.get("excluded_kind_timeout_seconds", 60)}
         remote = cfg.get("codex_remote") if isinstance(cfg, dict) else None
         out["transport"] = "unix_socket" if remote else "codex_desktop"
         out["service"] = BRIDGE_SERVICE["linux" if remote else "darwin"]

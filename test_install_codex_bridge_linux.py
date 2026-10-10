@@ -436,6 +436,65 @@ class LinuxInstallerTests(unittest.TestCase):
         self.ok(self.install("--no-start", "--no-allow-replies"))
         self.assertFalse(self.bridge_config()["allow_replies"])
 
+    def test_customized_instructions_survive_upgrade_and_rollback(self):
+        self.ok(self.install("--no-start"))
+        local = self.home / "codex-local" / "CODEX_DISPATCHER.md"
+        self.assertEqual((INSTALLER.parent / "CODEX_DISPATCHER.md").read_bytes(), local.read_bytes())
+        custom = "my own workflow, edited by the user\n".encode()
+        local.write_bytes(custom)
+        source = self.root / "source v2"
+        source.mkdir()
+        for name in ("install_codex_bridge_linux.py", "install_codex_bridge.py", "codex_bridge.py",
+                     "codex_queue_client.py", "CODEX_DISPATCHER.md"):
+            shutil.copy2(str(INSTALLER.parent / name), str(source / name))
+        with open(str(source / "CODEX_DISPATCHER.md"), "a") as f:
+            f.write("\nnew template paragraph\n")
+        with open(str(source / "codex_bridge.py"), "a") as f:
+            f.write("# version two\n")
+        env = {"HOME": str(self.user), "PATH": str(self.fakes) + ":/usr/bin:/bin"}
+        base = [sys.executable, str(source / "install_codex_bridge_linux.py"), "--tailmsg-home", str(self.home),
+                "--thread-id", self.thread, "--codex-remote", self.remote, "--no-start"]
+        plan = self.ok(subprocess.run(base + ["--dry-run"], env=env, capture_output=True, text=True))
+        self.assertTrue(any("kept the installed dispatcher instructions" in n for n in plan["notes"]))
+        upgrade = self.ok(subprocess.run(base, env=env, capture_output=True, text=True))
+        self.assertEqual(custom, local.read_bytes())
+        self.assertTrue((self.home / "codex-local/codex_bridge.py").read_text().endswith("# version two\n"))
+        receipt = json.loads((self.home / "codex-bridge" / "installation.json").read_text())
+        self.assertEqual(hashlib.sha256(custom).hexdigest(), receipt["files_sha256"]["CODEX_DISPATCHER.md"])
+        self.ok(self.run_installer("--rollback", upgrade["backup"], "--no-start"))
+        self.assertEqual(custom, local.read_bytes())
+        self.assertFalse((self.home / "codex-local/codex_bridge.py").read_text().endswith("# version two\n"))
+
+    def test_upgrade_preserves_routing_and_tuning_and_validates_them(self):
+        self.ok(self.install("--no-start"))
+        handler = self.fakes / "handler"
+        handler.write_text("#!/bin/sh\nexit 0\n")
+        handler.chmod(0o755)
+        custom = {"excluded_kinds": ["routed-kind"], "excluded_kind_adapter": [str(handler), "--fixed"],
+                  "excluded_kind_timeout_seconds": 20, "poll_seconds": 5,
+                  "dispatcher_instructions": str(self.user / "my instructions.md")}
+        path = self.home / "codex-bridge.json"
+        config = json.loads(path.read_text())
+        config.update(custom)
+        path.write_text(json.dumps(config))
+        plan = self.ok(self.install("--dry-run"))
+        self.assertEqual((["routed-kind"], custom["dispatcher_instructions"]),
+                         (plan["excluded_kinds"], plan["dispatcher_instructions"]))
+        self.ok(self.install("--no-start"))
+        config = self.bridge_config()
+        for key, value in custom.items():
+            self.assertEqual(value, config[key], key)
+        handler.unlink()
+        plan = self.ok(self.install("--dry-run"))
+        self.assertTrue(any("excluded_kind_adapter" in note for note in plan["notes"]))
+        config["excluded_kinds"] = "routed-kind"
+        path.write_text(json.dumps(config))
+        before = snapshot(self.user)
+        for extra in ("--dry-run", "--no-start"):
+            self.refused(self.install(extra), "excluded_kinds")
+        self.assertEqual(before, snapshot(self.user))
+        self.assertEqual([], self.calls())
+
     def test_default_codex_home_is_pinned_against_later_ambient_homes(self):
         default = self.user / ".codex"
         default.mkdir()

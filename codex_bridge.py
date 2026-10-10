@@ -4,6 +4,12 @@
 The inbox remains the source of truth. This program never acknowledges a message,
 executes its body, or includes the body in a Codex notification or its own state.
 An enqueued notification is not evidence that the model processed the request.
+
+Optional kind routing (config): `excluded_kinds` lists envelope kinds that never enter
+the Codex queue. A direct `wake` for such a verified, unacked, effective-`now` message
+runs the trusted local `excluded_kind_adapter` argv with only the canonical inbox path
+appended (no shell, no message text), bounded by `excluded_kind_timeout_seconds`.
+Scans, dispatch and status never run that handler; it owns its own dedup and retries.
 """
 import argparse
 import datetime
@@ -16,12 +22,18 @@ import re
 import signal
 import sqlite3
 import stat
+import subprocess
 import sys
 import time
 
 
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 REASON_RE = re.compile(r"^[a-z][a-z_]{2,39}$")
+MAX_KIND_CHARS = 32          # tailmsg's own limit for envelope kinds
+DEFAULT_HANDLER_TIMEOUT = 60  # below tailmsg's default 120 s adapter timeout
+RECEIVER_TIMEOUT = 120        # tailmsg's hook_timeout_s default for one adapter call
+RECEIVER_MARGIN = 10          # seconds kept for this process to stop the handler before the receiver kills it
+MIN_HANDLER_BUDGET = 1
 MAX_RECORD_BYTES = 1024 * 1024
 TOOL_SEND = "send_message_to_thread"
 TOOL_READ = "read_thread"
@@ -87,11 +99,34 @@ def _timestamp(value):
         raise Rejected("invalid_received_at")
 
 
+def kind_routing(config):
+    """Validated (excluded kinds, handler argv or None, timeout) or ValueError, before any side effect."""
+    kinds = config.get("excluded_kinds", [])
+    if not isinstance(kinds, list) or any(
+            not isinstance(kind, str) or not kind or len(kind) > MAX_KIND_CHARS or
+            any(ord(char) < 32 or char == "\x7f" for char in kind) for kind in kinds):
+        raise ValueError("invalid config field: excluded_kinds")
+    argv = config.get("excluded_kind_adapter")
+    if argv is not None and (not isinstance(argv, list) or not argv or any(
+            not isinstance(arg, str) or not arg or "\0" in arg for arg in argv) or not os.path.isabs(argv[0])):
+        raise ValueError("invalid config field: excluded_kind_adapter")
+    timeout = config.get("excluded_kind_timeout_seconds", DEFAULT_HANDLER_TIMEOUT)
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or \
+            not math.isfinite(timeout) or not 0 < timeout <= 300:
+        raise ValueError("invalid config field: excluded_kind_timeout_seconds")
+    return frozenset(kinds), (list(argv) if argv is not None else None), float(timeout)
+
+
 def load_config(path):
     path = Path(path).expanduser()
     config = _read_json(path)
     # The loaded file location is local provenance, never an override from its contents.
     config["bridge_config_path"] = str(path.resolve())
+    return validate_config(config)
+
+
+def validate_config(config):
+    """Check and normalize a bridge config object in place (pure; installers use it for previews)."""
     for key in ("bridge_home", "tailmsg_home", "dispatcher_thread_id"):
         if not isinstance(config.get(key), str) or not config[key]:
             raise ValueError("missing config field: " + key)
@@ -105,12 +140,14 @@ def load_config(path):
     config.setdefault("dispatcher_host_id", "local")
     if not isinstance(config["dispatcher_host_id"], str) or not config["dispatcher_host_id"]:
         raise ValueError("invalid config field: dispatcher_host_id")
+    kind_routing(config)
     return config
 
 
 class Bridge:
     def __init__(self, config, client_factory=None, clock=time.time):
         self.config = dict(config)
+        self.excluded_kinds, self.excluded_kind_adapter, self.handler_timeout = kind_routing(self.config)
         self.home = Path(config["bridge_home"]).expanduser().resolve()
         self.tailmsg_home = Path(config["tailmsg_home"]).expanduser().resolve()
         self.inbox = self.tailmsg_home / "inbox"
@@ -159,7 +196,7 @@ class Bridge:
     def _backfill_received_at(self):
         for row in self.db.execute("SELECT id,path FROM messages WHERE received_at IS NULL").fetchall():
             try:
-                _, mid, _, received_at, _ = self._record(row["path"])
+                _, mid, _, received_at, _, _ = self._record(row["path"])
                 if mid != row["id"]:
                     continue
             except (OSError, ValueError):
@@ -210,12 +247,17 @@ class Bridge:
         wake = wake_info.get("effective", "batch")
         if wake not in ("now", "batch", "none"):
             raise Rejected("invalid_wake")
-        return absolute, mid, wake, received_at, bool(record.get("acked_at"))
+        kind = env.get("kind", "text")
+        if not isinstance(kind, str) or len(kind) > MAX_KIND_CHARS:
+            raise Rejected("invalid_kind")
+        # Routing is decided only after identity, allow list, target agent and wake are verified.
+        return absolute, mid, wake, received_at, bool(record.get("acked_at")), kind in self.excluded_kinds
 
     def ingest(self, path):
-        path, mid, wake, received_at, acked = self._record(path)
-        if wake == "none" or acked:
-            return {"id": mid, "status": "skipped", "reason": "acked" if acked else "wake_none"}
+        path, mid, wake, received_at, acked, excluded = self._record(path)
+        if wake == "none" or acked or excluded:
+            reason = "acked" if acked else "wake_none" if wake == "none" else "excluded_kind"
+            return {"id": mid, "status": "skipped", "reason": reason}
         now = self.clock()
         due = now if wake == "now" else max(now, received_at + self.batch_delay_seconds)
         cursor = self.db.execute("""INSERT OR IGNORE INTO messages
@@ -224,6 +266,58 @@ class Bridge:
             (mid, str(path), wake, due, received_at, now, now, self.thread_id, self.host_id))
         self.db.commit()
         return {"id": mid, "status": "queued" if cursor.rowcount else "duplicate"}
+
+    def handler_budget(self):
+        """Seconds the handler may run: the configured limit, but always ending RECEIVER_MARGIN before the
+        receiver's own adapter timeout (hook_timeout_s), so this process outlives and stops its handler.
+        The user's config is read, never changed. None means no usable budget."""
+        try:
+            hook = _read_json(self.tailmsg_home / "config.json").get("hook_timeout_s")
+        except (OSError, ValueError):
+            return None
+        if hook is None or hook == 0:
+            hook = RECEIVER_TIMEOUT   # the receiver's own fallback for a missing or zero value
+        if isinstance(hook, bool) or not isinstance(hook, (int, float)) or not math.isfinite(hook) or hook < 0:
+            return None
+        budget = min(self.handler_timeout, hook - RECEIVER_MARGIN)
+        return budget if budget >= MIN_HANDLER_BUDGET else None
+
+    def wake(self, path):
+        """Receiver wake: queue an ordinary record, or hand an excluded kind to its trusted handler.
+
+        Returns (result, exit status). Only an unacked, effective-`now` excluded record runs the
+        handler, with the canonical inbox path as its only added argument. Once a handler has started
+        the exit status is 0 whatever it did, so the receiver never replays it; a nonzero status means
+        the handler was not started."""
+        absolute, mid, wake, _, acked, excluded = self._record(path)
+        if not excluded:
+            return self.ingest(absolute), 0
+        if acked or wake != "now" or self.excluded_kind_adapter is None:
+            reason = "acked" if acked else "wake_" + wake if wake != "now" else "excluded_kind_no_handler"
+            return {"id": mid, "status": "skipped", "reason": reason}, 0
+        budget = self.handler_budget()
+        if budget is None:
+            return {"id": mid, "status": "forward_not_started", "reason": "no_handler_time_budget"}, 1
+        try:
+            process = subprocess.Popen(self.excluded_kind_adapter + [str(absolute)], shell=False,
+                                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError:
+            return {"id": mid, "status": "forward_not_started", "reason": "handler_unavailable"}, 127
+        try:
+            code = process.wait(timeout=budget)
+        except BaseException as exc:
+            # Timeout (or this process being interrupted): stop the handler and everything it started.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            process.wait()
+            if not isinstance(exc, subprocess.TimeoutExpired):
+                raise
+            return {"id": mid, "status": "forward_timeout", "timeout_seconds": budget}, 0
+        code = code if code >= 0 else 128 - code
+        return {"id": mid, "status": "forwarded" if code == 0 else "forward_failed", "exit_code": code}, 0
 
     def scan(self):
         counts = {"queued": 0, "duplicate": 0, "skipped": 0, "rejected": 0}
@@ -312,7 +406,12 @@ class Bridge:
                 ORDER BY CASE wake WHEN 'now' THEN 0 ELSE 1 END,received_at,created_at,id""", (self.clock(),)).fetchall()
             for row in rows:
                 try:
-                    _, mid, wake, _, acked = self._record(row["path"])
+                    _, mid, wake, _, acked, excluded = self._record(row["path"])
+                    if excluded:
+                        # Routing applies to rows queued before excluded_kinds was configured, too.
+                        self._set(row["id"], "skipped", "excluded_kind")
+                        counts["skipped"] += 1
+                        continue
                     if mid != row["id"] or wake == "none" or acked:
                         self._set(row["id"], "skipped", "no_longer_pending")
                         counts["skipped"] += 1
@@ -394,7 +493,12 @@ def main(argv=None):
     try:
         bridge = Bridge(load_config(args.config))
         if args.command == "wake":
-            print(json.dumps(bridge.ingest(args.path), ensure_ascii=False))
+            result, code = bridge.wake(args.path)
+            print(json.dumps(result, ensure_ascii=False))
+            if result["status"].startswith("forward_"):
+                # Fixed status words only; the receiver keeps this line in its wake log.
+                print("codex_bridge: " + result["status"], file=sys.stderr)
+            return code
         elif args.command == "status":
             print(json.dumps(bridge.status(), ensure_ascii=False, indent=2))
         elif args.command == "scan":

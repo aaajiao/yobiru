@@ -8,11 +8,11 @@
     },
     "scripts/codex_bridge/CODEX_DISPATCHER.md": {
       "source": "CODEX_DISPATCHER.md",
-      "sha256": "1f5010aef39ad5624d4122f46262be2a3d294a3be80dceb2a09bfe64980be6ca"
+      "sha256": "718d7371cbebf8a3591eb180e00839d06f2bb6cb7b9b8ff78a7358ca52615767"
     },
     "scripts/codex_bridge/codex_bridge.py": {
       "source": "codex_bridge.py",
-      "sha256": "4e31bc6c6fb7a4f8b10b7f7c0b56bcf1679f765dec70566f3e58a3ce6c481f5c"
+      "sha256": "378420f9b0798f5bfd7a7bae8464fc6a3f31a7b65ee2a2868d87629adb96111b"
     },
     "scripts/codex_bridge/codex_queue_client.py": {
       "source": "codex_queue_client.py",
@@ -20,11 +20,11 @@
     },
     "scripts/codex_bridge/install_codex_bridge.py": {
       "source": "install_codex_bridge.py",
-      "sha256": "4d1b96339fb1c230c33b26a28e030cca842a13a2b393b75bbf5f7adda58d0b80"
+      "sha256": "beccfc340d7cca5da8b1128b62389c6f035f533637981ae25af80e84a06b01e4"
     },
     "scripts/codex_bridge/install_codex_bridge_linux.py": {
       "source": "install_codex_bridge_linux.py",
-      "sha256": "9c274dc77c02253ce6177ed53da876dab5980773a2724d2f0b86f886584fd878"
+      "sha256": "d8b2c1123b9dbcc469b326c05e3ce942e27ebd3e6dbd998d71d6298d11ca3136"
     },
     "LICENSE": {
       "source": "LICENSE",

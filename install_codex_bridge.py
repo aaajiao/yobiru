@@ -14,9 +14,63 @@ import sys
 import tempfile
 import uuid
 
+sys.dont_write_bytecode = True   # the installer may run from a plugin cache; keep it pristine
+from codex_bridge import validate_config  # noqa: E402  (sibling module, after the bytecode switch)
+
 SOURCE = Path(__file__).resolve().parent
 LABEL = "dev.tailmsg.codex-bridge"
 FILES = ("codex_bridge.py", "codex_queue_client.py", "CODEX_DISPATCHER.md")
+DEFAULT_CODEX = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
+TUNING = {"poll_seconds": 2, "batch_delay_seconds": 30, "retry_seconds": 15}
+
+
+INSTRUCTIONS = "CODEX_DISPATCHER.md"
+
+
+def install_sources(source, target, write=True):
+    """Copy the adapter files into target -> (sha256 per file, notes).
+
+    An existing local CODEX_DISPATCHER.md is kept byte for byte: it may hold the user's own workflow.
+    Only a first install copies the bundled template; template updates are reviewed and merged by hand.
+    The caller has already backed the old files up, so rollback restores exactly what was there."""
+    hashes, notes = {}, []
+    for filename in FILES:
+        path = target / filename
+        contents = (source / filename).read_bytes()
+        if filename == INSTRUCTIONS and path.is_file() and not path.is_symlink():
+            kept = path.read_bytes()
+            if kept != contents:
+                notes.append("kept the installed dispatcher instructions %s; the bundled template %s differs, "
+                             "review and merge it yourself if wanted" % (path, source / filename))
+            hashes[filename] = hashlib.sha256(kept).hexdigest()
+            continue
+        if write:
+            atomic(path, contents)
+        hashes[filename] = hashlib.sha256(contents).hexdigest()
+    return hashes, notes
+
+
+def merged_bridge_config(existing, home, state, target, thread_id, allow_replies, updates=None):
+    """The bridge config an install or upgrade writes, validated like the bridge itself loads it.
+
+    Identity fields are (re)pinned. Everything else already there survives an upgrade: tuned timing,
+    custom dispatcher instructions, kind routing (excluded_kinds, excluded_kind_adapter, ...), pinned
+    Codex settings and unknown keys. Replies keep the authorized value unless allow_replies is True or
+    False; new installs start with replies off."""
+    config = dict(existing)
+    config.update({"tailmsg_home": str(home), "bridge_home": str(state), "dispatcher_thread_id": thread_id,
+                   "dispatcher_host_id": "local", "caller_thread_id": thread_id})
+    config.setdefault("dispatcher_instructions", str(target / "CODEX_DISPATCHER.md"))
+    for key, value in TUNING.items():
+        config.setdefault(key, value)
+    config["allow_replies"] = bool(existing.get("allow_replies")) if allow_replies is None else bool(allow_replies)
+    config.update(updates or {})
+    try:
+        validate_config(dict(config))
+    except ValueError as exc:
+        raise RuntimeError("the bridge configuration would be invalid (%s); fix %s first"
+                           % (exc, home / "codex-bridge.json")) from exc
+    return config
 
 
 def atomic(path, data, mode=0o600):
@@ -80,6 +134,10 @@ def install(args):
         raise RuntimeError("a different codex wake adapter is already installed; review it first")
     state = home / "codex-bridge"
     check_queue_dispatcher(state / "bridge.sqlite3", args.thread_id)
+    codex_path = getattr(args, "codex_path", None) or existing_config.get("codex_path") or DEFAULT_CODEX
+    config = merged_bridge_config(existing_config, home, state, target, args.thread_id,
+                                  getattr(args, "allow_replies", None),
+                                  {"codex_path": str(Path(codex_path).expanduser().resolve())})
     if getattr(args, "dry_run", False):
         # Every check above has run; report the plan before the first write or service call.
         plist_path = Path.home() / "Library/LaunchAgents" / (LABEL + ".plist")
@@ -90,7 +148,10 @@ def install(args):
             "codex_wake_adapter": adapter, "existing_codex_wake_adapter": old_adapter,
             "backup_directory": str(home / "backups" / "codex-bridge-<UTC timestamp>"),
             "would_reload_services": [] if args.no_start else [LABEL, "dev.tailmsg"],
-            "allow_replies": bool(args.allow_replies)}, ensure_ascii=False, indent=2))
+            "allow_replies": config["allow_replies"], "codex_path": config["codex_path"],
+            "dispatcher_instructions": config["dispatcher_instructions"],
+            "excluded_kinds": config.get("excluded_kinds", []),
+            "notes": install_sources(SOURCE, target, write=False)[1]}, ensure_ascii=False, indent=2))
         return
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     backup = home / "backups" / ("codex-bridge-" + stamp)
@@ -113,21 +174,7 @@ def install(args):
     atomic(backup / "manifest.json", (json.dumps(manifest, indent=2) + "\n").encode())
     target.mkdir(mode=0o700, parents=True, exist_ok=True)
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
-    hashes = {}
-    for filename in FILES:
-        contents = (SOURCE / filename).read_bytes()
-        atomic(target / filename, contents)
-        hashes[filename] = hashlib.sha256(contents).hexdigest()
-    config = dict(existing_config)
-    config.update({
-        "tailmsg_home": str(home), "bridge_home": str(state),
-        "dispatcher_thread_id": args.thread_id, "dispatcher_host_id": "local",
-        "caller_thread_id": args.thread_id,
-        "dispatcher_instructions": str(target / "CODEX_DISPATCHER.md"),
-        "poll_seconds": 2, "batch_delay_seconds": 30, "retry_seconds": 15,
-        "allow_replies": bool(args.allow_replies),
-    })
-    config["codex_path"] = str(Path(args.codex_path).resolve())
+    hashes, notes = install_sources(SOURCE, target)
     atomic(config_path, (json.dumps(config, ensure_ascii=False, indent=2) + "\n").encode())
     original.setdefault("agents", {}).setdefault("codex", {})["wake_adapter"] = adapter
     atomic(original_path, (json.dumps(original, ensure_ascii=False, indent=2) + "\n").encode())
@@ -142,7 +189,7 @@ def install(args):
     atomic(plist_path, plistlib.dumps(plist))
     receipt = {"dispatcher_thread_id": args.thread_id, "host_id": "local", "installed_at": stamp,
                "source": str(SOURCE), "files_sha256": hashes, "backup": str(backup),
-               "service_label": LABEL, "allow_replies": bool(args.allow_replies)}
+               "service_label": LABEL, "allow_replies": config["allow_replies"]}
     atomic(state / "installation.json", (json.dumps(receipt, indent=2) + "\n").encode())
     if not args.no_start:
         service = "gui/%d/%s" % (os.getuid(), LABEL)
@@ -151,7 +198,7 @@ def install(args):
         subprocess.run(["launchctl", "kickstart", "-k", "gui/%d/dev.tailmsg" % os.getuid()], check=True)
     print(json.dumps({"installed": True, "started": not args.no_start,
                       "dispatcher_thread_id": args.thread_id, "backup": str(backup),
-                      "config": str(config_path)}, ensure_ascii=False))
+                      "config": str(config_path), "notes": notes}, ensure_ascii=False))
 
 
 def rollback(args):
@@ -188,8 +235,12 @@ def main():
     parser.add_argument("--thread-id", help="existing local desktop dispatcher thread UUID")
     parser.add_argument("--rollback", help="restore a specific installation backup without deleting inbox or queue")
     parser.add_argument("--tailmsg-home", default="~/.tailmsg")
-    parser.add_argument("--codex-path", default="/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex")
-    parser.add_argument("--allow-replies", action="store_true", help="enable only with user authorization")
+    parser.add_argument("--codex-path", help="Codex CLI (default: the installed value, else the Codex desktop CLI)")
+    replies = parser.add_mutually_exclusive_group()
+    replies.add_argument("--allow-replies", dest="allow_replies", action="store_true", default=None,
+                         help="enable only with user authorization")
+    replies.add_argument("--no-allow-replies", dest="allow_replies", action="store_false",
+                         help="turn automatic replies off (upgrades otherwise keep the installed setting)")
     parser.add_argument("--no-start", action="store_true", help="install without reloading either service")
     parser.add_argument("--dry-run", action="store_true",
                         help="run every check and print the planned changes without writing files or touching services")

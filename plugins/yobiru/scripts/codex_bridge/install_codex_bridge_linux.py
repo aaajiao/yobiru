@@ -14,7 +14,6 @@ sys.dont_write_bytecode = True   # the installer may run from a plugin cache; ke
 
 import argparse
 import datetime
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -24,7 +23,7 @@ import subprocess
 import uuid
 
 from codex_queue_client import CodexAppError, unix_socket_path
-from install_codex_bridge import FILES, atomic, check_queue_dispatcher
+from install_codex_bridge import FILES, atomic, check_queue_dispatcher, install_sources, merged_bridge_config
 
 SOURCE = Path(__file__).resolve().parent
 SERVICE = "tailmsg-codex-bridge.service"
@@ -244,17 +243,18 @@ def plan_install(args):
         notes.append("codex messages were woken by the top-level adapter; the bridge takes over agents.codex and "
                      "the top-level adapter stays unchanged")
     unit = unit_contents(python, script, config_path, codex_path)
-    # Replies stay as the user authorized them; new installs start with replies off.
-    allow_replies = bool(existing.get("allow_replies")) if args.allow_replies is None else args.allow_replies
-    config = dict(existing)
-    config.update({
-        "tailmsg_home": str(home), "bridge_home": str(state),
-        "dispatcher_thread_id": thread_id, "dispatcher_host_id": "local", "caller_thread_id": thread_id,
-        "dispatcher_instructions": str(home / "codex-local" / "CODEX_DISPATCHER.md"),
-        "poll_seconds": 2, "batch_delay_seconds": 30, "retry_seconds": 15,
-        "allow_replies": allow_replies, "codex_path": codex_path, "codex_remote": args.codex_remote,
-        "codex_home": codex_home,
-    })
+    # Pinned and unrelated settings survive upgrades (replies, timing, instructions, kind routing).
+    try:
+        config = merged_bridge_config(existing, home, state, home / "codex-local", thread_id, args.allow_replies,
+                                      {"codex_path": codex_path, "codex_remote": args.codex_remote,
+                                       "codex_home": codex_home})
+    except RuntimeError as exc:
+        raise InstallError(str(exc)) from exc
+    notes += install_sources(SOURCE, home / "codex-local", write=False)[1]
+    handler = config.get("excluded_kind_adapter")
+    if handler and not (os.path.isfile(handler[0]) and os.access(handler[0], os.X_OK)):
+        notes.append("excluded_kind_adapter %s is not an executable file; excluded kinds are not forwarded until "
+                     "it is" % handler[0])
     tailmsg_config.setdefault("agents", {})
     if tailmsg_config["agents"] is None:
         tailmsg_config["agents"] = {}
@@ -283,6 +283,8 @@ def install(args):
             "codex_wake_adapter": plan["adapter"], "existing_codex_wake_adapter": plan["old_adapter"],
             "backup_directory": str(home / "backups" / (BACKUP_PREFIX + "<UTC timestamp>")),
             "would_run_systemctl_user": actions, "allow_replies": plan["config"]["allow_replies"],
+            "dispatcher_instructions": plan["config"]["dispatcher_instructions"],
+            "excluded_kinds": plan["config"].get("excluded_kinds", []),
             "unit": plan["unit"].decode("utf-8"), "notes": plan["notes"]}, ensure_ascii=False, indent=2))
         return 0
     before = None
@@ -302,11 +304,7 @@ def install(args):
             entry.update(backup=name, mode=stat.S_IMODE(path.stat().st_mode))
         manifest["targets"].append(entry)
     atomic(backup / "manifest.json", (json.dumps(manifest, indent=2) + "\n").encode())
-    hashes = {}
-    for name in FILES:
-        contents = (SOURCE / name).read_bytes()
-        atomic(paths["codex-local/" + name], contents)
-        hashes[name] = hashlib.sha256(contents).hexdigest()
+    hashes, _ = install_sources(SOURCE, home / "codex-local")
     plan["state"].mkdir(mode=0o700, parents=True, exist_ok=True)
     atomic(paths["bridge-config.json"], (json.dumps(plan["config"], ensure_ascii=False, indent=2) + "\n").encode())
     config_mode = stat.S_IMODE(paths["tailmsg-config.json"].stat().st_mode)

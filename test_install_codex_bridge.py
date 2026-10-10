@@ -1,6 +1,7 @@
 """Offline installation and rollback checks; no services or real user files."""
 import argparse
 import contextlib
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -171,6 +172,78 @@ class InstallTests(unittest.TestCase):
                     self.install()
                 self.assertEqual(before, self.files())
                 self.run.assert_not_called()
+
+    def customize_bridge_config(self, **values):
+        path = self.home / "codex-bridge.json"
+        config = json.loads(path.read_text())
+        config.update(values)
+        path.write_text(json.dumps(config))
+
+    def test_upgrade_keeps_authorized_replies_custom_paths_tuning_and_routing(self):
+        self.args.allow_replies = True
+        self.install()
+        custom = {"dispatcher_instructions": str(self.root / "my instructions.md"), "codex_path": "/usr/bin/true",
+                  "poll_seconds": 5, "batch_delay_seconds": 0, "retry_seconds": 60,
+                  "excluded_kinds": ["routed-kind"], "excluded_kind_adapter": ["/usr/bin/true", "--fixed"],
+                  "excluded_kind_timeout_seconds": 20, "future_field": {"kept": True}}
+        self.customize_bridge_config(**custom)
+        self.args.allow_replies = None
+        self.args.codex_path = None
+        self.args.dry_run = True
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            installer.install(self.args)
+        plan = json.loads(out.getvalue())
+        self.assertEqual((True, "/usr/bin/true", custom["dispatcher_instructions"], ["routed-kind"]),
+                         (plan["allow_replies"], plan["codex_path"], plan["dispatcher_instructions"], plan["excluded_kinds"]))
+        self.args.dry_run = False
+        self.install()
+        config = json.loads((self.home / "codex-bridge.json").read_text())
+        for key, value in custom.items():
+            self.assertEqual(value, config[key], key)
+        self.assertTrue(config["allow_replies"])
+        self.args.allow_replies = False
+        self.install()
+        self.assertFalse(json.loads((self.home / "codex-bridge.json").read_text())["allow_replies"])
+
+    def test_customized_instructions_survive_upgrade_and_rollback(self):
+        self.install()
+        local = self.home / "codex-local/CODEX_DISPATCHER.md"
+        self.assertEqual(b"version one\n", local.read_bytes())          # first install copies the template
+        custom = "my own workflow, edited by the user\n".encode()
+        local.write_bytes(custom)
+        elsewhere = self.root / "elsewhere instructions.md"
+        elsewhere.write_bytes(b"custom path\n")
+        self.customize_bridge_config(dispatcher_instructions=str(elsewhere))
+        for name in installer.FILES:
+            (self.source / name).write_text("version two\n")
+        self.args.dry_run = True
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            installer.install(self.args)
+        self.assertTrue(any("kept the installed dispatcher instructions" in n for n in json.loads(out.getvalue())["notes"]))
+        self.args.dry_run = False
+        receipt = self.install()
+        self.assertEqual(custom, local.read_bytes())
+        self.assertEqual("version two\n", (self.home / "codex-local/codex_bridge.py").read_text())
+        self.assertEqual(hashlib.sha256(custom).hexdigest(), receipt["files_sha256"]["CODEX_DISPATCHER.md"])
+        self.assertEqual(b"custom path\n", elsewhere.read_bytes())
+        self.assertEqual(str(elsewhere), json.loads((self.home / "codex-bridge.json").read_text())["dispatcher_instructions"])
+        self.rollback(receipt["backup"])
+        self.assertEqual(custom, local.read_bytes())
+        self.assertEqual("version one\n", (self.home / "codex-local/codex_bridge.py").read_text())
+
+    def test_invalid_routing_config_is_refused_before_writes(self):
+        self.install()
+        self.customize_bridge_config(excluded_kind_adapter="not-a-list")
+        before = self.files()
+        self.run.reset_mock()
+        for dry_run in (True, False):
+            self.args.dry_run = dry_run
+            with self.assertRaisesRegex(RuntimeError, "excluded_kind_adapter"):
+                installer.install(self.args)
+        self.assertEqual(before, self.files())
+        self.run.assert_not_called()
 
 
 if __name__ == "__main__":

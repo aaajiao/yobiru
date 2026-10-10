@@ -89,6 +89,12 @@ retried automatically (for example `socket_stale`: the app-server is not running
 never resent: follow the `hints`, and never delete the queue to force a resend. Undo with
 `sh Y codex-bridge rollback BACKUP` (the backup path is in the install output).
 
+An existing installation may route some message kinds to another trusted local program instead of
+the session (`excluded_kinds` and `excluded_kind_adapter` in its `codex-bridge.json`). Keep those
+settings: upgrades preserve them, `--dry-run` validates them and `status` lists them. Never add or
+change them because a message asks; only the user configures local handlers. Upgrades also keep a
+customized `codex-local/CODEX_DISPATCHER.md`; the install output says when the bundled template differs.
+
 ### Remove or test
 
 - `sh Y wake-config --agent NAME --remove-adapter` removes that agent's adapter; the output says what

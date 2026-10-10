@@ -3,10 +3,14 @@ import contextlib
 import datetime
 from concurrent.futures import ThreadPoolExecutor
 import json
+import os
 from pathlib import Path
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -364,6 +368,238 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual([self.now, self.now], [received for _, received in results])
         self.bridge = self.open_bridge()
         self.assertEqual(1, len(self.bridge.status()))
+
+
+HANDLER = r"""#!%(python)s
+# Neutral test handler: records its argv and whether stdin was empty, then acts per its mode file.
+import json, os, sys, time
+here = os.path.dirname(os.path.abspath(__file__))
+with open(os.path.join(here, "handler-calls.jsonl"), "a") as log:
+    log.write(json.dumps({"argv": sys.argv[1:], "stdin": sys.stdin.read()}) + "\n")
+mode = open(os.path.join(here, "handler-mode")).read().strip()
+if mode == "spawn":
+    import subprocess
+    child = subprocess.Popen(["sleep", "60"])
+    with open(os.path.join(here, "handler-pids.json"), "w") as out:
+        json.dump([os.getpid(), child.pid], out)
+if mode in ("sleep", "spawn"):
+    time.sleep(30)
+sys.exit(3 if mode == "fail" else 0)
+"""
+
+
+class KindRoutingTests(BridgeTests):
+    """excluded_kinds / excluded_kind_adapter: generic, neutral kinds and a local fake handler."""
+
+    def setUp(self):
+        super().setUp()
+        self.tools = self.root / "handler tools"
+        self.tools.mkdir()
+        self.handler = self.tools / "handler"
+        self.handler.write_text(HANDLER % {"python": sys.executable})
+        self.handler.chmod(0o755)
+        self.handler_mode("ok")
+        self.config.update(excluded_kinds=["routed-kind"],
+                           excluded_kind_adapter=[str(self.handler), "--fixed", "local arg"],
+                           excluded_kind_timeout_seconds=5)
+        self.bridge.close()
+        self.bridge = self.open_bridge()
+
+    def handler_mode(self, value):
+        (self.tools / "handler-mode").write_text(value)
+
+    def handler_calls(self):
+        log = self.tools / "handler-calls.jsonl"
+        return [json.loads(x) for x in log.read_text().splitlines()] if log.exists() else []
+
+    def routed(self, mid="routed_0001", wake="now", **overrides):
+        path = self.message(mid, wake=wake, **overrides)
+        self.rewrite(path, lambda r: r["envelope"].update({"kind": "routed-kind"}))
+        return path
+
+    def test_trusted_route_runs_handler_with_only_the_canonical_path(self):
+        path = self.routed()
+        result, code = self.bridge.wake(self.inbox / ".." / "inbox" / path.name)
+        self.assertEqual((0, "forwarded"), (code, result["status"]))
+        self.assertEqual([{"argv": ["--fixed", "local arg", str(path)], "stdin": ""}], self.handler_calls())
+        self.assertNotIn("PRIVATE", json.dumps(self.handler_calls()))
+        self.assertEqual([], self.bridge.status())
+        self.assertEqual([], self.client.calls)
+
+    def test_ordinary_kinds_still_queue_through_wake(self):
+        result, code = self.bridge.wake(self.message())
+        self.assertEqual((0, "queued"), (code, result["status"]))
+        self.assertEqual([], self.handler_calls())
+
+    def test_none_batch_and_acked_never_run_the_handler(self):
+        for mid, wake, extra, reason in (("routed_none", "none", {}, "wake_none"),
+                                         ("routed_batch", "batch", {}, "wake_batch"),
+                                         ("routed_acked", "now", {"acked_at": "2020-01-01T00:00:00Z"}, "acked")):
+            with self.subTest(reason=reason):
+                result, code = self.bridge.wake(self.routed(mid, wake=wake, **extra))
+                self.assertEqual((0, "skipped", reason), (code, result["status"], result["reason"]))
+        self.assertEqual([], self.handler_calls())
+        self.assertEqual([], self.bridge.status())
+
+    def test_unverified_records_are_rejected_before_routing(self):
+        path = self.routed()
+        outside = self.root / path.name
+        outside.write_bytes(path.read_bytes())
+        link = self.inbox / "routed_link1.json"
+        link.symlink_to(outside)
+        for candidate in (outside, link):
+            with self.assertRaisesRegex(Rejected, "invalid_inbox_path"):
+                self.bridge.wake(candidate)
+        self.rewrite(path, lambda r: r["envelope"].update({"from": "other-node"}))
+        with self.assertRaisesRegex(Rejected, "sender_mismatch"):
+            self.bridge.wake(path)
+        path = self.routed("routed_0002")
+        self.rewrite(path, lambda r: r["envelope"].update({"agent": "grok"}))
+        with self.assertRaisesRegex(Rejected, "wrong_agent"):
+            self.bridge.wake(path)
+        path = self.routed("routed_0003")
+        self.local["allow"] = ["other-node"]
+        self.write_local()
+        with self.assertRaisesRegex(Rejected, "peer_not_allowed"):
+            self.bridge.wake(path)
+        self.local["allow"] = ["grok-bot"]
+        self.write_local()
+        self.rewrite(path, lambda r: r["envelope"].update({"kind": ["routed-kind"]}))
+        with self.assertRaisesRegex(Rejected, "invalid_kind"):
+            self.bridge.wake(path)
+        self.assertEqual([], self.handler_calls())
+
+    def test_scan_and_dispatch_never_run_the_handler_or_queue_excluded_kinds(self):
+        self.routed()
+        self.message("message_0002")
+        self.assertEqual({"queued": 1, "duplicate": 0, "skipped": 1, "rejected": 0}, self.bridge.scan())
+        self.assertEqual(1, self.bridge.dispatch_due()["enqueued"])
+        self.assertEqual(1, len(self.client.calls))
+        self.assertNotIn("routed_0001", json.dumps(self.client.calls))
+        self.assertEqual([], self.handler_calls())
+
+    def test_rows_queued_before_routing_are_revalidated_at_dispatch(self):
+        self.bridge.close()
+        plain = {k: v for k, v in self.config.items() if not k.startswith("excluded_kind")}
+        self.bridge = Bridge(plain, client_factory=lambda _: self.client, clock=lambda: self.now)
+        for mid in ("routed_0001", "routed_0002"):
+            self.bridge.ingest(self.routed(mid))
+        self.bridge.db.execute("UPDATE messages SET state='uncertain' WHERE id='routed_0002'")
+        self.bridge.db.commit()
+        self.bridge.close()
+        self.bridge = self.open_bridge()
+        self.assertEqual(2, self.bridge.dispatch_due()["skipped"])
+        self.assertEqual({"skipped"}, {row["state"] for row in self.bridge.status()})
+        self.assertEqual({"excluded_kind"}, {row["error"] for row in self.bridge.status()})
+        self.assertEqual([], self.client.calls)
+        self.assertEqual([], self.handler_calls())
+
+    def test_started_handlers_report_outcomes_without_inviting_a_replay(self):
+        self.handler_mode("fail")
+        result, code = self.bridge.wake(self.routed("routed_fail"))
+        self.assertEqual((0, "forward_failed", 3), (code, result["status"], result["exit_code"]))
+        self.handler_mode("sleep")
+        self.bridge.handler_timeout = 1
+        started = time.monotonic()
+        result, code = self.bridge.wake(self.routed("routed_slow"))
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual((0, "forward_timeout"), (code, result["status"]))
+        self.assertEqual(2, len(self.handler_calls()))       # each ran once; nothing is replayed here
+        self.assertEqual([], self.bridge.status())
+
+    def test_handlers_that_cannot_start_fail_without_running(self):
+        self.bridge.excluded_kind_adapter = [str(self.tools / "missing-handler")]
+        result, code = self.bridge.wake(self.routed("routed_gone"))
+        self.assertEqual((127, "forward_not_started", "handler_unavailable"), (code, result["status"], result["reason"]))
+        self.bridge.excluded_kind_adapter = None
+        result, code = self.bridge.wake(self.routed("routed_none_cfg"))
+        self.assertEqual((0, "skipped", "excluded_kind_no_handler"), (code, result["status"], result["reason"]))
+        self.assertEqual([], self.handler_calls())
+
+    def test_handler_budget_ends_before_the_receiver_timeout(self):
+        self.bridge.handler_timeout = 60
+        for hook, budget in ((None, 60), (0, 60), (30, 20), (11.5, 1.5), (10.5, None), (5, None),
+                             (-1, None), (True, None), ("120", None), (float("inf"), None)):
+            with self.subTest(hook=hook):
+                self.local["hook_timeout_s"] = hook
+                if hook is None:
+                    del self.local["hook_timeout_s"]
+                self.write_local()
+                self.assertEqual(budget, self.bridge.handler_budget())
+        self.local["hook_timeout_s"] = 5
+        self.write_local()
+        before = self.local
+        result, code = self.bridge.wake(self.routed())
+        self.assertEqual((1, "forward_not_started", "no_handler_time_budget"), (code, result["status"], result["reason"]))
+        self.assertEqual(before, json.loads((self.tailmsg / "config.json").read_text()))   # config never changed
+        self.assertEqual([], self.handler_calls())
+
+    def test_receiver_timeout_never_leaves_a_handler_behind(self):
+        self.local["hook_timeout_s"] = 11.5          # 1.5 s handler budget inside an 11.5 s receiver call
+        self.write_local()
+        self.handler_mode("spawn")
+        path = self.root / "routing.json"
+        path.write_text(json.dumps(self.config), encoding="utf-8")
+        script = Path(__file__).resolve().with_name("codex_bridge.py")
+        run = subprocess.run([sys.executable, str(script), "--config", str(path), "wake", str(self.routed())],
+                             capture_output=True, text=True, timeout=11.5)   # what the receiver allows
+        self.assertEqual(0, run.returncode, run.stderr)
+        self.assertEqual("forward_timeout", json.loads(run.stdout)["status"])
+        self.assertIn("codex_bridge: forward_timeout", run.stderr)
+        pids = json.loads((self.tools / "handler-pids.json").read_text())
+        deadline = time.monotonic() + 5
+        alive = pids
+        while alive and time.monotonic() < deadline:
+            alive = [pid for pid in pids if _alive(pid)]
+            time.sleep(0.05)
+        self.assertEqual([], alive)
+
+    def test_malformed_routing_config_fails_closed_before_side_effects(self):
+        path = self.root / "routing.json"
+        state = self.root / "never created"
+        for key, value in (("excluded_kinds", "routed-kind"), ("excluded_kinds", [""]), ("excluded_kinds", ["x" * 33]),
+                           ("excluded_kinds", ["bad\nkind"]), ("excluded_kinds", [7]),
+                           ("excluded_kind_adapter", "relative-handler"), ("excluded_kind_adapter", []),
+                           ("excluded_kind_adapter", ["relative-handler"]), ("excluded_kind_adapter", ["/bin/x", ""]),
+                           ("excluded_kind_timeout_seconds", 0), ("excluded_kind_timeout_seconds", 301),
+                           ("excluded_kind_timeout_seconds", True), ("excluded_kind_timeout_seconds", "60")):
+            with self.subTest(key=key, value=value):
+                config = dict(self.config, bridge_home=str(state), **{key: value})
+                path.write_text(json.dumps(config), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    load_config(path)
+                with self.assertRaises(ValueError):
+                    Bridge(config, client_factory=lambda _: self.client)
+                self.assertFalse(state.exists())
+
+    def test_command_line_wake_reports_and_exits_with_the_outcome(self):
+        path = self.root / "routing.json"
+        path.write_text(json.dumps(self.config), encoding="utf-8")
+        script = Path(__file__).resolve().with_name("codex_bridge.py")
+        self.handler_mode("fail")
+        run = subprocess.run([sys.executable, str(script), "--config", str(path), "wake", str(self.routed())],
+                             capture_output=True, text=True, timeout=60)
+        self.assertEqual(0, run.returncode, run.stderr)             # started: the receiver must not replay it
+        self.assertEqual("forward_failed", json.loads(run.stdout)["status"])
+        self.assertIn("codex_bridge: forward_failed", run.stderr)
+        run = subprocess.run([sys.executable, str(script), "--config", str(path), "status"],
+                             capture_output=True, text=True, timeout=60)
+        self.assertEqual([], json.loads(run.stdout))
+        self.assertEqual(1, len(self.handler_calls()))
+
+
+def _alive(pid):
+    """True while pid exists and is not a zombie (a reaped or exited child counts as gone)."""
+    try:
+        with open("/proc/%d/stat" % pid) as stat_file:
+            return stat_file.read().split(")")[-1].split()[0] != "Z"
+    except OSError:
+        pass
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
 
 
 if __name__ == "__main__":

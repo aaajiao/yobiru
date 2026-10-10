@@ -196,7 +196,9 @@ sh "$Y" codex-bridge install --thread-id SESSION_UUID --codex-remote "unix:///ab
 sh "$Y" codex-bridge status
 ```
 
-`--dry-run` 不写文件、不调用服务管理器；`--no-start` 只写文件。只使用同一用户的本机 socket（不支持网络端点，不创建会话，不使用 `--last`）。桥接会固定记录 `codex_home`（`--codex-home`，否则已安装的值，首次安装时用 `$CODEX_HOME`，最后是 `~/.codex`），使核对读取与 app-server 相同的账户。新安装默认关闭自动回复，需经授权后传入 `--allow-replies`；Linux 升级会保留已授权的设置（`--no-allow-replies` 可关闭），macOS 重新安装时需要再次传入该选项。`enqueued` 表示 CLI 接收了通知，不代表任务已完成。`uncertain` 表示一次入队尝试可能已到达 Codex：它绝不会被自动重发，`status` 会说明如何核对。详情、权限和回滚见 [Codex 桥接配置](CODEX_LOCAL.md)。
+`--dry-run` 不写文件、不调用服务管理器；`--no-start` 只写文件。只使用同一用户的本机 socket（不支持网络端点，不创建会话，不使用 `--last`）。桥接会固定记录 `codex_home`（`--codex-home`，否则已安装的值，首次安装时用 `$CODEX_HOME`，最后是 `~/.codex`），使核对读取与 app-server 相同的账户。新安装默认关闭自动回复，需经授权后传入 `--allow-replies`；升级会保留已授权的设置（`--no-allow-replies` 可关闭）。`enqueued` 表示 CLI 接收了通知，不代表任务已完成。`uncertain` 表示一次入队尝试可能已到达 Codex：它绝不会被自动重发，`status` 会说明如何核对。详情、权限和回滚见 [Codex 桥接配置](CODEX_LOCAL.md)。
+
+已有部署可以让指定的消息类型不进入入口会话：在 `codex-bridge.json` 中设置 `excluded_kinds` 和 `excluded_kind_adapter`（可信本机程序的绝对路径 argv）。这些消息从不进入 Codex 队列。只有接收端对一封已校验、未 ack、实际级别为 `now` 的消息直接唤醒时，才运行该程序，并只追加 inbox JSON 路径这一个参数（不经 shell，不含正文），超过 `excluded_kind_timeout_seconds`（默认 60 秒）即终止。扫描、重试和 `status` 都不会运行它。实际时限还会在接收端 `hook_timeout_s` 到期前 10 秒结束，先终止处理程序及其进程组。程序一旦启动，即使失败或超时，桥接也以 0 退出（结果会输出并记入日志），因此不会被自动重放；消息留在 inbox，重试和按消息 ID 去重由程序自己负责。升级时原样保留本地已有的入口指令，模板更新需自行合并。安装器在 `--dry-run` 中校验这些字段，并在升级时连同调整过的时间参数、自定义入口指令、已记录的 Codex CLI 和已授权的回复设置一并保留。
 
 | 信号 | 能说明什么 |
 |---|---|
@@ -255,8 +257,8 @@ python3 tools/build_plugin.py release
 | 范围 | 当前验证边界 |
 |---|---|
 | 打包与 CLI | 自动检查覆盖解压后运行、含空格的路径、配置保留，以及使用隔离测试环境的消息／文件／回复／唤醒流程。 |
-| Tailscale 传输 | 在 0.1.0 上（0.2.0 未重跑，核心未改动），上游 `selftest.sh` 在一台 Linux 机器的真实 Tailscale 地址上使用临时接收进程，通过了 59 项检查；这不是双机测试。 |
-| Codex | 在 0.1.0 上（0.2.0 未重复）已验证 Linux CLI 安装、插件启用状态、四个 skills 的发现，以及从插件缓存执行命令。0.2.0 中 Linux 与 macOS 桥接仅由使用假 CLI、假 `systemctl` 和临时 socket 的离线及解包测试覆盖；未声称已在真实 app-server 上运行。 |
+| Tailscale 传输 | 在 0.1.0 上（0.2.x 未重跑，核心未改动），上游 `selftest.sh` 在一台 Linux 机器的真实 Tailscale 地址上使用临时接收进程，通过了 59 项检查；这不是双机测试。 |
+| Codex | 在 0.1.0 上（0.2.x 未重复）已验证 Linux CLI 安装、插件启用状态、四个 skills 的发现，以及从插件缓存执行命令。0.2.x 中 Linux 与 macOS 桥接仅由使用假 CLI、假 `systemctl` 和临时 socket 的离线及解包测试覆盖；未声称已在真实 app-server 上运行。 |
 | Cursor / Grok Bot / DOTS | Cursor／Grok 安装路径依据宿主文档；实机验收与跨平台端到端协作仍未验证。未提供 DOTS 连接器。 |
 | 公共市场上架 | 尚未提交或获批；仓库安装与公共上架是两回事。 |
 

@@ -37,7 +37,7 @@ python3 install_codex_bridge.py --thread-id <固定入口 UUID>
 
 更新已有安装时仍使用同一 UUID；安装器拒绝用新 UUID 覆盖已有入口，避免把旧队列投给其他会话。安装器保留旧代码、指令、配置、安装回执和服务文件的时间戳备份，位置记在安装回执中。另一个 codex wake adapter 已存在时会拒绝覆盖。`--no-start` 可只安装而不重新加载服务。
 
-默认 `allow_replies=false`。只有用户明确允许自动回执与结果回传时，才使用 `--allow-replies`。该权限只允许回复对应收到的请求，不允许导出其他会话的私人内容。
+新安装默认 `allow_replies=false`。只有用户明确允许自动回执与结果回传时，才使用 `--allow-replies`；升级时保留已授权的设置，`--no-allow-replies` 可显式关闭。未指定 `--codex-path` 时保留已记录的 CLI 路径。该权限只允许回复对应收到的请求，不允许导出其他会话的私人内容。
 
 ## 检查与恢复
 
@@ -107,6 +107,28 @@ sh "$Y" codex-bridge rollback <backup 路径>
 ```
 
 回滚只接受该数据目录 `backups/` 下由 Linux 安装器生成的备份，并校验清单中的目标路径。它先 `disable --now` 并确认服务已停止（失败，或服务仍在运行但 unit 文件已不存在时，什么都不恢复），再恢复代码、配置、unit 和回执，按安装前记录的启用/运行状态恢复服务，并 `try-restart` 接收端。若当前 unit 已属于另一个数据目录则拒绝。`--no-start` 只恢复文件、不碰服务（适合已手动停服时）。inbox、SQLite 队列、处理记录和入口会话都不会被删除；保留的队列继续锁定原入口 UUID。
+
+## 按消息类型分流（可选，macOS 与 Linux 通用）
+
+已有部署可以让某些消息类型不进入固定入口会话，而交给另一个本机程序处理。在 `codex-bridge.json` 中设置：
+
+```json
+{
+  "excluded_kinds": ["example-kind"],
+  "excluded_kind_adapter": ["/absolute/path/to/handler", "--fixed-arg"],
+  "excluded_kind_timeout_seconds": 60
+}
+```
+
+- `excluded_kinds`：信封 `kind` 字符串列表（每项 1–32 个字符，无控制字符）。`excluded_kind_adapter`：可信本机程序的 argv，第一项必须是绝对路径。`excluded_kind_timeout_seconds`：可选，默认 60，范围 (0, 300]。实际时限取它与“接收端 `hook_timeout_s`（默认 120）减 10 秒”中的较小值，保证适配器在接收端终止它之前先终止处理程序；剩余时间不足 1 秒时不启动处理程序。只读取、不修改用户配置。任一字段无效时，适配器和安装器在任何副作用之前拒绝运行。
+- 先完成与普通消息相同的校验（inbox 路径、Tailscale 来源、白名单、目标 agent `codex`、实际 wake 级别、是否已 ack），之后才按 `kind` 分流。被排除的消息从不进入 Codex 队列：`wake`、`scan` 都不会入队；在配置前已入队的 pending/retry/uncertain 记录，在投递时重新校验并记为 `skipped`（`excluded_kind`）。
+- 只有接收端对一封未 ack、实际级别为 `now` 的消息直接调用 `wake` 时，才运行该程序：argv 原样，只追加经过校验的规范 inbox 路径；不经 shell，stdin 为空，不展开任何正文。`none`、`batch`、已 ack，或未配置程序时只记为 skipped，消息留在 inbox。`scan`、定时投递、`status` 和核对都不会运行它。
+- 结果写到标准输出（JSON），并在标准错误输出一行固定状态，接收端会把它记入 wake 日志：`forwarded`（程序退出码 0）；`forward_failed`（程序非零退出，`exit_code` 记录其值）；`forward_timeout`（超时，程序及其整个进程组被终止）。这三种情况程序都已启动过，适配器一律以 0 退出，接收端不会重放它；程序失败或超时都不会被自动重试，消息仍留在 inbox 中，由该程序或用户处理。程序未能启动时（`forward_not_started`：可执行文件不可用为 127，没有可用时限为 1）以非零退出，接收端可能按 `wake_attempts` 再试，这是安全的，因为程序从未运行。程序可能在失败或超时前已部分执行，去重与重试由它自己以消息 ID 为键负责；这里不承诺恰好一次。
+- 没有对应的 CLI 选项：直接编辑 `codex-bridge.json`，再用 `codex-bridge install ... --dry-run` 预览（会校验这些字段，并显示 `excluded_kinds`）。两个安装器升级时都保留这些字段，以及调整过的轮询/重试时间、自定义入口指令路径、已记录的 Codex CLI 路径、固定的 Codex 账户设置和已授权的 `allow_replies`。迁移已有部署时，先把原有分流设置写入 `codex-bridge.json`，确认预览无误后再安装，避免消息被误投到入口会话。`codex-bridge status` 会列出当前分流设置，但不会运行程序。
+
+## 入口指令的升级
+
+两个安装器在首次安装时把公开模板复制为 `<数据目录>/codex-local/CODEX_DISPATCHER.md`。之后升级时，若该文件已存在，就原样保留其内容（可能是用户自己的工作流），只更新代码；安装输出和 `--dry-run` 会在模板有差异时提示。`dispatcher_instructions` 指向其他路径时，安装器既不写该文件，也不改该配置。升级前的文件会进入备份，回滚恢复的正是原来的内容。要采用新模板，请自行比较插件中的 `scripts/codex_bridge/CODEX_DISPATCHER.md` 与本地文件，审阅后手动合并。
 
 ## 验收
 
