@@ -1,0 +1,17 @@
+Generated with OpenAI image generation (image_gen.imagegen), 2026-10-10.
+Concept illustration; not screenshots of actual integrations.
+
+Use case: product-mockup / editorial product illustration.
+Create one beautiful wide landscape README hero image for the open-source product Yobiru, ideally 2400x1350 (16:9), opaque background.
+Primary request: ONE adult person operating EXACTLY THREE smartphones with three clearly distinct personal-agent chat interfaces: first Grok Bot, second DOTS, third Codex. They exchange useful messages, a JSON dataset and a Markdown file through Yobiru over Tailscale. This is a conceptual product demonstration, not a real screenshot.
+Composition: sophisticated editorial illustration combined with realistic crisp device mockups. Warm off-white studio desk, soft daylight, muted indigo and teal accents, generous negative space. Three large upright portrait phones are the main focal point, arranged left-to-right across the middle with nearly front-on highly readable screens. A single casually dressed adult is partially visible from over the shoulder at lower left, with a natural pair of hands: left hand steadies the left phone, right hand taps the right phone; center and right phones on minimal desk stands. Do not hide any app name or key chat text behind hands. Exactly one person, two hands, three devices. No laptop or additional screen.
+Top-left elegant large heading: "Yobiru"
+Smaller subheading: "Let your agents talk."
+Each device uses plausible modern chat UI, clean precise typography, restrained chat bubbles and a bottom input field, not a command terminal. Small distinct simple avatars, no need for official logos.
+Left screen: black/white Grok-style UI. App header exact "Grok Bot". Short user bubble exact "Find signals on X." Agent bubble exact "3 useful links found." Small attachment card exact "signals.json". Small delivery line exact "Sent to DOTS".
+Middle screen: calm ChatGPT-like light UI, soft purple agent accent. App header exact "DOTS". User bubble exact "Make a short brief." Agent bubble exact "Key points organized." Attachment card exact "brief.md". Small delivery line exact "Sent to Codex".
+Right screen: clean Codex-style light interface with restrained green status. App header exact "Codex". User bubble exact "Check this against the code." Agent bubble exact "Review complete." Attachment card exact "review.md". Small delivery line exact "Reply sent".
+Subtle thin indigo dotted connectors between the three phones, with small message and file icons, communicating bidirectional agent communication, no central server or dashboard drawn.
+Under the devices, unobtrusive but readable caption exact "Messages · Data · Files" and below it "Connected over Tailscale".
+Small bottom-right label exact "Concept demo".
+Quality: premium open-source developer product editorial art, polished but approachable; anatomically correct hands, excellent screen typography, legible exact app names, balanced composition, no clutter, no cyberpunk, no neon, no robots, no dashboard grids, no extra devices, no real personal names, no IP addresses, no account identifiers, no websites or QR codes. The picture should explain the human using their existing agent interfaces, with the agents communicating for them.

@@ -1,0 +1,94 @@
+# Building and releasing Yobiru
+
+Everything is plain Python 3.8+ with the standard library; no network access is needed.
+
+## Sources of truth
+
+- `packaging/product.json`: plugin id, display name, version, publisher, license, descriptions,
+  marketplace names, and which root files are bundled.
+- `tailmsg.py` and the Codex bridge files at the repository root are canonical. The plugin carries
+  byte-identical copies under `plugins/yobiru/scripts/`, listed with SHA-256 in `scripts/SOURCES.json`.
+- Generated, never edited by hand: `plugins/yobiru/plugin.json`, `plugins/yobiru/.codex-plugin/plugin.json`,
+  `plugins/yobiru/.cursor-plugin/plugin.json`, `.agents/plugins/marketplace.json`,
+  `.cursor-plugin/marketplace.json`, the bundled copies, `plugins/yobiru/LICENSE` and `SOURCES.json`.
+- Hand-written: `scripts/yobiru`, `scripts/yobiru.py`, `skills/*/SKILL.md`, `README.md`, `assets/`
+  (`assets/icon.png` is rendered by `tools/make_icon.py`).
+
+## Commands
+
+```sh
+python3 tools/build_plugin.py sync      # regenerate manifests and copies, fix file modes
+python3 tools/build_plugin.py check     # no writes: drift, manifest rules, skills, hygiene
+python3 tools/build_plugin.py files     # what goes into the plugin archive
+python3 tools/build_plugin.py release   # check, then dist/ archives and SHA256SUMS
+```
+
+`check` fails when:
+
+- a generated file or bundled copy differs from what `sync` would write, or an executable bit is wrong;
+- `plugin.json` leaves the closed Agent Plugins 1.0.0 schema
+  (<https://agent-plugins.org/schemas/1.0.0/plugin.schema.json>) or adds `extensions` (that would
+  replace the `.codex-plugin` overlay, see <https://developers.openai.com/plugins/build/plugins>);
+- `.codex-plugin/plugin.json` breaks the rules of the Codex plugin-creator validator (fields, semver,
+  interface fields, asset paths inside the plugin);
+- `.cursor-plugin/plugin.json` or either marketplace file breaks the documented Cursor rules
+  (<https://cursor.com/docs/reference/plugins>), or sets component paths that would replace default
+  discovery;
+- a skill folder lacks `SKILL.md`, its `name` differs from the folder or lacks the `yobiru-` prefix, or
+  its description is empty or longer than 1024 characters;
+- anything in the plugin is a symlink (including symlinked directories), or looks like runtime state
+  or a secret (`config.json`, inbox, outbox, databases, keys, logs, backups);
+- the plugin or the repository docs contain a real tailnet name, an absolute home path, a concrete
+  Tailscale address, an email address, a UUID, or a token-like string. Maintainers can add personal
+  markers in a file outside the repository and point `YOBIRU_PRIVATE_DENYLIST` at it (one regular
+  expression per line).
+
+## Release archives
+
+`release` writes to `dist/` (ignored by Git):
+
+| File | Contents | Use |
+|---|---|---|
+| `yobiru-<version>-plugin.zip` | `yobiru/` = the plugin directory | Cursor local folder, `agent --plugin-dir`, manual install, Grok Bot fallback in `/workspace` |
+| `yobiru-<version>-marketplace.zip` | `yobiru-marketplace/` = both marketplace files + `plugins/yobiru/` + `LICENSE` | `codex plugin marketplace add <unpacked folder>` |
+| `SHA256SUMS` | SHA-256 of both archives | verification |
+
+Archives are reproducible: entries sorted, timestamps fixed to 1980-01-01, modes fixed (0755 for
+`scripts/yobiru` and `scripts/yobiru.py`, 0644 otherwise), stored without compression, junk such as
+`__pycache__` excluded. The same commit gives the same bytes. Check out with LF line endings
+(`core.autocrlf=false`) when comparing hashes on Windows.
+
+Python's `zipfile` does not restore file modes when unpacking; the skills therefore run the launcher
+as `sh .../scripts/yobiru` (or `python3 .../scripts/yobiru.py`), which works without the executable bit.
+
+## Tests
+
+```sh
+python3 -m unittest discover -s tests -v
+python3 -m unittest -v test_codex_bridge test_codex_queue_client test_install_codex_bridge
+```
+
+`tests/` builds the archives in a temporary directory, unpacks them into a path with spaces outside
+the checkout and drives the unpacked `yobiru` command with an isolated `HOME`, a fake `tailscale`
+CLI and loopback-only receivers. No test reads or writes `~/.tailmsg`, calls the real Tailscale, uses
+port 7766, or contacts another machine.
+
+`sh selftest.sh` is the upstream end-to-end check. It needs Tailscale on the machine and runs
+temporary receivers on the machine's own Tailscale address, ports 7866-7883 (and a stub webhook on
+127.0.0.1:7879); confirm those ports are free first. It never uses port 7766 or `~/.tailmsg`. The
+older receiver it checks compatibility against is `tests/fixtures/tailmsg_v1_pre_agents.py`, the
+protocol v1 release from before @agent addressing. Its runtime files go to `test-run/` (ignored by Git).
+
+## Version bumps
+
+Change `version` in `packaging/product.json`, run `sync`, `check`, the tests and `release`, then commit
+the regenerated files. Codex reinstalls a local plugin when its version changes.
+
+## Renaming
+
+The product id is defined once in `packaging/product.json`. A rename means: update `id`,
+`displayName`, `pluginDir`, `skillPrefix` and the marketplace names there; `git mv` the plugin folder
+and the skill folders (and their `name:` lines); rename `scripts/yobiru*` and the `PRODUCT`,
+`DISPLAY` and `YOBIRU_PYTHON` constants in `scripts/yobiru.py`; update the docs; run `sync` and `check`.
+Keep the tailmsg protocol, `tailmsg.py`, `~/.tailmsg`, `TAILMSG_*` variables and service names, so
+deployed machines need no change.

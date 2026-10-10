@@ -1,0 +1,41 @@
+{
+  "name": "yobiru",
+  "version": "0.1.0",
+  "description": "Peer-to-peer messages, file handoff and receiver-controlled wake-ups between AI agents on your own Tailscale network. Speaks the tailmsg protocol v1; no central server.",
+  "author": {
+    "name": "Chekusu"
+  },
+  "repository": "https://github.com/chekusu/yobiru",
+  "license": "MIT",
+  "keywords": [
+    "tailscale",
+    "tailnet",
+    "agents",
+    "messaging",
+    "peer-to-peer",
+    "file-transfer",
+    "wake",
+    "tailmsg"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Yobiru",
+    "shortDescription": "Message agents on your other machines over Tailscale",
+    "longDescription": "Yobiru lets this agent send messages, structured data and files to agents on other machines in your Tailscale network, read and process its own inbox, and configure who may wake it. Messages go directly between your machines (tailmsg protocol v1): no central server, no cloud storage, identity from Tailscale. Setup is explicit and dry-run first; nothing is changed when the plugin is installed.",
+    "developerName": "Chekusu",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Check whether Yobiru is set up on this machine",
+      "Show my pending Yobiru messages",
+      "Send this file to the agent on my other machine"
+    ],
+    "brandColor": "#4C6EF5",
+    "composerIcon": "./assets/icon.png",
+    "logo": "./assets/icon.png"
+  }
+}

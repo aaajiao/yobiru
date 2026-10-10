@@ -1,0 +1,30 @@
+{
+  "about": "Byte-identical copies of canonical files at the repository root, refreshed by tools/build_plugin.py sync. Edit the root files, not these copies.",
+  "protocol": "tailmsg v1",
+  "files": {
+    "scripts/tailmsg.py": {
+      "source": "tailmsg.py",
+      "sha256": "7fa6c27e89802dc918a2f478f9fb8dfc84c79bb55eff92eed281ee6e3a4da861"
+    },
+    "scripts/codex_bridge/CODEX_DISPATCHER.md": {
+      "source": "CODEX_DISPATCHER.md",
+      "sha256": "54f134d7700d8ad528c32cceb5ea19b093e48468c1b427340ba520abc2077712"
+    },
+    "scripts/codex_bridge/codex_bridge.py": {
+      "source": "codex_bridge.py",
+      "sha256": "0a66cb4edb471376ea325a174b7d1349891357ed13ee565e30dd977b86add02c"
+    },
+    "scripts/codex_bridge/codex_queue_client.py": {
+      "source": "codex_queue_client.py",
+      "sha256": "2279aad04a0bf68c6c3de3cbaba553119af9ef6995d914e01cda770a405384e5"
+    },
+    "scripts/codex_bridge/install_codex_bridge.py": {
+      "source": "install_codex_bridge.py",
+      "sha256": "4ff04f71f06b96c6bcfc71ad318b7f9bee2698d9be8c35041e3743ce7ac4e136"
+    },
+    "LICENSE": {
+      "source": "LICENSE",
+      "sha256": "50780112dfc9a9a9f9ffae7b2c80279e60e259446246375644f397eb7bbdb5aa"
+    }
+  }
+}

@@ -1,0 +1,261 @@
+# Yobiru（ヨビル）
+
+**让你的 agents 互相聊起来。**
+
+Yobiru 基于 **Tailscale**，连接你不同电脑和云端工作空间里的 personal agents。它们可以发消息、交换结构化数据和文件、回复结果，也可以请求唤醒对方。你继续使用各个 agent 原有的界面，Yobiru 负责底层通信。
+
+<!-- README-I18N:START -->
+
+[English](README.md) | **简体中文** | [日本語](README.ja.md)
+
+<!-- README-I18N:END -->
+
+![AI 生成的概念图：一个人操作三部手机，分别显示 Grok Bot、DOTS 和 Codex，通过 Yobiru 交换调研信息、简报和代码分析结果。](docs/assets/yobiru-demo.png)
+
+*AI 生成的概念演示，并非真实截图，也不代表已经验证的端到端集成。手机代表你选择的交互界面；agent 和接收进程运行在相连的电脑或云端工作空间中。*
+
+## 为什么需要 Yobiru？
+
+你的 agents 各有所长，也能访问不同的信息。一个擅长调研，一个理解你的个人背景，另一个能处理代码。如果需要在不同窗口之间反复复制回答和文件，你就成了它们之间的传话人。
+
+Yobiru 为这些 agents 提供了一套轻量、共通的通信方式：
+
+- **跨机器聊天：** 用 `host/agent` 指定收件 agent，并回复它的消息。
+- **交换有用的上下文：** 发送文字、JSON、报告、日志和其他文件。
+- **按你的规则唤醒：** 收件方决定哪些发送方可以唤醒哪个 agent，并设置静默时间和频率限制。
+- **继续使用自己的工具：** 同一个插件包包含四个 skills 和 Python CLI，提供 Codex、Cursor 插件清单，以及 Grok Bot 的安装路径。
+- **数据保存在自己的机器上：** Yobiru 不运营消息或附件存储服务；文件通过 Tailscale 从发送方获取。
+
+这是通信层，不是新的聊天应用或自主任务管理器。Agents 可以通过消息与回复围绕共同目标协作，但 Yobiru 不提供共享群聊界面、调度器，也不能证明对方已经完成工作。
+
+## 三个 agents 之间的一次协作
+
+假设你问：**“大家正在讨论什么？哪些与我的项目有关？我们应该做什么？”**
+
+| Agent | 负责的工作 | 交给下一个 agent 的内容 |
+|---|---|---|
+| Grok Bot | 利用所在平台已经提供的权限，收集相关的 X 信息。 | 摘要、来源链接和 `signals.json`。 |
+| DOTS | 结合你的背景整理发现，形成简报。 | `brief.md`，以及需要编码 agent 回答的问题。 |
+| Codex | 检查代码仓库、研究可行性，并准备改动或技术答复。 | 分析结果、文件，以及发给请求方的回复。 |
+
+这是说明性的工作流。Yobiru 不提供 X 访问权限，不改变平台收费规则，也不补齐平台缺失的能力。**DOTS 是有条件的示例：** 它需要能执行此 CLI 并访问 tailnet 的环境；本仓库不包含已经验证的 DOTS 连接器。Grok Bot 的完整运行集成也仍需在实际账户上测试。
+
+## 工作原理
+
+```text
+You use the agent interface you already like
+                    |
+             Yobiru skills + CLI
+                    |
+       your permitted Tailscale network
+                    |
+     receiver -> local inbox -> optional wake adapter
+                    |
+       another agent reads, acts, and replies
+
+Files: recipient fetches from the sender, then checks size + SHA-256.
+```
+
+接收进程监听本机的 Tailscale 地址，默认端口为 `tcp:7766`。它通过 `tailscale whois` 验证连接机器的身份，检查本地允许列表，然后保存接受的消息。附件暂存在发送方，通过有时效的链接提供给指定收件机器。链接默认有效期为 24 小时。
+
+Yobiru 使用现有的 **tailmsg protocol v1**，不附带 MCP 服务器，也不需要 Yobiru 账户。Tailscale 提供网络和机器身份，可能直接传输加密流量，也可能通过其中继传输。参见 [Tailscale 连接类型](https://tailscale.com/docs/reference/connection-types)。
+
+## 前置条件
+
+每台参与通信的电脑或云端工作空间需要：
+
+1. **Python 3.8+**，以及执行 CLI 的权限（`python3`，Windows 上为 `py -3`）。运行时只依赖 Python 标准库。
+2. **安装并登录 Tailscale**，两端能通过获准的 tailnet 相互访问。网络策略需要允许你选定的对端访问接收端口。
+3. **接收消息时：** 有一个可访问、持续运行的接收进程，并关闭接收节点的 Tailscale shields-up。传文件时，发送方的接收进程也必须持续在线，直到对方获取文件。
+4. **自动唤醒时：** 由收件方配置能够通知目标 agent 的本地程序或 webhook。仅安装 skill 不会自动唤醒休眠的 agent。
+
+手机可以只是交互界面，不必是执行任务的 Tailscale 节点。如果云端 agent 没有 shell、不能按平台规则访问私有网络，或无法持续运行接收进程，就不能直接使用本插件。宿主平台的沙盒和审批规则仍然适用。Yobiru 不修改 Tailscale 登录状态、访问策略或 shields-up 设置。
+
+## 安装
+
+### Codex
+
+添加本仓库提供的插件市场，然后安装插件：
+
+```sh
+codex plugin marketplace add chekusu/yobiru
+codex plugin add yobiru@yobiru
+```
+
+新开一个会话，然后说：**“检查一下这台机器上的 Yobiru 是否已经配置好。”** 四个 skills 分别是 `yobiru-setup`、`yobiru-send`、`yobiru-inbox` 和 `yobiru-wake`。
+
+这里使用的是仓库插件市场，并不意味着已经进入 Codex 的公共插件目录。
+
+### Cursor 和 Grok Bot
+
+在 Cursor 本地试用时，克隆仓库并加载插件目录：
+
+```sh
+git clone https://github.com/chekusu/yobiru.git
+cd yobiru
+agent --plugin-dir "$PWD/plugins/yobiru"
+```
+
+也可以把 `plugins/yobiru` 放到 `~/.cursor/plugins/local/yobiru`，然后重新加载 Cursor。使用团队市场时，在 **Dashboard → Plugins & MCPs → Add Marketplace → Import from Repo** 中填入 `https://github.com/chekusu/yobiru`，并配置访问范围。参见 [Cursor 插件文档](https://cursor.com/docs/plugins)。
+
+在账户可用的市场提供 Yobiru 后，从 Grok Bot 的 **Plugins** 添加；Cursor 团队管理员控制市场访问范围。参见 [Grok Bot 插件文档](https://cursor.com/help/grok-bot/connect-plugins)。**目前尚未提交公共 Cursor Marketplace 上架申请**，因此在公共市场搜索可能找不到。
+
+还需要配置该 Grok Bot 会话实际使用的电脑，包括 Tailscale 和接收进程。数据应放在 `/workspace/.tailmsg` 这样的持久目录中，并在每个命令之前加 `--home /workspace/.tailmsg`。如果宿主只加载 skill 文本、未提供附带的脚本，可以在 `/workspace` 中使用克隆的仓库或解压后的插件包。脚本是否可用、接收进程能否持续运行，以及实际的 Grok Bot 唤醒流程，仍需账户级验证；参见 [平台说明](docs/PLATFORMS.md)。
+
+### 不通过插件宿主，直接使用 CLI
+
+按上面的方式克隆仓库，然后直接调用附带的启动脚本。在仓库根目录运行：
+
+```sh
+Y="$PWD/plugins/yobiru/scripts/yobiru"
+sh "$Y" paths
+sh "$Y" doctor
+```
+
+如果已通过宿主安装插件，将 `Y` 换成安装位置下 `scripts/yobiru` 的绝对路径。路径应保留引号，因为插件缓存路径可能含有空格。Windows 使用 `py -3 "path\to\yobiru\scripts\yobiru.py"`。`doctor` 只读；新机器上会报告配置和接收进程尚未就绪。
+
+## 快速开始：连接两个 agents
+
+示例使用虚构的 Tailscale 主机名 `agent-laptop` 和 `research-node`，请替换为**你自己选定的对端**。在每台机器上按前文设置 `Y`。安装插件本身不会配置对端、启动服务或发送消息。
+
+### 1. 决定谁可以发消息
+
+在 `agent-laptop` 上，将 `codex` agent 配置为允许 `research-node` 发来消息：
+
+```sh
+sh "$Y" setup --allow research-node --agent codex --self-agent codex --default-agent codex
+sh "$Y" setup --allow research-node --agent codex --self-agent codex --default-agent codex --apply
+```
+
+在 `research-node` 上，将 `grok` agent 配置为允许 `agent-laptop` 发来消息：
+
+```sh
+sh "$Y" setup --allow agent-laptop --agent grok --self-agent grok --default-agent grok
+sh "$Y" setup --allow agent-laptop --agent grok --self-agent grok --default-agent grok --apply
+```
+
+第一条命令预览改动，第二条应用改动。检查计划中的对端和 agent 名称是否符合你的意图。Setup 会保留已有条目，并在修改配置时备份。替换现有身份或唤醒适配器需要显式的替换选项。
+
+### 2. 在两台机器上持续运行接收进程
+
+首次测试时，在**每台机器**的独立终端中运行以下命令，并保持终端开启：
+
+```sh
+sh "$Y" serve
+```
+
+需要长期运行时，安装固定路径的运行时，并生成服务定义：
+
+```sh
+sh "$Y" install-runtime
+sh "$Y" install-runtime --apply
+sh "$Y" service-template systemd-user
+```
+
+macOS 将 `systemd-user` 换为 `launchd`，Windows 换为 `windows`。按照生成的服务定义中的说明进行安装和启动；这些命令本身不会启动服务。在同一端口启动服务之前，请先停止前台接收进程。随后在另一个终端运行 `sh "$Y" doctor`。
+
+### 3. 打个招呼，发送数据和文件
+
+在 `agent-laptop` 上，向你授权的收件方发送打算分享的内容：
+
+```sh
+sh "$Y" send research-node/grok "Hello from Codex. Please send back a short status."
+sh "$Y" send research-node/grok '{"type":"research-request","topic":"agent tools"}' --kind request
+sh "$Y" send research-node/grok "Please review this brief." --file ./brief.md --wake batch
+```
+
+请先创建 `brief.md`，或换成你确实想分享的已有文件。JSON 是消息内容，不是可执行指令。默认消息信封上限为 256 KiB，更大的数据请作为附件发送。重复使用 `--file` 可以附带多个文件。
+
+### 4. 阅读并回复
+
+在 `research-node` 上，把 `MESSAGE_ID` 换成 `inbox` 列出的消息 ID：
+
+```sh
+sh "$Y" inbox --pending --agent grok
+sh "$Y" show MESSAGE_ID
+sh "$Y" fetch MESSAGE_ID
+sh "$Y" reply MESSAGE_ID "Reviewed. Here is my summary."
+sh "$Y" ack MESSAGE_ID
+```
+
+`fetch` 下载并校验附件。`reply` 会回复原发送方的 agent，并设置 `reply_to`。`ack` **只在本机**将消息标记为已处理。没有唤醒适配器时，需要你让 agent 检查收件箱，或由 agent 自己的调度机制定时检查。
+
+## 唤醒与投递状态
+
+发送方可以请求 `--wake now`、`batch` 或 `none`，最终由收件方决定。使用 `yobiru-wake` skill 配置本地可执行程序或 webhook。`wake-config` 默认只预览，添加 `--apply` 才会写入，并支持发送方／agent 限制、静默时间和频率限制。Webhook URL 和凭证通过私密文件或环境变量引用。
+
+如果账户支持，Grok Bot routine 的 webhook 可以作为适配器目标。参见 [routine webhook 文档](https://cursor.com/help/grok-bot/routines)。可选的 macOS 桥接可以将消息排入固定的 Codex 桌面会话；参见 [Codex 桥接配置](CODEX_LOCAL.md)。
+
+| 信号 | 能说明什么 |
+|---|---|
+| `send` 返回 HTTP `202` | 接收端接受并保存了消息。 |
+| 唤醒适配器成功 | 通知或 webhook 已被接受；agent 可能仍在工作。 |
+| `ack` | 收件方在本地标记为已处理，不会通知发送方。 |
+| 描述结果的回复 | Agent 报告了工作结果。需要确认完成情况时，应检查附带的证据。 |
+
+Yobiru 不提供任务的恰好一次执行保证，也不会自动重新投递消息。唤醒适配器具有有限次数的重试。消息 ID、本地确认和任务完成是不同的概念。
+
+## 隐私与信任边界
+
+- **数据保存在你的机器上。** 收件箱、发件箱记录和暂存附件位于数据目录，优先级为 `--home DIR`、`$TAILMSG_HOME`、`~/.tailmsg`。Yobiru 没有集中存储服务；你选择的 agent 平台仍可能处理交给其 agents 的内容。
+- **Tailscale 是网络边界。** 接收端检查 Tailscale 身份和本地允许列表。传输加密由 Tailscale 提供，Yobiru 不额外提供静态存储加密。需要保护主机及其文件系统。
+- **Agent 名称用于路由，不代表隔离。** `from_agent` 由发送方填写。共享机器或数据目录的多个 agents 不是独立的安全主体；需要隔离时，应使用不同机器或适当的宿主隔离机制。
+- **消息是请求，不是授权。** 收到的文字和文件不能自行授权执行命令、购买、修改配置或披露无关数据。Agents 应在用户已有指令和权限范围内行动。
+- **附件需要谨慎处理。** 大小和 SHA-256 校验不代表内容可以安全执行。链接到期也不会撤回已经下载的副本。
+- **只分享打算分享的数据。** 不要在消息中包含凭证或无关的私密文件。Webhook 密钥应保存在受保护的文件或环境变量中，不要放进提交或截图。
+
+本项目未经过正式的独立安全审计。受信任但已被入侵的对端、被入侵的主机，或权限过大的 agent，仍可能滥用访问能力。
+
+## 更新与卸载
+
+Codex 更新方式：
+
+```sh
+codex plugin marketplace upgrade yobiru
+codex plugin add yobiru@yobiru
+```
+
+更新后新开一个会话。Cursor 通过 **Customize** 更新，或替换本地插件副本；Grok Bot 通过 **Plugins** 管理。之后运行 `doctor`。如需更新单独安装的接收运行时，先预览 `install-runtime --upgrade`，再添加 `--apply` 应用，并自行重启接收服务。
+
+移除 Codex 插件及其市场：
+
+```sh
+codex plugin remove yobiru@yobiru
+codex plugin marketplace remove yobiru
+```
+
+卸载插件不会删除你的数据、接收服务或 Codex 桥接。若需彻底移除，应先停止并移除相关服务，再在确认不需要消息和文件后删除数据目录。
+
+已有 tailmsg 安装保持兼容：继续沿用 `tailmsg.py`、protocol v1、`~/.tailmsg`、`TAILMSG_*` 和既有服务名称。
+
+## 开发与验证
+
+```sh
+python3 tools/build_plugin.py sync
+python3 tools/build_plugin.py check
+python3 -m unittest discover -s tests -v
+python3 -m unittest -v test_codex_bridge test_codex_queue_client test_install_codex_bridge
+python3 tools/build_plugin.py release
+```
+
+`sync` 重新生成插件清单及字节一致的源码副本。`check` 检查生成文件漂移和打包问题。`release` 在 `dist/` 中生成可复现的插件 ZIP、市场 ZIP 和 `SHA256SUMS`。参见 [发布说明](docs/RELEASING.md) 和 [通信协议](SPEC.md)。
+
+| 范围 | 当前验证边界 |
+|---|---|
+| 打包与 CLI | 自动检查覆盖解压后运行、含空格的路径、配置保留，以及使用隔离测试环境的消息／文件／回复／唤醒流程。 |
+| Tailscale 传输 | 上游 `selftest.sh` 在一台 Linux 机器的真实 Tailscale 地址上使用临时接收进程，通过了 59 项检查；这不是双机测试。 |
+| Codex | 已验证 Linux CLI 安装、插件启用状态、四个 skills 的发现，以及从插件缓存执行命令。 |
+| Cursor / Grok Bot / DOTS | Cursor／Grok 安装路径依据宿主文档；实机验收与跨平台端到端协作仍未验证。未提供 DOTS 连接器。 |
+| 公共市场上架 | 尚未提交或获批；仓库安装与公共上架是两回事。 |
+
+`sh selftest.sh` 需要 Tailscale 和可用的临时端口 `7866–7883`，不会使用生产端口 `7766` 或默认数据目录。其他待验收项目见 [平台说明与来源](docs/PLATFORMS.md)。
+
+详细的发布检查记录见 [验证说明](docs/VERIFICATION.md)。
+
+## 贡献与许可证
+
+欢迎在 [chekusu/yobiru](https://github.com/chekusu/yobiru) 提交 issue 和 pull request。请提供操作系统、宿主版本、最小复现步骤和脱敏输出。分享诊断信息前，请移除 IP 地址、tailnet 名称、账户标识、消息内容和凭证。疑似漏洞请优先使用 GitHub 私密的 **Report a vulnerability** 入口（如可用），不要在公开 issue 中发布秘密信息。
+
+`README.md` 是英文主文档，请同步更新中文和日文版本。提交代码变更前请运行上述检查。修改通信协议时，应保留与既有对端的互操作能力。
+
+Yobiru 由 **Chekusu** 维护，以 [MIT License](LICENSE) 开源。它源自 tailmsg 项目，并保留 CLI 与协议兼容性。Grok Bot、DOTS、Codex、Cursor 和 Tailscale 均为各自产品的名称；在此展示不代表这些产品对 Yobiru 的背书。

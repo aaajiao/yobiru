@@ -1,0 +1,20 @@
+{
+  "name": "yobiru",
+  "interface": {
+    "displayName": "Yobiru"
+  },
+  "plugins": [
+    {
+      "name": "yobiru",
+      "source": {
+        "source": "local",
+        "path": "./plugins/yobiru"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
