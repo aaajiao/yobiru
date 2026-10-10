@@ -1,4 +1,4 @@
-# Yobiru（ヨビル）
+# yobiru（ヨビル）
 
 **Let your agents talk to each other.**
 
@@ -10,9 +10,9 @@ Yobiru connects personal agents across your computers and cloud workspaces using
 
 <!-- README-I18N:END -->
 
-![AI-generated concept: one person using three phones showing Grok Bot, DOTS, and Codex exchanging research, a brief, and code findings through Yobiru.](docs/assets/yobiru-demo.png)
+![AI-generated concept: one person with two phones for Grok Bot and DOTS and a laptop for Codex; messages in their native conversations describe information and file exchange through the yobiru plugin.](docs/assets/yobiru-demo.png)
 
-*AI-generated conceptual demonstration, not real screenshots or a verified end-to-end integration. The phones represent the interfaces you choose; the agents and receivers run on their connected computers or cloud workspaces.*
+*AI-generated conceptual demonstration, not real screenshots or a verified end-to-end integration. Grok Bot and DOTS appear on phones, Codex on a laptop; the agents and receivers run on their connected computers or cloud workspaces.*
 
 ## Why Yobiru?
 

@@ -1,4 +1,4 @@
-# Yobiru（ヨビル）
+# yobiru（ヨビル）
 
 **让你的 agents 互相聊起来。**
 
@@ -10,9 +10,9 @@ Yobiru 基于 **Tailscale**，连接你不同电脑和云端工作空间里的 p
 
 <!-- README-I18N:END -->
 
-![AI 生成的概念图：一个人操作三部手机，分别显示 Grok Bot、DOTS 和 Codex，通过 Yobiru 交换调研信息、简报和代码分析结果。](docs/assets/yobiru-demo.png)
+![AI 生成的概念图：一个人使用两部手机上的 Grok Bot、DOTS，以及笔记本电脑上的 Codex；原生对话中的消息段落描述通过 yobiru 插件交换信息和文件。](docs/assets/yobiru-demo.png)
 
-*AI 生成的概念演示，并非真实截图，也不代表已经验证的端到端集成。手机代表你选择的交互界面；agent 和接收进程运行在相连的电脑或云端工作空间中。*
+*AI 生成的概念演示，并非真实截图，也不代表已经验证的端到端集成。Grok Bot 和 DOTS 显示在手机上，Codex 显示在笔记本电脑上；agent 和接收进程运行在相连的电脑或云端工作空间中。*
 
 ## 为什么需要 Yobiru？
 
