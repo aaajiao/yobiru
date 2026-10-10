@@ -184,7 +184,19 @@ sh "$Y" ack MESSAGE_ID
 
 Senders can request `--wake now`, `batch`, or `none`; the receiver makes the final decision. Configure a local executable or a webhook with the `yobiru-wake` skill. `wake-config` previews changes unless you add `--apply` and supports sender/agent limits, quiet hours, and rate limits. Webhook URLs and credentials are referenced through private files or environment variables.
 
-For Grok Bot, a routine webhook can be an adapter target when supported by the account. See [routine webhooks](https://cursor.com/help/grok-bot/routines). An optional macOS bridge can queue a message into a fixed Codex desktop session; see [Codex bridge setup](CODEX_LOCAL.md).
+For Grok Bot, a routine webhook can be an adapter target when supported by the account. See [routine webhooks](https://cursor.com/help/grok-bot/routines).
+
+### Optional Codex bridge (macOS desktop or Linux app-server)
+
+`codex-bridge` queues authenticated messages into **one existing Codex session** that acts as a dispatcher: on macOS through the Codex desktop app, on Linux through a user systemd service and your own running Codex app-server. Both use the official `codex queue` command and share one durable SQLite queue with deduplication and retries. The plugin does not start Codex. On Linux you need the Codex CLI, an app-server you run as the same user on a local Unix socket, the session's UUID, a working `systemctl --user`, and a receiver installed with `install-runtime`:
+
+```sh
+sh "$Y" codex-bridge install --thread-id SESSION_UUID --codex-remote "unix:///absolute/path/to/app-server.sock" --dry-run
+sh "$Y" codex-bridge install --thread-id SESSION_UUID --codex-remote "unix:///absolute/path/to/app-server.sock"
+sh "$Y" codex-bridge status
+```
+
+`--dry-run` writes nothing and calls no service manager; `--no-start` writes files only. Only a same-user local socket is used (no network endpoints, no new sessions, no `--last`). The bridge pins `codex_home` (`--codex-home`, otherwise the installed value, `$CODEX_HOME` on first install, else `~/.codex`) so reconciliation reads the same account as the app-server. Automatic replies are off on new installs and need `--allow-replies` with your authorization; Linux upgrades keep an existing authorized setting (`--no-allow-replies` turns it off), while macOS reinstalls need the flag again. `enqueued` means the CLI accepted the notification, not that the task is done. `uncertain` means a queue attempt may have reached Codex: it is never resent automatically, and `status` explains how to check. Details, permissions and rollback: [Codex bridge setup](CODEX_LOCAL.md) (in Chinese).
 
 | Signal | What it proves |
 |---|---|
@@ -234,7 +246,7 @@ Existing tailmsg installations remain compatible: `tailmsg.py`, protocol v1, `~/
 python3 tools/build_plugin.py sync
 python3 tools/build_plugin.py check
 python3 -m unittest discover -s tests -v
-python3 -m unittest -v test_codex_bridge test_codex_queue_client test_install_codex_bridge
+python3 -m unittest -v test_codex_bridge test_codex_queue_client test_install_codex_bridge test_install_codex_bridge_linux
 python3 tools/build_plugin.py release
 ```
 
@@ -243,8 +255,8 @@ python3 tools/build_plugin.py release
 | Area | Current verification boundary |
 |---|---|
 | Packaging and CLI | Automated checks cover extracted archives, paths with spaces, configuration preservation, and message/file/reply/wake flows with isolated fixtures. |
-| Tailscale transport | The upstream `selftest.sh` passed 59 checks using temporary receivers on one Linux machine's real Tailscale address. This is not a two-machine test. |
-| Codex | Linux CLI installation, enabled plugin state, four-skill discovery, and command execution from the plugin cache were verified. |
+| Tailscale transport | With 0.1.0 (not rerun for 0.2.0; the core is unchanged), the upstream `selftest.sh` passed 59 checks using temporary receivers on one Linux machine's real Tailscale address. This is not a two-machine test. |
+| Codex | With 0.1.0 (not repeated for 0.2.0): Linux CLI installation, enabled plugin state, four-skill discovery, and command execution from the plugin cache were verified. In 0.2.0 the Linux and macOS bridges are covered only by offline and extracted-package tests with fake CLIs, fake `systemctl` and temporary sockets; no live app-server run is claimed. |
 | Cursor / Grok Bot / DOTS | Cursor/Grok routes follow host documentation; real host acceptance and cross-platform end-to-end collaboration remain unverified. No DOTS connector is shipped. |
 | Public marketplace listings | Not submitted or approved. Repository installation is separate. |
 

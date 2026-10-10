@@ -11,6 +11,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import uuid
 
 SOURCE = Path(__file__).resolve().parent
@@ -18,14 +19,21 @@ LABEL = "dev.tailmsg.codex-bridge"
 FILES = ("codex_bridge.py", "codex_queue_client.py", "CODEX_DISPATCHER.md")
 
 
-def atomic(path, data):
+def atomic(path, data, mode=0o600):
+    """Replace path with data via a fresh, exclusively created temporary file in the same directory."""
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    fd = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "wb") as out:
-        out.write(data)
-    os.chmod(str(temporary), 0o600)
-    os.replace(str(temporary), str(path))
+    fd, temporary = tempfile.mkstemp(dir=str(path.parent), prefix="." + path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as out:
+            out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, str(path))
+    except BaseException:
+        if os.path.lexists(temporary):
+            os.unlink(temporary)
+        raise
 
 
 def check_queue_dispatcher(path, thread_id):

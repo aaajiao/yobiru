@@ -65,7 +65,8 @@ Check and set up (read-only unless --apply):
   service-template {{systemd,systemd-user,launchd,windows}}
                              print a reviewable service definition (never installs it)
   codex-bridge {{status,install,rollback}} ...
-                             optional macOS Codex desktop bridge (install/rollback support --dry-run)
+                             optional Codex bridge: macOS desktop app, or Linux user systemd + a local
+                             app-server socket (install/rollback support --dry-run and --no-start)
   version
 
 Messaging (passed unchanged to the bundled tailmsg.py):
@@ -1179,72 +1180,148 @@ def cmd_service_template(home, home_source, argv):
     return 0
 
 
-# ---------------------------------------------------------------- optional Codex desktop bridge
+# ---------------------------------------------------------------- optional Codex bridge
+BRIDGE_SERVICE = {"darwin": "dev.tailmsg.codex-bridge (launchd)", "linux": "tailmsg-codex-bridge.service (systemd --user)"}
+
+
 def cmd_codex_bridge(home, home_source, argv):
     ap = argparse.ArgumentParser(allow_abbrev=False,
         prog=PRODUCT + " codex-bridge",
-        description="Optional: queue authenticated messages into one fixed Codex desktop session (macOS). "
-                    "Install and rollback run the bundled installer, which supports --dry-run and refuses to "
+        description="Optional: queue authenticated messages into one fixed, existing Codex session. macOS uses the "
+                    "Codex desktop app; Linux uses a user systemd service and your running local Codex app-server "
+                    "through an explicit unix:/// socket. Install and rollback run the bundled installer, which "
+                    "supports --dry-run (no writes, no service calls) and --no-start (files only) and refuses to "
                     "replace an existing dispatcher session or a different codex wake adapter.")
     sub = ap.add_subparsers(dest="action")
     sub.required = True
-    sub.add_parser("status", help="read-only queue summary")
-    pi = sub.add_parser("install", help="install the bridge (macOS)")
-    pi.add_argument("--thread-id", required=True, help="existing Codex desktop dispatcher session UUID")
-    pi.add_argument("--codex-path", help="path to the Codex CLI that provides `codex queue`")
-    pi.add_argument("--allow-replies", action="store_true", help="only with the user's explicit authorization")
-    pi.add_argument("--no-start", action="store_true", help="do not reload services")
+    sub.add_parser("status", help="read-only configuration, socket and queue diagnosis")
+    pi = sub.add_parser("install", help="install or upgrade the bridge (macOS or Linux)")
+    pi.add_argument("--thread-id", required=True, help="UUID of the existing Codex session used as the dispatcher")
+    pi.add_argument("--codex-path", help="Codex CLI that provides `codex queue` (Linux default: `codex` on PATH)")
+    pi.add_argument("--codex-remote", metavar="URL",
+                    help="Linux, required: unix:///absolute/socket of your running local Codex app-server")
+    pi.add_argument("--codex-home", help="Linux: CODEX_HOME of that app-server (default: installed value, "
+                                         "$CODEX_HOME on first install, else ~/.codex)")
+    replies = pi.add_mutually_exclusive_group()
+    replies.add_argument("--allow-replies", action="store_true", help="only with the user's explicit authorization")
+    replies.add_argument("--no-allow-replies", action="store_true",
+                         help="Linux: turn automatic replies off (upgrades otherwise keep the installed setting)")
+    pi.add_argument("--no-start", action="store_true", help="write files only; never touch services")
     pi.add_argument("--dry-run", action="store_true", help="run all checks and print the plan only")
-    pr = sub.add_parser("rollback", help="restore an installation backup (macOS)")
+    pr = sub.add_parser("rollback", help="restore an installation backup (inbox and queue are kept)")
     pr.add_argument("backup")
-    pr.add_argument("--no-start", action="store_true")
+    pr.add_argument("--no-start", action="store_true", help="restore files only; never touch services")
     pr.add_argument("--dry-run", action="store_true")
     a = ap.parse_args(argv)
     if a.action == "status":
         return bridge_status(home)
-    if sys.platform != "darwin":
-        die("host capability missing: the Codex desktop bridge manages a macOS LaunchAgent and the Codex desktop "
-            "app; on %s use `%s wake-config --agent codex --exec ...` instead" % (sys.platform, PRODUCT), 3)
+    if sys.platform not in BRIDGE_SERVICE:
+        die("host capability missing: the Codex bridge manages a macOS LaunchAgent or a Linux user systemd "
+            "service; on %s use `%s wake-config --agent codex --exec ...` instead" % (sys.platform, PRODUCT), 3)
+    linux = sys.platform == "linux"
+    if a.action == "install" and not linux and (a.codex_remote or a.codex_home or a.no_allow_replies):
+        die("--codex-remote, --codex-home and --no-allow-replies belong to the Linux bridge", 2)
+    if a.action == "install" and linux and not a.codex_remote:
+        die("the Linux bridge needs --codex-remote unix:///absolute/socket: the socket of your running local Codex "
+            "app-server (this plugin does not start Codex)", 2)
     if not (home / "tailmsg.py").is_file():
         die("the bridge expects a durable receiver at %s; run `%s install-runtime` first"
             % (home / "tailmsg.py", PRODUCT), 2)
-    cmd = [sys.executable, str(BRIDGE / "install_codex_bridge.py"), "--tailmsg-home", str(home)]
+    installer = "install_codex_bridge_linux.py" if linux else "install_codex_bridge.py"
+    cmd = [sys.executable, "-B", str(BRIDGE / installer), "--tailmsg-home", str(home)]
     if a.action == "install":
         cmd += ["--thread-id", a.thread_id]
-        if a.codex_path:
-            cmd += ["--codex-path", a.codex_path]
+        for flag, value in (("--codex-path", a.codex_path), ("--codex-remote", a.codex_remote),
+                            ("--codex-home", a.codex_home)):
+            if value:
+                cmd += [flag, value]
         if a.allow_replies:
             cmd.append("--allow-replies")
+        if a.no_allow_replies:
+            cmd.append("--no-allow-replies")
     else:
         cmd += ["--rollback", a.backup]
     if a.no_start:
         cmd.append("--no-start")
     if a.dry_run:
         cmd.append("--dry-run")
+    sys.stdout.flush()
     return subprocess.call(cmd)
+
+
+def _queue_client():
+    """The bundled queue client, for its socket checks (no bytecode is written into the plugin)."""
+    spec = importlib.util.spec_from_file_location("yobiru_bundled_codex_queue_client", str(BRIDGE / "codex_queue_client.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+BRIDGE_HINTS = {
+    "socket_missing": "start your Codex app-server; known-unsent messages are retried automatically",
+    "socket_stale": "nothing listens on the socket (stale file): restart the Codex app-server; messages are retried",
+    "socket_unreachable": "the app-server socket does not accept connections; check the app-server",
+    "socket_foreign": "the socket belongs to another user; point --codex-remote at your own app-server",
+    "socket_invalid": "--codex-remote does not name a Unix socket",
+    "socket_directory_unsafe": "other users can replace the socket; keep it in a private directory",
+    "runtime_unavailable": "the Codex CLI is missing or not executable; reinstall with --codex-path",
+    "app_unavailable": "the Codex desktop app is closed; messages are retried when it runs",
+}
 
 
 def bridge_status(home):
     cfg_path = home / "codex-bridge.json"
     out = {"installed": cfg_path.is_file(), "config": str(cfg_path)}
     if out["installed"]:
+        cfg, db = {}, None
         try:
             cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
             out["dispatcher_thread_id"] = cfg.get("dispatcher_thread_id")
             out["allow_replies"] = bool(cfg.get("allow_replies"))
             db = Path(cfg.get("bridge_home") or str(home / "codex-bridge")) / "bridge.sqlite3"
-        except (OSError, ValueError) as e:
+        except (OSError, ValueError, AttributeError) as e:
             out["error"] = "cannot read bridge config: %s" % e
-            db = None
+        remote = cfg.get("codex_remote") if isinstance(cfg, dict) else None
+        out["transport"] = "unix_socket" if remote else "codex_desktop"
+        out["service"] = BRIDGE_SERVICE["linux" if remote else "darwin"]
+        hints = []
+        if remote:
+            out.update({"codex_remote": remote, "codex_home": cfg.get("codex_home"), "codex_path": cfg.get("codex_path")})
+            cli = cfg.get("codex_path")
+            out["codex_path_ok"] = bool(cli) and os.path.isfile(cli) and os.access(cli, os.X_OK)
+            try:
+                client = _queue_client()
+                problem = client.unix_socket_problem(client.unix_socket_path(remote))
+                out["socket"] = "listening" if problem is None else problem[0]
+            except Exception as e:   # a diagnostic reports, it does not crash
+                out["socket"] = "invalid_config"
+                problem = ("invalid_config", str(e))
+            if problem is not None:
+                hints.append(BRIDGE_HINTS.get(problem[0], problem[1]))
+            if not out["codex_path_ok"]:
+                hints.append(BRIDGE_HINTS["runtime_unavailable"])
         if db is not None and db.is_file():
             try:
                 con = sqlite3.connect(db.as_uri() + "?mode=ro", uri=True, timeout=2)
                 try:
                     out["queue"] = dict(con.execute("SELECT state, COUNT(*) FROM messages GROUP BY state").fetchall())
+                    out["reasons"] = {"%s:%s" % row[:2]: row[2] for row in con.execute(
+                        "SELECT state, error, COUNT(*) FROM messages WHERE state IN ('retry','uncertain') "
+                        "GROUP BY state, error").fetchall()}
                 finally:
                     con.close()
             except sqlite3.Error as e:
                 out["queue_error"] = str(e)
+        for reason in out.get("reasons", {}):
+            state, error = reason.split(":", 1)
+            if state == "retry" and error in BRIDGE_HINTS and BRIDGE_HINTS[error] not in hints:
+                hints.append(BRIDGE_HINTS[error])
+        if out.get("queue", {}).get("uncertain"):
+            hints.append("uncertain: the queue command may have reached Codex, so it is never resent automatically. "
+                         "The bridge keeps checking the dispatcher session (in its configured Codex home) for the "
+                         "[TAILMSG:<id>] marker. If it never appears, handle that message by hand "
+                         "(`inbox --pending`); do not delete the queue to force a resend")
+        out["hints"] = hints
     print(json.dumps(out, indent=2, ensure_ascii=False))
     return 0
 

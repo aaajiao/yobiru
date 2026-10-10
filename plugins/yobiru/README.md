@@ -3,7 +3,7 @@
 Agent-to-agent messages, file handoff and receiver-controlled wake-ups between machines on your own
 Tailscale network, using the tailmsg protocol v1. One package for Codex, Cursor and Grok Bot.
 
-Version 0.1.0. Source: <https://github.com/chekusu/yobiru>. Not submitted to or reviewed by any
+Version 0.2.0. Source: <https://github.com/chekusu/yobiru>. Not submitted to or reviewed by any
 marketplace.
 
 ## Contents
@@ -19,7 +19,7 @@ marketplace.
 | `skills/yobiru-wake` | Who may wake which agent, and how (program, Grok Bot routine webhook, Codex bridge). |
 | `scripts/yobiru`, `scripts/yobiru.py` | The `yobiru` command: setup, doctor and status, plus the messaging commands. |
 | `scripts/tailmsg.py` | The bundled tailmsg CLI and receiver (stdlib only). |
-| `scripts/codex_bridge/` | Optional macOS bridge into a fixed Codex desktop session. |
+| `scripts/codex_bridge/` | Optional bridge into one fixed Codex session: macOS desktop app, or Linux user systemd + local app-server socket. |
 | `scripts/SOURCES.json` | Where the bundled files come from, with SHA-256. |
 
 No hooks, MCP servers or permission settings are included. Installing the plugin runs nothing.
@@ -57,7 +57,7 @@ tailmsg homes are used as they are; `setup` and `wake-config` only add what you 
 | `paths`, `doctor`, `status`, `version` | never |
 | `setup`, `wake-config`, `install-runtime` | only with `--apply` |
 | `service-template KIND` | never (prints a definition) |
-| `codex-bridge status` | never; `install` / `rollback` are macOS-only and support `--dry-run` |
+| `codex-bridge status` | never; `install` / `rollback` (macOS or Linux) support `--dry-run` (no writes) and `--no-start` (files only) |
 | `send`, `reply`, `inbox`, `show`, `fetch`, `ack`, `wake`, `peers`, `serve` | tailmsg commands, passed through unchanged |
 
 ## Safety

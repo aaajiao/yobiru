@@ -2,9 +2,14 @@
 import json
 import os
 import plistlib
+import shutil
+import socket
 import stat
+import subprocess
 import sys
+import tempfile
 import unittest
+import uuid
 from pathlib import Path
 
 from support.pkg import REPO, Package, free_port, snapshot
@@ -342,15 +347,121 @@ class RuntimeAndServiceTests(Base):
         self.assertIn('"%s"' % str(home / "tailmsg.py").replace("%", "%%").replace("$", "$$"), line)
         self.assertTrue(line.endswith(' "serve"'), line)
 
-    def test_codex_bridge_install_fails_clearly_off_macos(self):
-        if sys.platform == "darwin":
-            self.skipTest("macOS runs the real installer")
+    def test_codex_bridge_needs_a_supported_host_and_an_explicit_socket(self):
         self.write_config({"allow": ["peer"]})
-        r = self.yobiru("codex-bridge", "install", "--thread-id", "00000000-0000-4000-8000-000000000000", "--dry-run")
-        self.assertEqual(3, r.returncode)
-        self.assertIn("host capability missing", r.stderr)
+        r = self.yobiru("codex-bridge", "install", "--thread-id", str(uuid.uuid4()), "--dry-run")
+        if sys.platform == "linux":
+            self.assertEqual(2, r.returncode)
+            self.assertIn("--codex-remote", r.stderr)
+        elif sys.platform != "darwin":
+            self.assertEqual(3, r.returncode)
+            self.assertIn("host capability missing", r.stderr)
         r, res = PKG.run_json(["codex-bridge", "status"], self.user)
         self.assertFalse(res["installed"])
+
+
+FAKE_SYSTEMCTL = """#!/bin/sh
+printf '%s\\n' "$*" >> "$(dirname "$0")/systemctl.log"
+exit 0
+"""
+
+
+@unittest.skipUnless(sys.platform == "linux", "Linux user-systemd bridge")
+class LinuxCodexBridgeTests(Base):
+    """`codex-bridge` through the unpacked plugin: forwarding, file-only installs and cache independence.
+    A fake systemctl and fake codex sit on PATH and a temporary AF_UNIX socket stands in for the app-server."""
+
+    def setUp(self):
+        super().setUp()
+        self.home = self.user / "data home 100% $X"
+        self.write_config({"allow": ["peer"], "agents": {"grok": {"wake_adapter": {"type": "exec", "argv": ["/bin/true"]}}}})
+        (self.home / "tailmsg.py").write_text("# receiver\n")
+        self.fakes = self.user / "fake tools"
+        self.fakes.mkdir()
+        for name, text in (("systemctl", FAKE_SYSTEMCTL), ("codex", "#!/bin/sh\nexit 0\n")):
+            (self.fakes / name).write_text(text)
+            (self.fakes / name).chmod(0o755)
+        self.codex_home = self.user / "codex home"
+        self.codex_home.mkdir()
+        sock_dir = Path(tempfile.mkdtemp(prefix="yobiru-cli-")).resolve()
+        self.addCleanup(shutil.rmtree, str(sock_dir), True)
+        os.chmod(str(sock_dir), 0o700)
+        self.socket_path = sock_dir / "app.sock"
+        self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.listener.bind(str(self.socket_path))
+        self.listener.listen(4)
+        self.addCleanup(self.listener.close)
+        self.thread = str(uuid.uuid4())
+        self.extra = {"PATH": "%s:%s" % (PKG.bin, self.fakes)}
+
+    def bridge(self, *args):
+        return self.yobiru("--home", str(self.home), "codex-bridge", *args, extra=self.extra)
+
+    def install_args(self):
+        return ["install", "--thread-id", self.thread, "--codex-remote", "unix://" + str(self.socket_path),
+                "--codex-home", str(self.codex_home)]
+
+    def systemctl_calls(self):
+        log = self.fakes / "systemctl.log"
+        return log.read_text().splitlines() if log.exists() else []
+
+    def test_wrapper_forwards_to_the_linux_installer_without_writes(self):
+        before, plugin_before = snapshot(self.user), snapshot(PKG.plugin)
+        r = self.bridge(*(self.install_args() + ["--codex-path", str(self.fakes / "codex"), "--allow-replies", "--dry-run"]))
+        self.assertEqual(0, r.returncode, r.stderr)
+        plan = json.loads(r.stdout)
+        self.assertEqual((self.thread, "unix://" + str(self.socket_path), str(self.fakes / "codex"),
+                          str(self.codex_home), True, str(self.home)),
+                         (plan["dispatcher_thread_id"], plan["codex_remote"], plan["codex_path"], plan["codex_home"],
+                          plan["allow_replies"], plan["tailmsg_home"]))
+        self.assertEqual(before, snapshot(self.user))
+        self.assertEqual(plugin_before, snapshot(PKG.plugin))         # no __pycache__ in the plugin cache
+        self.assertEqual([], self.systemctl_calls())
+        r = self.bridge("install", "--thread-id", self.thread, "--codex-remote", "ws://127.0.0.1:4500", "--dry-run")
+        self.assertEqual(1, r.returncode)
+        self.assertIn("unix:///", r.stderr)
+
+    def test_installed_bridge_runs_without_the_plugin_cache(self):
+        r = self.bridge(*(self.install_args() + ["--no-start"]))
+        self.assertEqual(0, r.returncode, r.stderr)
+        self.assertEqual([], self.systemctl_calls())
+        cfg = self.config()
+        adapter = cfg["agents"]["codex"]["wake_adapter"]["argv"]
+        self.assertEqual(str(self.home / "codex-local" / "codex_bridge.py"), adapter[1])
+        self.assertEqual({"wake_adapter": {"type": "exec", "argv": ["/bin/true"]}}, cfg["agents"]["grok"])
+        unit = (self.user / ".config/systemd/user/tailmsg-codex-bridge.service").read_text()
+        self.assertNotIn(str(PKG.cache), unit)                         # never runs from the plugin cache
+        (self.home / "inbox").mkdir()
+        moved = PKG.cache.with_name("moved away")
+        os.rename(str(PKG.cache), str(moved))
+        try:
+            env = PKG.env(self.user)
+            run = lambda *a: subprocess.run([sys.executable] + list(adapter[1:4]) + list(a), env=env,
+                                            capture_output=True, text=True)
+            status = run("status")
+            self.assertEqual(0, status.returncode, status.stderr)
+            self.assertEqual([], json.loads(status.stdout))
+            wake = run("wake", str(self.home / "inbox" / "missing_0001.json"))
+            self.assertEqual(1, wake.returncode)                       # rejected input, fixed reason only
+            self.assertIn("codex_bridge: ", wake.stderr)
+        finally:
+            os.rename(str(moved), str(PKG.cache))
+
+    def test_status_diagnoses_socket_and_rollback_is_file_only(self):
+        r = self.bridge(*(self.install_args() + ["--no-start"]))
+        receipt = json.loads(r.stdout)
+        r, res = PKG.run_json(["--home", str(self.home), "codex-bridge", "status"], self.user, extra=self.extra)
+        self.assertEqual(("unix_socket", "listening", True, False),
+                         (res["transport"], res["socket"], res["codex_path_ok"], res["allow_replies"]))
+        self.listener.close()
+        r, res = PKG.run_json(["--home", str(self.home), "codex-bridge", "status"], self.user, extra=self.extra)
+        self.assertEqual("socket_stale", res["socket"])
+        self.assertTrue(any("stale" in hint for hint in res["hints"]))
+        r = self.bridge("rollback", receipt["backup"], "--no-start")
+        self.assertEqual(0, r.returncode, r.stderr)
+        self.assertFalse((self.home / "codex-bridge.json").exists())
+        self.assertNotIn("codex", self.config().get("agents", {}))
+        self.assertEqual([], self.systemctl_calls())
 
 
 class UnsafeInputTests(Base):

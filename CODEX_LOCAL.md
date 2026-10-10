@@ -1,13 +1,16 @@
-# Codex 桌面本地入口
+# Codex 本地入口（macOS 桌面 / Linux app-server）
 
-来信先进入一个固定的 Codex 桌面会话，由该会话查找相关任务、转交请求或派生新任务。会话空闲时不运行模型；后台服务负责扫描和排队。重启使用已保存的同一会话 ID。
+来信先进入一个固定的 Codex 会话，由该会话查找相关任务、转交请求或派生新任务。会话空闲时不运行模型；后台服务负责扫描和排队。重启使用已保存的同一会话 ID。
 
 ```text
 Tailscale 身份校验 → Tailmsg inbox
   → wake exec / 定时补扫 → SQLite 去重队列
   → 官方 codex queue --thread <固定 UUID>
+     （macOS：桌面应用；Linux：--remote unix:///<本机 app-server socket>）
   → 固定入口会话 → 查找 / 转交 / 派生任务
 ```
+
+两个平台共用同一份适配器、SQLite 队列、去重、进程锁、重试和 `uncertain` 核对逻辑，区别只在投递通道和服务管理：macOS 用 LaunchAgent 并检查桌面进程；Linux 用 user systemd 服务，并只连接配置中明确写出的、属于当前用户的本机 Unix socket。Linux 部分见下文“Linux（user systemd + app-server）”一节。
 
 ## 接口与语义
 
@@ -24,7 +27,7 @@ Tailscale 身份校验 → Tailmsg inbox
 
 先在桌面创建一个固定入口会话，以本仓库的 `CODEX_DISPATCHER.md` 为工作流。安装器需要它的准确 UUID，不会自行创建或猜测会话。
 
-在该会话中明确授予需要的消息处理、会话搜索、转交及派生权限。工作流模板不构成授权。此安装器面向 macOS，要求已安装提供 `codex queue` 的 Codex 桌面 CLI，以及由 `dev.tailmsg` 管理的 Tailmsg 接收端；其他平台可以继续使用 Tailmsg 本体。
+在该会话中明确授予需要的消息处理、会话搜索、转交及派生权限。工作流模板不构成授权。`install_codex_bridge.py` 面向 macOS，要求已安装提供 `codex queue` 的 Codex 桌面 CLI，以及由 `dev.tailmsg` 管理的 Tailmsg 接收端；Linux 见下文；其他平台可以继续使用 Tailmsg 本体。
 
 ```sh
 python3 install_codex_bridge.py --thread-id <固定入口 UUID>
@@ -49,9 +52,65 @@ tailmsg inbox --pending --agent codex
 
 停止适配器：`launchctl bootout gui/$(id -u)/dev.tailmsg.codex-bridge`。完整回滚：先读取 `~/.tailmsg/codex-bridge/installation.json` 的 `backup` 路径，再运行 `python3 install_codex_bridge.py --rollback <backup路径>`。它恢复那一版代码、指令、配置和服务状态，重新加载既有 `dev.tailmsg`；不删除消息、队列、处理记录或入口会话。
 
+## Linux（user systemd + app-server）
+
+### 前提
+
+安装器和插件都不会启动 Codex。需要事先具备：
+
+- 已安装提供 `codex queue --remote` 的官方 Codex CLI（在 `PATH` 上，或用 `--codex-path` 指定）。
+- 当前用户自己运行的本机 Codex app-server，监听一个 Unix socket（例如用 `codex app-server --listen unix://PATH` 启动的 `PATH`）。只接受 `unix:///绝对路径`；不支持 `ws://`/`wss://` 等网络端点，也不使用 CLI 的隐式默认 `unix://`。
+- 该 app-server 中一个已存在的入口会话 UUID。安装器不创建会话，不使用 `--last`，也不接受会话名称。
+- 可用的 user systemd 管理器（`systemctl --user` 可用；需要在登出后继续运行时启用 lingering）。非交互 shell 可能还需设置 `XDG_RUNTIME_DIR`。
+- 已用 `install-runtime` 安装到数据目录的 Tailmsg 接收端；接收端服务名按 `service-template systemd-user` 的约定为 `tailmsg.service`。
+
+### 快速开始
+
+```sh
+Y="/path/to/yobiru/scripts/yobiru"
+SOCK=/absolute/path/to/app-server.sock      # 你的 app-server 实际监听的 socket
+sh "$Y" codex-bridge install --thread-id <入口会话 UUID> --codex-remote "unix://$SOCK" --dry-run
+sh "$Y" codex-bridge install --thread-id <入口会话 UUID> --codex-remote "unix://$SOCK"
+sh "$Y" codex-bridge status
+```
+
+`--dry-run` 只检查并打印计划（含将写入的 unit 文件），不写任何文件，也不调用 `systemctl`。正式安装把适配器复制到 `<数据目录>/codex-local/`（不从插件缓存运行），写入 `codex-bridge.json`、`agents.codex.wake_adapter`、安装回执和 `~/.config/systemd/user/tailmsg-codex-bridge.service`（遵循绝对路径的 `$XDG_CONFIG_HOME`），然后 `daemon-reload`、`enable`、`restart` 该服务，并对 `tailmsg.service` 执行 `try-restart`（只在它已运行时重启）。路径中的空格、`%` 和 `$` 会按 systemd 规则转义。
+
+`--no-start` 只写文件，完全不调用 `systemctl`；之后自行执行 `systemctl --user daemon-reload && systemctl --user enable tailmsg-codex-bridge.service && systemctl --user restart tailmsg-codex-bridge.service && systemctl --user try-restart tailmsg.service`。用 `restart` 而不是 `enable --now`，这样已运行的服务也会加载升级后的代码。
+
+### 权限与账户
+
+- 只使用属于当前用户的 socket；socket 不存在、不是 socket、属于其他用户、所在目录可被他人替换，或没有进程监听（残留的旧 socket）时，都不会调用 `codex queue`，消息记为已知未发送并自动退避重试。
+- 核对（`uncertain` 时读取入口会话）使用短时只读的官方 `codex app-server --listen stdio://`，它从 `CODEX_HOME` 读取会话。为保证读的是目标 app-server 的同一账户和会话存储，安装器总是固定记录 `codex_home`：`--codex-home`，否则已安装的值，首次安装时再看 `$CODEX_HOME`，最后是 `~/.codex`。之后在其他 `CODEX_HOME` 环境里升级或触发 wake 都不会改变它。`codex_path` 同样优先保留已安装的值。
+- 安装器新建的运行文件和目录（适配器副本、`codex-bridge.json`、安装回执、备份、状态目录）使用仅当前用户可访问的权限（`umask 077`，文件 0600）；已有的 `config.json` 保留原权限，systemd unit 为 0644（不含机密）。服务以当前用户运行，不需要 root。
+- `allow_replies` 首次安装为 false；升级时保留已授权的设置，`--no-allow-replies` 可显式关闭，`--allow-replies` 仅在用户明确授权后使用。
+- 既有顶层 exec/webhook adapter、其他 agent 及未知字段原样保留；只设置 `agents.codex.wake_adapter`。已有不同的 codex adapter、不同的入口 UUID、混合 UUID 的队列、或已被另一数据目录占用的 user unit 时，安装在写入任何文件之前拒绝。
+
+### 状态含义与 `uncertain` 排查
+
+`enqueued` 只表示官方 CLI 返回了该会话的入队回执，不表示模型已处理或任务完成；完成与否要看入口会话的记录、产物或回复。
+
+`sh "$Y" codex-bridge status` 给出通道、socket 状态（`listening`、`socket_missing`、`socket_stale` 等）、队列各状态计数、`retry`/`uncertain` 的原因和处理建议，不输出消息正文。`retry` 表示确定没有发出，会自动重试（退避最长约一小时一次）。`uncertain` 表示 `codex queue` 已启动但超时、失败或回执无效：消息可能已进入会话，因此绝不自动重发。适配器会定期在固定入口会话（`codex_home` 对应的账户）中查找 `[TAILMSG:<id>]` 标记，找到即记为 `delivered`。长期找不到时，请在该会话中人工确认后用 `inbox --pending` 处理原信；不要删除队列或状态来强制重发。
+
+```sh
+systemctl --user status tailmsg-codex-bridge.service
+journalctl --user -u tailmsg-codex-bridge.service -n 30 --no-pager
+```
+
+### 回滚
+
+读取 `<数据目录>/codex-bridge/installation.json` 中的 `backup`，然后：
+
+```sh
+sh "$Y" codex-bridge rollback <backup 路径> --dry-run
+sh "$Y" codex-bridge rollback <backup 路径>
+```
+
+回滚只接受该数据目录 `backups/` 下由 Linux 安装器生成的备份，并校验清单中的目标路径。它先 `disable --now` 并确认服务已停止（失败，或服务仍在运行但 unit 文件已不存在时，什么都不恢复），再恢复代码、配置、unit 和回执，按安装前记录的启用/运行状态恢复服务，并 `try-restart` 接收端。若当前 unit 已属于另一个数据目录则拒绝。`--no-start` 只恢复文件、不碰服务（适合已手动停服时）。inbox、SQLite 队列、处理记录和入口会话都不会被删除；保留的队列继续锁定原入口 UUID。
+
 ## 验收
 
-离线：`python3 -m unittest -v test_codex_bridge test_codex_queue_client test_install_codex_bridge`。
+离线：`python3 -m unittest -v test_codex_bridge test_codex_queue_client test_install_codex_bridge test_install_codex_bridge_linux`。Linux 测试使用临时 AF_UNIX socket、假的 `codex` 与 `systemctl` 可执行文件和隔离的 HOME，不连接真实 app-server、不调用真实 systemd。
 
 桌面会话继续遵守 Codex 原生权限策略。入口能够请求查找、转交和创建任务；如果原生工具要求审批，消息会保留在该入口等待用户处理，适配器不会代替用户批准。部署与真实验收结果见 [IMPLEMENTATION_REPORT.md](IMPLEMENTATION_REPORT.md)。
 

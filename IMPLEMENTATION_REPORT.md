@@ -11,14 +11,15 @@ Tailmsg inbox → 快速 wake 入队 / 定时补扫 → SQLite 持久去重队�
 | 文件 | 技术职责 |
 | --- | --- |
 | `codex_bridge.py` | 校验本地认证记录和当前白名单；持久队列；now/batch/none；收件排序；进程锁；重试和未知结果核对 |
-| `codex_queue_client.py` | 检查桌面进程；通过官方 CLI 向固定会话入队；只读核对会话中的通知标记 |
+| `codex_queue_client.py` | 检查桌面进程（macOS）或同用户本机 Unix socket（Linux，`--remote unix:///…`）；通过官方 CLI 向固定会话入队；按固定的 `CODEX_HOME` 只读核对会话中的通知标记 |
 | `install_codex_bridge.py` | 安装 exec adapter 与 macOS LaunchAgent；备份和回滚；保护固定入口 ID |
+| `install_codex_bridge_linux.py` | 安装 exec adapter 与 Linux user systemd 服务；dry-run 零写入、`--no-start` 不调用 systemctl；备份、升级、回滚并恢复原服务状态；保护固定入口 ID、队列和 unit 归属 |
 | `CODEX_DISPATCHER.md` | 入口工作流模板；会话路由、处理记录、ack 与回复权限边界 |
 | `test_*.py` | 离线验证队列、CLI 接口、安装和回滚 |
 
 ## 实现边界
 
-- Tailmsg 本体保持 Python 3.8+ 和既有跨平台行为；这个可选适配器目前面向 macOS 与提供 `codex queue` 的 Codex 桌面安装。
+- Tailmsg 本体保持 Python 3.8+ 和既有跨平台行为；这个可选适配器面向 macOS 的 Codex 桌面安装，以及 Linux 上用户自行运行的本机 Codex app-server（0.2.0 起）。Linux 部分目前只有离线测试，尚未在真实 app-server 上验收。
 - 固定会话 ID 和队列跨进程重启保留。空闲时不持续运行模型；桌面关闭时暂停投递。
 - 通知只包含消息 ID 和本地文件、配置、状态目录引用，不将来信正文作为 shell 命令执行。自定义安装目录贯穿处理记录、配置读取和 Tailmsg 命令。
 - 同级消息按验证后的收件时间排序，`now` 优先于 `batch`，`none` 不投递。

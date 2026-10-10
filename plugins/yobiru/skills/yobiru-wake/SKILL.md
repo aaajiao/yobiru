@@ -1,6 +1,6 @@
 ---
 name: yobiru-wake
-description: Configure whether and how other machines' Yobiru (tailmsg) messages wake this machine's agents - receiver-side wake policy per sender, quiet hours, rate limits, and per-agent wake adapters (a local program, a Grok Bot routine webhook, or the optional Codex desktop bridge). Use when the user wants messages to wake an agent right away, wants fewer or no wake-ups, or asks why an agent was or was not woken.
+description: Configure whether and how other machines' Yobiru (tailmsg) messages wake this machine's agents - receiver-side wake policy per sender, quiet hours, rate limits, and per-agent wake adapters (a local program, a Grok Bot routine webhook, or the optional Codex bridge for macOS desktop or a Linux app-server). Use when the user wants messages to wake an agent right away, wants fewer or no wake-ups, or asks why an agent was or was not woken.
 ---
 
 # Yobiru: wake-ups
@@ -68,10 +68,26 @@ a session) and return quickly; it must never act on the message text or grant pe
    reads the full message itself. Yobiru counts any HTTP 2xx as a delivered wake-up: the webhook was
    accepted, not completed. Check the routine's run history or the Bot's chat for the outcome.
 
-### Codex desktop on macOS (optional bridge)
+### Codex: one fixed dispatcher session (optional bridge)
 
-`sh Y codex-bridge install --thread-id UUID --dry-run` queues messages into one fixed Codex desktop
-session. Review the plan; it refuses to replace an existing dispatcher session or codex adapter.
+The bridge queues each authenticated codex message's ID and local paths (never its text) into one
+existing Codex session with the official `codex queue`, using a durable queue with retries.
+
+- macOS, Codex desktop app: `sh Y codex-bridge install --thread-id UUID --dry-run`.
+- Linux, user systemd + the user's own running Codex app-server on a local Unix socket:
+
+      sh Y codex-bridge install --thread-id UUID --codex-remote unix:///absolute/path/to/app-server.sock --dry-run
+
+  Add `--codex-home DIR` when that app-server uses a non-default `CODEX_HOME`; the bridge pins it so
+  reconciliation reads the same account. Prerequisites: the session exists, the app-server runs as
+  this user, `systemctl --user` works, and `install-runtime` was applied. The plugin never starts Codex.
+
+Review the plan, then run it without `--dry-run` when the user asked for the bridge (`--no-start`
+writes files only). Use `--allow-replies` only with the user's explicit authorization. Check with
+`sh Y codex-bridge status`: `enqueued` means queued into the session, not done; `retry` will be
+retried automatically (for example `socket_stale`: the app-server is not running); `uncertain` is
+never resent: follow the `hints`, and never delete the queue to force a resend. Undo with
+`sh Y codex-bridge rollback BACKUP` (the backup path is in the install output).
 
 ### Remove or test
 

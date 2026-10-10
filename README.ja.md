@@ -184,7 +184,19 @@ sh "$Y" ack MESSAGE_ID
 
 送信側は `--wake now`、`batch`、`none` を要求できますが、最終的には受信側が決定します。`yobiru-wake` スキルでローカル実行プログラムや webhook を設定してください。`wake-config` は `--apply` を付けない限りプレビューのみで、送信元・エージェントごとの上限、通知を控える時間帯、頻度制限を設定できます。Webhook URL と認証情報は、非公開ファイルや環境変数を介して参照します。
 
-アカウントで対応していれば、Grok Bot の routine webhook をアダプターの通知先にできます。[Routine webhook の文書](https://cursor.com/help/grok-bot/routines)を参照してください。オプションの macOS ブリッジでは、固定した Codex デスクトップセッションにメッセージをキュー登録できます。[Codex ブリッジ設定](CODEX_LOCAL.md)を参照してください。
+アカウントで対応していれば、Grok Bot の routine webhook をアダプターの通知先にできます。[Routine webhook の文書](https://cursor.com/help/grok-bot/routines)を参照してください。
+
+### オプションの Codex ブリッジ（macOS デスクトップまたは Linux app-server）
+
+`codex-bridge` は認証済みのメッセージを、窓口となる**既存の Codex セッション 1 つ**にキュー登録します。macOS では Codex デスクトップアプリ、Linux では user systemd サービスと自分で起動した Codex app-server を経由します。どちらも公式の `codex queue` コマンドを使い、重複排除と再試行を備えた永続 SQLite キューを共有します。プラグインは Codex を起動しません。Linux では Codex CLI、同じユーザーで動きローカル Unix ソケットで待ち受ける app-server、そのセッションの UUID、利用可能な `systemctl --user`、`install-runtime` で導入した受信プロセスが必要です。
+
+```sh
+sh "$Y" codex-bridge install --thread-id SESSION_UUID --codex-remote "unix:///absolute/path/to/app-server.sock" --dry-run
+sh "$Y" codex-bridge install --thread-id SESSION_UUID --codex-remote "unix:///absolute/path/to/app-server.sock"
+sh "$Y" codex-bridge status
+```
+
+`--dry-run` はファイルを書かず、サービスマネージャーも呼び出しません。`--no-start` はファイルの書き込みだけを行います。使うのは同一ユーザーのローカルソケットだけです（ネットワークエンドポイント、新規セッション作成、`--last` は使いません）。ブリッジは `codex_home`（`--codex-home`、なければインストール済みの値、初回は `$CODEX_HOME`、最後に `~/.codex`）を固定し、照合が app-server と同じアカウントを読むようにします。新規インストールでは自動返信はオフで、許可を得たうえで `--allow-replies` を指定します。Linux のアップグレードでは許可済みの設定が保持され（`--no-allow-replies` でオフにできます）、macOS の再インストールでは再度の指定が必要です。`enqueued` は CLI が通知を受け付けたことを示すだけで、タスク完了ではありません。`uncertain` はキュー登録の試行が Codex に届いた可能性があることを示し、自動では決して再送されません。確認方法は `status` が示します。詳細、権限、ロールバックは [Codex ブリッジ設定](CODEX_LOCAL.md)（中国語）を参照してください。
 
 | シグナル | 確認できること |
 |---|---|
@@ -234,7 +246,7 @@ codex plugin marketplace remove yobiru
 python3 tools/build_plugin.py sync
 python3 tools/build_plugin.py check
 python3 -m unittest discover -s tests -v
-python3 -m unittest -v test_codex_bridge test_codex_queue_client test_install_codex_bridge
+python3 -m unittest -v test_codex_bridge test_codex_queue_client test_install_codex_bridge test_install_codex_bridge_linux
 python3 tools/build_plugin.py release
 ```
 
@@ -243,8 +255,8 @@ python3 tools/build_plugin.py release
 | 対象 | 現在の検証範囲 |
 |---|---|
 | パッケージと CLI | 展開後の実行、空白を含むパス、設定の保持、隔離したテスト環境でのメッセージ・ファイル・返信・起動処理を自動検証しています。 |
-| Tailscale 通信 | 上流の `selftest.sh` は、一台の Linux マシンの実際の Tailscale アドレスで一時受信プロセスを使い、59 項目に合格しました。二台のマシン間のテストではありません。 |
-| Codex | Linux CLI でのインストール、有効状態、四つのスキルの検出、プラグインキャッシュからのコマンド実行を確認済みです。 |
+| Tailscale 通信 | 0.1.0 で（0.2.0 では再実行していません。コアは変更なし）、上流の `selftest.sh` は、一台の Linux マシンの実際の Tailscale アドレスで一時受信プロセスを使い、59 項目に合格しました。二台のマシン間のテストではありません。 |
+| Codex | 0.1.0 で（0.2.0 では未再確認）Linux CLI でのインストール、有効状態、四つのスキルの検出、プラグインキャッシュからのコマンド実行を確認済みです。0.2.0 の Linux と macOS のブリッジは、偽の CLI・偽の `systemctl`・一時ソケットを使うオフラインテストと展開済みパッケージのテストでのみ確認しています。実際の app-server での動作確認は主張しません。 |
 | Cursor / Grok Bot / DOTS | Cursor／Grok の導入経路はホストの文書に基づきます。実環境での受け入れ確認と、複数プラットフォーム間のエンドツーエンド連携は未検証です。DOTS コネクターは同梱していません。 |
 | 公開マーケットプレイスへの掲載 | 未申請・未承認です。リポジトリからのインストールとは別です。 |
 

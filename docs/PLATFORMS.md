@@ -32,6 +32,14 @@ configuration per host, because Cursor does not expand the standard `${PLUGIN_RO
   public-directory eligibility is claimed; this release targets local and repository marketplaces.
 - CLI used in the instructions: `codex plugin marketplace add|upgrade|remove`, `codex plugin
   add|remove NAME@MARKETPLACE` (checked against `codex plugin --help`, codex-cli 0.162.1).
+- Optional Codex bridge: `codex queue --thread <session UUID or exact name> --message TEXT` queues a
+  message for an existing session; `--remote` accepts `ws://`, `wss://`, `unix://` or `unix://PATH`
+  (checked against `codex queue --help`, codex-cli 0.162.1). Yobiru passes only a session UUID and an
+  explicit `unix:///absolute/path`. Reconciliation runs `codex app-server --listen stdio://` for a
+  read-only `thread/read` with the pinned `CODEX_HOME`. The Linux bridge expects the user to run the
+  app-server themselves (for example `codex app-server --listen unix://PATH`); how a given setup keeps
+  that app-server running is outside Yobiru. Neither has been exercised against a live app-server for
+  this release; see [VERIFICATION.md](VERIFICATION.md).
 
 ## Cursor
 

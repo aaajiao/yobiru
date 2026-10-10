@@ -65,13 +65,14 @@ as `sh .../scripts/yobiru` (or `python3 .../scripts/yobiru.py`), which works wit
 
 ```sh
 python3 -m unittest discover -s tests -v
-python3 -m unittest -v test_codex_bridge test_codex_queue_client test_install_codex_bridge
+python3 -m unittest -v test_codex_bridge test_codex_queue_client test_install_codex_bridge test_install_codex_bridge_linux
 ```
 
 `tests/` builds the archives in a temporary directory, unpacks them into a path with spaces outside
 the checkout and drives the unpacked `yobiru` command with an isolated `HOME`, a fake `tailscale`
 CLI and loopback-only receivers. No test reads or writes `~/.tailmsg`, calls the real Tailscale, uses
-port 7766, or contacts another machine.
+port 7766, or contacts another machine. The Codex bridge tests use temporary AF_UNIX sockets and fake `codex` and
+`systemctl` executables; they never reach a real app-server or the user's systemd manager.
 
 `sh selftest.sh` is the upstream end-to-end check. It needs Tailscale on the machine and runs
 temporary receivers on the machine's own Tailscale address, ports 7866-7883 (and a stub webhook on

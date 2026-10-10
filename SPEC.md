@@ -151,7 +151,7 @@ agent 名字规则：1–64 个字符，可以用中文等任意 Unicode；不�
 
      **URL 和密钥只从环境变量或权限为 0600 的文件里读**（文件权限更宽会直接拒绝），每次调用时现读，换密钥不用重启；它们**绝不写进** config、日志或收件箱，出错信息里也会被替换成 `<url>` / `<secret>`。
 
-   **各家 agent 的适配思路**：内置的是通用 `exec` / `webhook` 传输；Grok Bot 端到端尚未验证。可选 Codex macOS 适配器见 [CODEX_LOCAL.md](CODEX_LOCAL.md)。
+   **各家 agent 的适配思路**：内置的是通用 `exec` / `webhook` 传输；Grok Bot 端到端尚未验证。可选 Codex 适配器（macOS 桌面 / Linux app-server）见 [CODEX_LOCAL.md](CODEX_LOCAL.md)。
 
    - **Grok**：`webhook` 类型，URL 是一个由 webhook 触发的 Grok routine，密钥放在 routine 要求的请求头里。Grok 被叫醒后在自己的 box 上运行 `tailmsg inbox --pending` / `show` / `fetch` 处理信件，处理完 `ack`。
    - **Codex**（服务器）：`exec` 类型，一个小脚本读取 `TAILMSG_MSG_ID`，通过 Codex app-server 用 `thread/queue/add` 把“有一封 tailmsg 新信 `<id>`，请用 `tailmsg show <id>` 查看”排进既定线程，再 `thread/queue/start`；不要用 `turn/start`，不自动批准命令，按 `id` 去重保证幂等。

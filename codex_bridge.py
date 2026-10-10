@@ -21,6 +21,7 @@ import time
 
 
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+REASON_RE = re.compile(r"^[a-z][a-z_]{2,39}$")
 MAX_RECORD_BYTES = 1024 * 1024
 TOOL_SEND = "send_message_to_thread"
 TOOL_READ = "read_thread"
@@ -353,11 +354,13 @@ class Bridge:
                         self._set(row["id"], "enqueued")
                         counts["enqueued"] += 1
                 except Exception as exc:
-                    if getattr(exc, "delivery_unknown", True):
-                        self._set(row["id"], "uncertain", "send_result_unknown", self.clock() + self.retry_seconds)
+                    unknown = getattr(exc, "delivery_unknown", True)
+                    reason = _reason(exc, "send_result_unknown" if unknown else "send_unavailable")
+                    if unknown:
+                        self._set(row["id"], "uncertain", reason, self.clock() + self.retry_seconds)
                         counts["uncertain"] += 1
                     else:
-                        self._retry(row, "send_unavailable")
+                        self._retry(row, reason)
                         counts["retry"] += 1
                 finally:
                     self._close_client(client)
@@ -366,6 +369,12 @@ class Bridge:
     def status(self):
         """Return metadata only; no envelope bodies or exception details."""
         return [dict(row) for row in self.db.execute("SELECT * FROM messages ORDER BY created_at,id")]
+
+
+def _reason(exc, default):
+    """A client's fixed reason code (for example socket_stale) is safe to persist; messages are not."""
+    code = getattr(exc, "code", None)
+    return code if isinstance(code, str) and REASON_RE.fullmatch(code) else default
 
 
 def _tool_error(result):

@@ -184,7 +184,19 @@ sh "$Y" ack MESSAGE_ID
 
 发送方可以请求 `--wake now`、`batch` 或 `none`，最终由收件方决定。使用 `yobiru-wake` skill 配置本地可执行程序或 webhook。`wake-config` 默认只预览，添加 `--apply` 才会写入，并支持发送方／agent 限制、静默时间和频率限制。Webhook URL 和凭证通过私密文件或环境变量引用。
 
-如果账户支持，Grok Bot routine 的 webhook 可以作为适配器目标。参见 [routine webhook 文档](https://cursor.com/help/grok-bot/routines)。可选的 macOS 桥接可以将消息排入固定的 Codex 桌面会话；参见 [Codex 桥接配置](CODEX_LOCAL.md)。
+如果账户支持，Grok Bot routine 的 webhook 可以作为适配器目标。参见 [routine webhook 文档](https://cursor.com/help/grok-bot/routines)。
+
+### 可选的 Codex 桥接（macOS 桌面或 Linux app-server）
+
+`codex-bridge` 把已认证的来信排入**一个已存在的 Codex 会话**，由它充当入口：macOS 经由 Codex 桌面应用，Linux 经由 user systemd 服务和你自己运行的 Codex app-server。两者都使用官方 `codex queue` 命令，共用带去重和重试的持久 SQLite 队列。插件不会启动 Codex。Linux 需要 Codex CLI、以同一用户运行并监听本机 Unix socket 的 app-server、该会话的 UUID、可用的 `systemctl --user`，以及用 `install-runtime` 安装的接收端：
+
+```sh
+sh "$Y" codex-bridge install --thread-id SESSION_UUID --codex-remote "unix:///absolute/path/to/app-server.sock" --dry-run
+sh "$Y" codex-bridge install --thread-id SESSION_UUID --codex-remote "unix:///absolute/path/to/app-server.sock"
+sh "$Y" codex-bridge status
+```
+
+`--dry-run` 不写文件、不调用服务管理器；`--no-start` 只写文件。只使用同一用户的本机 socket（不支持网络端点，不创建会话，不使用 `--last`）。桥接会固定记录 `codex_home`（`--codex-home`，否则已安装的值，首次安装时用 `$CODEX_HOME`，最后是 `~/.codex`），使核对读取与 app-server 相同的账户。新安装默认关闭自动回复，需经授权后传入 `--allow-replies`；Linux 升级会保留已授权的设置（`--no-allow-replies` 可关闭），macOS 重新安装时需要再次传入该选项。`enqueued` 表示 CLI 接收了通知，不代表任务已完成。`uncertain` 表示一次入队尝试可能已到达 Codex：它绝不会被自动重发，`status` 会说明如何核对。详情、权限和回滚见 [Codex 桥接配置](CODEX_LOCAL.md)。
 
 | 信号 | 能说明什么 |
 |---|---|
@@ -234,7 +246,7 @@ codex plugin marketplace remove yobiru
 python3 tools/build_plugin.py sync
 python3 tools/build_plugin.py check
 python3 -m unittest discover -s tests -v
-python3 -m unittest -v test_codex_bridge test_codex_queue_client test_install_codex_bridge
+python3 -m unittest -v test_codex_bridge test_codex_queue_client test_install_codex_bridge test_install_codex_bridge_linux
 python3 tools/build_plugin.py release
 ```
 
@@ -243,8 +255,8 @@ python3 tools/build_plugin.py release
 | 范围 | 当前验证边界 |
 |---|---|
 | 打包与 CLI | 自动检查覆盖解压后运行、含空格的路径、配置保留，以及使用隔离测试环境的消息／文件／回复／唤醒流程。 |
-| Tailscale 传输 | 上游 `selftest.sh` 在一台 Linux 机器的真实 Tailscale 地址上使用临时接收进程，通过了 59 项检查；这不是双机测试。 |
-| Codex | 已验证 Linux CLI 安装、插件启用状态、四个 skills 的发现，以及从插件缓存执行命令。 |
+| Tailscale 传输 | 在 0.1.0 上（0.2.0 未重跑，核心未改动），上游 `selftest.sh` 在一台 Linux 机器的真实 Tailscale 地址上使用临时接收进程，通过了 59 项检查；这不是双机测试。 |
+| Codex | 在 0.1.0 上（0.2.0 未重复）已验证 Linux CLI 安装、插件启用状态、四个 skills 的发现，以及从插件缓存执行命令。0.2.0 中 Linux 与 macOS 桥接仅由使用假 CLI、假 `systemctl` 和临时 socket 的离线及解包测试覆盖；未声称已在真实 app-server 上运行。 |
 | Cursor / Grok Bot / DOTS | Cursor／Grok 安装路径依据宿主文档；实机验收与跨平台端到端协作仍未验证。未提供 DOTS 连接器。 |
 | 公共市场上架 | 尚未提交或获批；仓库安装与公共上架是两回事。 |
 

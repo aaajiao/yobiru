@@ -1,15 +1,22 @@
 """Fixed-session Tailmsg delivery through the installed official Codex CLI.
 
 CodexAppClient(config).call_tool('send_message_to_thread', arguments) uses the
-official `codex queue` command. The desktop owns and executes the real session;
-this client never creates/resumes a model session or changes its permissions.
+official `codex queue` command. The Codex desktop app (macOS) or an existing
+local app-server reached through `--remote unix:///absolute/socket` (Linux) owns
+and executes the real session; this client never creates/resumes a model
+session, never selects `--last`, and never changes permissions.
 `read_thread` uses a short-lived official app-server for a read-only thread/read
 request, returning only Tailmsg markers from user messages for reconciliation.
 
 Configuration: dispatcher_thread_id (or caller_thread_id), codex_cli_path
-(optional), timeout (seconds, default 30). Only the fixed local dispatcher can
-be addressed. No send is retried here. CodexAppError.delivery_unknown is True
-after a queue subprocess times out or fails; reconcile before any retry.
+(optional on macOS), codex_remote (optional absolute unix:/// socket URL owned
+by this user; requires a UUID thread and codex_path), codex_home (optional
+CODEX_HOME for both queue and reconciliation, so reads use the same account and
+session store as the target runtime), timeout (seconds, default 30). Only the
+fixed local dispatcher can be addressed. No send is retried here.
+CodexAppError.delivery_unknown is False when the runtime was unavailable before
+any attempt and True after a queue subprocess times out, fails or returns no
+valid receipt; reconcile before any retry.
 """
 
 from __future__ import annotations
@@ -20,9 +27,12 @@ import os
 from pathlib import Path
 import re
 import selectors
+import socket
+import stat
 import subprocess
 import time
-from typing import Any, Mapping
+from typing import Any, Mapping, Optional, Tuple
+import uuid
 
 
 DEFAULT_CLI_PATH = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
@@ -30,6 +40,9 @@ APP_EXECUTABLE = "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 MARKER_RE = re.compile(r"\[TAILMSG:[A-Za-z0-9_-]{8,64}\]")
 QUEUE_RECEIPT_RE = re.compile(r"^Queued message ([A-Za-z0-9_-]{8,128}) for thread ([A-Za-z0-9_-]{8,128})\.$", re.MULTILINE)
+
+
+UNIX_REMOTE_PREFIX = "unix://"
 
 
 class CodexAppError(RuntimeError):
@@ -52,14 +65,93 @@ def _user_markers(thread: Mapping[str, Any], turn_limit: int) -> list[str]:
     return sorted(found)
 
 
+def unix_socket_path(remote: Any) -> str:
+    """Return the socket path of an explicit `unix:///absolute/path` URL or raise invalid_config.
+
+    Network endpoints (ws://, wss://), the CLI's implicit default (`unix://`), relative or
+    non-normalized paths, queries, fragments and control characters are all rejected."""
+    if not isinstance(remote, str) or not remote.startswith(UNIX_REMOTE_PREFIX + "/"):
+        raise CodexAppError("codex_remote must be an explicit unix:///absolute/socket URL.", False, "invalid_config")
+    path = remote[len(UNIX_REMOTE_PREFIX):]
+    if any(ord(char) < 32 or char in "\x7f?#" for char in path) or path.startswith("//") or \
+            path == "/" or path.endswith("/") or os.path.normpath(path) != path:
+        raise CodexAppError("codex_remote must be an explicit unix:///absolute/socket URL.", False, "invalid_config")
+    return path
+
+
+def _private_directory(path: str) -> bool:
+    """Only this user (or root, or a sticky shared directory) may replace entries in it."""
+    info = os.stat(path)
+    if info.st_uid not in (os.getuid(), 0):
+        return False
+    return not (info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)) or bool(info.st_mode & stat.S_ISVTX)
+
+
+def unix_socket_problem(path: str, timeout: float = 2.0) -> Optional[Tuple[str, str]]:
+    """None when a same-user app-server is listening on `path`, else (code, explanation).
+
+    The endpoint may be a symlink into a private runtime directory, so the endpoint's type and
+    owner are checked. A connect probe sends no bytes; refusal means a stale socket file, i.e.
+    nothing could have been delivered yet."""
+    try:
+        info = os.stat(path)
+    except FileNotFoundError:
+        return "socket_missing", "The Codex app-server socket does not exist; start the app-server."
+    except OSError:
+        return "socket_unavailable", "The Codex app-server socket cannot be inspected."
+    if not stat.S_ISSOCK(info.st_mode):
+        return "socket_invalid", "The configured Codex remote is not a Unix socket."
+    if info.st_uid != os.getuid():
+        return "socket_foreign", "The Codex app-server socket belongs to another user; only a same-user socket is used."
+    try:
+        directories = {os.path.dirname(path), os.path.dirname(os.path.realpath(path))}
+        if not all(_private_directory(directory) for directory in directories):
+            return "socket_directory_unsafe", "Other users can replace the Codex socket; use a private directory."
+    except OSError:
+        return "socket_unavailable", "The Codex app-server socket directory cannot be inspected."
+    try:
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    except OSError:
+        # For example EMFILE: no probe was possible, so nothing was sent either.
+        return "socket_probe_failed", "A connection probe could not be created (local resource limit?)."
+    try:
+        probe.settimeout(timeout)
+        probe.connect(path)
+    except ConnectionRefusedError:
+        return "socket_stale", "Nothing is listening on the Codex app-server socket (stale socket); start or restart the app-server."
+    except OSError:
+        return "socket_unreachable", "The Codex app-server socket did not accept a connection."
+    finally:
+        probe.close()
+    return None
+
+
 class CodexAppClient:
     def __init__(self, config: Mapping[str, Any] | None = None, **kwargs: Any):
         settings = dict(config or {})
         settings.update(kwargs)
         self.thread_id = settings.get("dispatcher_thread_id") or settings.get("caller_thread_id")
-        self.cli_path = str(settings.get("codex_cli_path") or settings.get("codex_path") or DEFAULT_CLI_PATH)
+        configured_cli = settings.get("codex_cli_path") or settings.get("codex_path")
+        self.cli_path = str(configured_cli or DEFAULT_CLI_PATH)
         if not isinstance(self.thread_id, str) or not self.thread_id.strip():
             raise CodexAppError("Configure the fixed dispatcher thread ID.", False, "invalid_config")
+        self.remote = settings.get("codex_remote")
+        self.socket_path = None
+        if self.remote is not None:
+            self.socket_path = unix_socket_path(self.remote)
+            # A session name could resolve to another session; only an exact existing UUID is addressed.
+            try:
+                exact = str(uuid.UUID(self.thread_id)) == self.thread_id
+            except ValueError:
+                exact = False
+            if not exact:
+                raise CodexAppError("The Unix socket transport needs the dispatcher's lowercase session UUID.", False, "invalid_config")
+            if not configured_cli or not os.path.isabs(self.cli_path):
+                raise CodexAppError("The Unix socket transport needs an absolute codex_path.", False, "invalid_config")
+        self.codex_home = settings.get("codex_home")
+        if self.codex_home is not None and (not isinstance(self.codex_home, str) or not os.path.isabs(self.codex_home)
+                                            or any(ord(char) < 32 for char in self.codex_home)):
+            raise CodexAppError("codex_home must be an absolute directory path.", False, "invalid_config")
         try:
             self.timeout = float(settings.get("timeout", settings.get("timeout_seconds", 30)))
         except (TypeError, ValueError) as error:
@@ -92,15 +184,31 @@ class CodexAppClient:
         except (OSError, subprocess.TimeoutExpired):
             return False
 
+    def _env(self) -> dict[str, str] | None:
+        """Pin CODEX_HOME when configured so queue and reconciliation use the runtime's account."""
+        if self.codex_home is None:
+            return None
+        return dict(os.environ, CODEX_HOME=self.codex_home)
+
     def _send(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         prompt = arguments.get("prompt")
         if not isinstance(prompt, str) or not prompt.strip():
             raise CodexAppError("A nonempty queue notification is required.", False, "invalid_request")
-        if not self._app_running():
+        command = [self.cli_path, "queue", "--thread", self.thread_id, "--message", prompt]
+        if self.socket_path is not None:
+            try:
+                problem = unix_socket_problem(self.socket_path, min(2.0, self.timeout))
+            except Exception:
+                # Still before the queue command: nothing can have been delivered.
+                problem = ("socket_probe_failed", "The Codex app-server socket could not be checked.")
+            if problem is not None:
+                raise CodexAppError(problem[1] + " Delivery was not attempted.", False, problem[0])
+            command += ["--remote", self.remote]
+        elif not self._app_running():
             raise CodexAppError("Codex desktop is not available; delivery was not attempted.", False, "app_unavailable")
         try:
             result = subprocess.run(
-                [self.cli_path, "queue", "--thread", self.thread_id, "--message", prompt],
+                command, stdin=subprocess.DEVNULL, env=self._env(),
                 capture_output=True, text=True, timeout=self.timeout, check=False,
             )
         except subprocess.TimeoutExpired as error:
@@ -114,7 +222,8 @@ class CodexAppClient:
         receipts = QUEUE_RECEIPT_RE.findall(result.stdout)
         if len(receipts) != 1 or receipts[0][1] != self.thread_id:
             raise CodexAppError("Official Codex queue returned no valid acceptance receipt; delivery is unknown.", True, "queue_receipt_unknown")
-        return {"ok": True, "threadId": self.thread_id, "hostId": "local", "status": "enqueued", "transport": "codex_queue", "queueId": receipts[0][0]}
+        return {"ok": True, "threadId": self.thread_id, "hostId": "local", "status": "enqueued",
+                "transport": "codex_queue_unix" if self.socket_path is not None else "codex_queue", "queueId": receipts[0][0]}
 
     def _read(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         try:
@@ -125,7 +234,7 @@ class CodexAppClient:
             raise CodexAppError("Thread read limit must be between 1 and 1000.", False, "invalid_request")
         try:
             process = subprocess.Popen(
-                [self.cli_path, "app-server", "--listen", "stdio://"],
+                [self.cli_path, "app-server", "--listen", "stdio://"], env=self._env(),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             )
         except OSError as error:
