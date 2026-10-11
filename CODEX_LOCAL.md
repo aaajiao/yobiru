@@ -126,6 +126,10 @@ sh "$Y" codex-bridge rollback <backup 路径>
 - 结果写到标准输出（JSON），并在标准错误输出一行固定状态，接收端会把它记入 wake 日志：`forwarded`（程序退出码 0）；`forward_failed`（程序非零退出，`exit_code` 记录其值）；`forward_timeout`（超时，程序及其整个进程组被终止）。这三种情况程序都已启动过，适配器一律以 0 退出，接收端不会重放它；程序失败或超时都不会被自动重试，消息仍留在 inbox 中，由该程序或用户处理。程序未能启动时（`forward_not_started`：可执行文件不可用为 127，没有可用时限为 1）以非零退出，接收端可能按 `wake_attempts` 再试，这是安全的，因为程序从未运行。程序可能在失败或超时前已部分执行，去重与重试由它自己以消息 ID 为键负责；这里不承诺恰好一次。
 - 没有对应的 CLI 选项：直接编辑 `codex-bridge.json`，再用 `codex-bridge install ... --dry-run` 预览（会校验这些字段，并显示 `excluded_kinds`）。两个安装器升级时都保留这些字段，以及调整过的轮询/重试时间、自定义入口指令路径、已记录的 Codex CLI 路径、固定的 Codex 账户设置和已授权的 `allow_replies`。迁移已有部署时，先把原有分流设置写入 `codex-bridge.json`，确认预览无误后再安装，避免消息被误投到入口会话。`codex-bridge status` 会列出当前分流设置，但不会运行程序。
 
+## 会话名称与发现（0.3.0）
+
+安装桥接后，`yobiru agents` 和其他机器的发现（`GET /info`，仅对白名单内的机器）会自动报告固定入口会话的 UUID。原生名称由 `codex_bridge.py session-name` 只读查询：短时官方 app-server 执行 `thread/read`（`includeTurns: false`），只取 `Thread.name`，从不读取 `preview`、回合或会话列表，不入队、不创建队列数据库、不启动模型回合；接收端在整组进程超时清理和输出上限下调用它并缓存约 5 分钟。别名用 `yobiru session bind --agent codex --display-name 名称` 记录在 `sessions.json`；与桥接入口不同的 UUID 会被拒绝。两个安装器升级时不碰 `sessions.json`，名称因此保留。
+
 ## 入口指令的升级
 
 两个安装器在首次安装时把公开模板复制为 `<数据目录>/codex-local/CODEX_DISPATCHER.md`。之后升级时，若该文件已存在，就原样保留其内容（可能是用户自己的工作流），只更新代码；安装输出和 `--dry-run` 会在模板有差异时提示。`dispatcher_instructions` 指向其他路径时，安装器既不写该文件，也不改该配置。升级前的文件会进入备份，回滚恢复的正是原来的内容。要采用新模板，请自行比较插件中的 `scripts/codex_bridge/CODEX_DISPATCHER.md` 与本地文件，审阅后手动合并。

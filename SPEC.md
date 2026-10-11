@@ -27,7 +27,9 @@ Body: 信封（见 §3），默认上限 256 KiB
 | 403 | 来源不是 tailnet 地址、不在白名单、或 `from` 与 Tailscale 身份不符 |
 | 413 | 太大　　415 不是 JSON |
 
-另有 `GET /health` → `{"ok":true,"v":1,"node":"<fqdn>"}`，只回答 tailnet 地址，用于探活。
+另有 `GET /health` → `{"ok":true,"v":1,"node":"<fqdn>"}`，只回答 tailnet 地址，用于探活（保持不变）。
+
+Yobiru 0.3.0 起另有 `GET /info`（发现接口，见 §9）。旧版接收端对它返回 404：发现方据此显示“旧版、版本与会话未知”，**不能**当作离线或未安装。
 
 ## 3. 信封格式
 
@@ -242,6 +244,31 @@ agent 名字规则：1–64 个字符，可以用中文等任意 Unicode；不�
 
 - 收件机器上 Tailscale 不能开 shields-up（`tailscale set --shields-up=false`），否则别的机器连不进来。
 - 建议在 ACL / grants 里只放行 `tcp:7766`，并且只允许互相通信的这几台机器访问。Tailscale 的访问策略和 tailmsg 自己的 `allow` 白名单是两道独立的门。
+
+## 9. 发现接口 `GET /info`（Yobiru 0.3.0 起，可选）
+
+鉴权顺序与 `/msg` 相同，并且在读取任何元数据、查询任何会话名称**之前**完成：来源必须是 tailnet 地址，`tailscale whois` 查出的节点必须在本机 `allow` 白名单里（或就是本机自己），否则 403。
+
+```json
+{"ok": true, "v": 1, "product": "yobiru", "version": "0.3.0", "node": "dev-server.example.ts.net",
+ "agents_total": 2, "agents_truncated": false, "generated_at": "2026-10-11T00:00:00Z",
+ "agents": [
+  {"agent": "codex", "default": true, "session": {
+     "runtime": "codex", "id": "<会话 UUID>", "id_source": "codex-bridge",
+     "display_name": "入口", "confirmed_title": null, "confirmed_at": null,
+     "native_name": "Triage inbox", "native_name_status": "ok", "native_name_checked_at": "2026-10-11T00:00:00Z",
+     "native_name_cached": true, "native_name_stale": false, "activity": "unknown"}},
+  {"agent": "grok", "default": false, "session": null}]}
+```
+
+- `version` 是 Yobiru 产品版本，不是协议版本（协议仍是 v1）。最多列出 32 个 agent，超出时 `agents_truncated` 为 true。
+- 只投影**明确绑定**的会话：`<home>/sessions.json`（`yobiru session bind` 写入）中的绑定，以及已安装 Codex 桥接的固定入口会话（agent `codex`，以桥接配置为准，冲突的绑定不会改变它）。绝不返回配置、路径、适配器 argv、webhook 地址、密钥、消息预览、会话记录、任意会话列表或账户信息。
+- `display_name` 是本地别名，`confirmed_title` 是用户绑定时确认的标题；两者都不是原生名称。`native_name` 只来自只读查询：Codex 桥接用 `thread/read`（`includeTurns: false`）读取绑定 UUID 的 `Thread.name`，从不使用 `preview`（首条用户消息），不启动模型回合。查询有界（子进程组超时清理、输出上限），结果按进程缓存约 5 分钟（失败 1 分钟）；冷查询超过约 1.5 秒时返回 `pending`，或返回带 `stale` 标记的旧值。短时读取器看到的 `notLoaded` 等状态不代表会话所属运行时的状态，因此 `activity` 永远是 `unknown`。
+- 发现方必须把整个响应当作不可信数据：限制大小与总时长，校验类型，去掉控制字符和终端转义，Codex 会话 ID 必须是小写 UUID。
+
+### 升级通知（kind `yobiru-upgrade-notice`）
+
+普通的 v1 消息，请求 `wake: "now"`（接收端策略照常降级），`text` 是 JSON：`{"type":"yobiru-upgrade-notice","product":"yobiru","version":"0.3.0","from_node":...,"source":"https://github.com/chekusu/yobiru","release":<已核实的 release 页面>,"tag":...,"note":...}`。它只是信息，不是命令、批准或脚本；收件方不得据此执行任何内容，也不得转发。发件方（`yobiru update notify`）只在本机插件、常驻运行时和运行中的接收端都已是已发布的官方版本后发送，只发给已知安装，并在本地 `upgrade-notices.json` 中按（节点、端口、agent、版本）去重：先持久记录意图和固定的信封 ID 再 POST；只有 202/200 且 `ok=true`、`id` 与信封一致才算 `notified`；发出后超时或回执无效记为 `uncertain`，绝不自动重发（显式核对时用完全相同的 ID 重发，接收端按 ID 去重）。403 记为 `blocked`，只有对方 `/info` 再次通过鉴权（即允许名单已包含本机）或显式 `--retry-blocked` 时才再发。
 
 ## 8. 刻意不做的事
 

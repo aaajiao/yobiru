@@ -63,7 +63,8 @@ class RepositoryTests(unittest.TestCase):
 
     def test_skills_are_discoverable_and_locate_the_bundled_command(self):
         skills = sorted((REPO / P["pluginDir"] / "skills").iterdir())
-        self.assertEqual(["yobiru-inbox", "yobiru-send", "yobiru-setup", "yobiru-wake"], [s.name for s in skills])
+        self.assertEqual(["yobiru-inbox", "yobiru-send", "yobiru-sessions", "yobiru-setup", "yobiru-upgrade",
+                          "yobiru-wake"], [s.name for s in skills])
         for s in skills:
             text = (s / "SKILL.md").read_text()
             self.assertTrue(text.startswith("---\nname: %s\n" % s.name))
@@ -93,7 +94,8 @@ class ArchiveTests(unittest.TestCase):
                     "LICENSE", "scripts/yobiru", "scripts/yobiru.py", "scripts/tailmsg.py",
                     "scripts/codex_bridge/install_codex_bridge.py", "assets/logo.svg", "assets/icon.png",
                     "skills/yobiru-setup/SKILL.md", "skills/yobiru-send/SKILL.md",
-                    "skills/yobiru-inbox/SKILL.md", "skills/yobiru-wake/SKILL.md"):
+                    "skills/yobiru-inbox/SKILL.md", "skills/yobiru-wake/SKILL.md",
+                    "skills/yobiru-sessions/SKILL.md", "skills/yobiru-upgrade/SKILL.md"):
             self.assertIn("%s/%s" % (P["id"], rel), names)
 
     def test_archive_has_no_runtime_state_or_junk(self):

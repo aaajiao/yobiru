@@ -20,12 +20,17 @@ import json
 import os
 import plistlib
 import re
+import secrets
 import shutil
+import socket
 import sqlite3
 import stat
 import subprocess
 import sys
+import time
 import unicodedata
+import urllib.parse
+import uuid
 from pathlib import Path
 
 sys.dont_write_bytecode = True   # keep installed plugin directories pristine (no __pycache__)
@@ -40,7 +45,7 @@ HERE = Path(__file__).resolve().parent
 PLUGIN_ROOT = HERE.parent
 CORE = HERE / "tailmsg.py"
 BRIDGE = HERE / "codex_bridge"
-CORE_COMMANDS = ("serve", "send", "reply", "inbox", "show", "fetch", "ack", "wake", "peers")
+CORE_COMMANDS = ("serve", "send", "reply", "inbox", "show", "fetch", "ack", "wake")
 LEVELS = ("none", "batch", "now")
 SERVICE_LABEL = "dev.tailmsg"    # receiver service names stay tailmsg's, matching existing installs
 PEER_RULE_RE = re.compile(
@@ -54,10 +59,20 @@ USAGE = """usage: {p} [--home DIR] <command> [args]
 {d} sends messages, files and wake-up requests between agents on your own Tailscale network
 (tailmsg protocol v1). Data home: --home, ${env} or {home}.
 
+Start here (read-only; works before anything is set up):
+  onboard [--json]           step-by-step plan for this platform: Tailscale install and sign-in, config,
+                             receiver, session binding, verification (installing the plugin ran nothing)
+  agents [--online] [--json] which machines are online, their Yobiru version, and each agent's session
+                             (name with its source + exact id); peers answer over authenticated /info
+
 Check and set up (read-only unless --apply):
   paths                      where the plugin, bundled CLI, Python and data home are (JSON)
-  doctor [--json]            check Python, Tailscale, config, receiver and wake adapters
-  status [--json]            summarize config, agents, wake settings and inbox counts
+  doctor [--json]            check Python, Tailscale, config, receiver, sessions and wake adapters
+  status [--json]            summarize config, agents, sessions, versions, wake settings and inbox counts
+  session {{list,bind,unbind}} explicit agent -> existing session binding (exact id; bind/unbind need --apply)
+  update {{check,status,notify,reminder-template}}
+                             official release check, versions, and upgrade notices to your known
+                             installations (notify is a dry run unless --apply)
   setup ... [--apply]        create or extend config.json with an explicit allow list / agent names
   wake-config ... [--apply]  receiver-side wake policy and per-agent wake adapters
   install-runtime [--upgrade] [--apply]
@@ -72,7 +87,8 @@ Check and set up (read-only unless --apply):
 Messaging (passed unchanged to the bundled tailmsg.py):
   send PEER[/AGENT] TEXT [--file F]... [--wake now|batch|none] [--agent A] [--kind K]
   reply ID TEXT [--file F]...      inbox [--pending] [--agent A]      show ID      fetch ID
-  ack ID [ID...]                   wake ID                            peers        serve
+  ack ID [ID...]                   wake ID                            serve
+  peers                            same as `agents` (the richer view; tailmsg.py peers stays available)
 Run `{p} <command> --help` for details.
 """
 
@@ -356,6 +372,13 @@ def gather(home, home_source, probe=True):
     if runtime.is_file() and CORE.is_file():
         f["runtime"]["same_as_bundled"] = sha256_file(runtime) == sha256_file(CORE)
     f["codex_bridge_installed"] = (home / "codex-bridge.json").is_file()
+    f["runtime_version"] = runtime_version(home)[0]
+    f["update"] = recorded_update(home) if home.is_dir() else None
+    if cfg is not None:
+        names = core().info_agent_names(cfg, agents)
+        bound, problems = core().session_bindings(home, names)
+        f["sessions"] = {"bound": {n: b["session_id"] for n, b in bound.items()},
+                         "unbound": [n for n in names if n not in bound], "problems": problems}
     return f
 
 
@@ -408,27 +431,51 @@ def doctor_checks(f):
             add("warn", "allow", "allow list is empty: every incoming message is rejected",
                 "%s setup --allow <peer>   # then --apply" % PRODUCT)
     ts = f["tailscale"]
+    state = classify_tailscale(ts)
+    linux = sys.platform.startswith("linux")
     if ts.get("cmd") is None:
         add("error", "tailscale", ts["error"], "fix tailscale_cmd in config.json by hand, or use "
             "`%s setup --tailscale-cmd PATH --replace tailscale_cmd`" % PRODUCT)
-    elif ts.get("error") and not ts.get("found"):
-        hint = "install Tailscale and sign this machine in (https://tailscale.com/download)"
-        if sys.platform == "darwin" and Path("/Applications/Tailscale.app/Contents/MacOS/Tailscale").exists():
-            hint = ("the Tailscale app CLI exists; run `%s setup --tailscale-cmd "
-                    "/Applications/Tailscale.app/Contents/MacOS/Tailscale`" % PRODUCT)
+    elif state == "missing":
+        hint = "install Tailscale and sign this machine in; `%s onboard` prints the steps for %s (%s)" % (
+            PRODUCT, sys.platform, TS_DOCS.get(sys.platform if sys.platform in ("darwin", "win32") else "linux"))
+        if sys.platform == "darwin" and Path(MAC_TS_CLI).exists():
+            hint = "the Tailscale app CLI exists; run `%s setup --tailscale-cmd %s`" % (PRODUCT, MAC_TS_CLI)
+        elif sys.platform == "win32" and Path(WIN_TS_CLI).exists():
+            hint = 'Tailscale is installed but not on PATH: `%s setup --tailscale-cmd "%s" --replace tailscale_cmd`' \
+                % (PRODUCT, WIN_TS_CLI)
         add("error", "tailscale", ts["error"], hint)
-    elif ts.get("error"):
-        fix = "make sure tailscaled is running and this machine is signed in (`tailscale up`)"
-        if re.search(r"permission denied|access denied|not permitted", ts["error"], re.I):
-            fix = "allow your user to query tailscale, or set tailscale_cmd to [\"sudo\",\"-n\",\"tailscale\"]"
-        add("error", "tailscale", ts["error"], fix)
-    elif not ts.get("probed"):
+    elif state == "permission":
+        detail, cmds, _ = permission_guidance(environment_facts(), ts.get("cmd"))
+        add("error", "tailscale", ts["error"], detail + ("" if not cmds else ": `%s`" % cmds[0]))
+    elif state == "daemon_unavailable":
+        facts = environment_facts() if linux else {}
+        pre = root_prefix(facts) if linux else None
+        add("error", "tailscale", "the Tailscale daemon is not available: %s" % ts["error"],
+            ("start it: `%ssystemctl enable --now tailscaled`, or without systemd run tailscaled yourself "
+             "(`%s onboard`)" % (pre, PRODUCT)) if linux and pre is not None else
+            "an administrator must start tailscaled (this user has no root or sudo)" if linux else
+            "open the Tailscale app and sign in")
+    elif state == "error":
+        add("error", "tailscale", ts["error"], "make sure tailscaled is running and this machine is signed in "
+            "(`%s onboard`)" % PRODUCT)
+    elif state == "unchecked":
         add("info", "tailscale", "found %s (state not checked: --no-probe)" % ts["found"])
     else:
-        state = ts.get("backend")
-        add("ok" if state == "Running" else "error", "tailscale",
-            "%s, node %s, ips %s" % (state, ts.get("node"), ", ".join(ts.get("ips") or [])),
-            None if state == "Running" else "sign this machine in to Tailscale (`tailscale up`)")
+        pre = root_prefix(environment_facts()) if linux else None
+        if linux and (ts.get("cmd") or [""])[0] == "sudo":
+            pre = ""
+        up = "`%stailscale up`" % pre if pre is not None else "an administrator running `tailscale up`"
+        login = "%s, then the user opens the login URL and chooses the account" % up if linux \
+            else "sign in from the Tailscale app"
+        fixes = {"logged_out": "this machine is logged out: %s (`%s onboard`)" % (login, PRODUCT),
+                 "stopped": "Tailscale is stopped: %s" % (up if linux else "connect from the Tailscale app"),
+                 "starting": "Tailscale is still starting; check again shortly",
+                 "needs_approval": "a tailnet administrator must approve this device in the admin console",
+                 "unknown": "sign this machine in to Tailscale (`tailscale up`)"}
+        add("ok" if state == "running" else "error", "tailscale",
+            "%s, node %s, ips %s" % (ts.get("backend"), ts.get("node"), ", ".join(ts.get("ips") or [])),
+            fixes.get(state))
         if ts.get("shields_up") is True:
             add("error", "shields-up", "Tailscale shields-up blocks all incoming connections",
                 "only if this machine should receive: `tailscale set --shields-up=false` (the owner's "
@@ -465,6 +512,28 @@ def doctor_checks(f):
         i = f["inbox"]
         add("info", "inbox", "%d messages, %d pending, %d failed wake-ups, %d for unknown agents"
             % (i["messages"], i["pending"], i["wake_failed"], i["unknown_agent"]))
+    if f.get("sessions") is not None:
+        s = f["sessions"]
+        add("info" if not s["problems"] else "warn", "sessions",
+            "bound: %s; unbound: %s%s" % (", ".join("@%s -> %s" % kv for kv in sorted(s["bound"].items())) or "none",
+                                         ", ".join("@" + n for n in s["unbound"]) or "none",
+                                         "; " + "; ".join(s["problems"]) if s["problems"] else ""),
+            None if not s["unbound"] else "name each agent's existing session: `%s session bind --agent NAME "
+            "--session-id ID` (see `%s agents`)" % (PRODUCT, PRODUCT))
+    rt_version = f.get("runtime_version")
+    if rt_version and rt_version != f["plugin_version"]:
+        add("info", "versions", "plugin %s, durable runtime %s" % (f["plugin_version"], rt_version),
+            "`%s install-runtime --upgrade --apply`, then restart the receiver" % PRODUCT)
+    up = f.get("update")
+    if up and up["status"] == "update_available":
+        add("info", "update", "Yobiru %s is available (checked %s, %s channel)" % (up["latest"], up["checked_at"],
+                                                                                up["channel"]),
+            "see `%s update check`; upgrade with the yobiru-upgrade skill" % PRODUCT)
+    elif up is None and f["config_exists"]:
+        add("info", "update", "no recorded update check", "`%s update check` (network; add --record to "
+            "remember the result)" % PRODUCT)
+    if any(c["status"] == "error" for c in checks):
+        add("info", "next", "for a step-by-step plan run `%s onboard`" % PRODUCT)
     return checks
 
 
@@ -508,7 +577,11 @@ def cmd_status(home, home_source, argv):
     ts = f["tailscale"]
     out["tailscale"] = {k: ts.get(k) for k in ("backend", "node", "ips", "shields_up", "error") if k in ts}
     out["agents"] = [{"agent": x["agent"], "default": x["default"], "wake_max": x["wake_max"],
-                      "wake_adapter": x["adapter"]} for x in f.get("adapters", [])]
+                      "wake_adapter": x["adapter"],
+                      "session_id": (f.get("sessions") or {}).get("bound", {}).get(x["agent"])}
+                     for x in f.get("adapters", [])]
+    out["versions"] = {"plugin": f["plugin_version"], "runtime": f.get("runtime_version")}
+    out["update"] = f.get("update")
     if a.json:
         print(json.dumps(out, indent=2, ensure_ascii=False))
         return 0
@@ -522,14 +595,24 @@ def cmd_status(home, home_source, argv):
         print("  allow     %s" % (", ".join(map(str, f["allow"])) or "(nobody)"))
         print("  identity  self_agent=%s default_agent=%s" % (f["self_agent"], f["default_agent"]))
         for x in out["agents"]:
-            print("  agent     %s%s: wake %s%s" % ("-" if x["agent"] is None else "@" + x["agent"],
-                                                   " (default)" if x["default"] else "", x["wake_adapter"],
-                                                   " max %s" % x["wake_max"] if x["wake_max"] else ""))
+            print("  agent     %s%s: wake %s%s; session %s" % (
+                "-" if x["agent"] is None else "@" + x["agent"], " (default)" if x["default"] else "",
+                x["wake_adapter"], " max %s" % x["wake_max"] if x["wake_max"] else "",
+                x["session_id"] or "not bound"))
         r = f.get("receiver") or {}
         print("  receiver  %s" % ("serving v%s" % r.get("v") if r.get("ok") else "not reachable"))
         i = f["inbox"]
         print("  inbox     %d messages, %d pending %s" % (i["messages"], i["pending"],
                                                          json.dumps(i["by_agent"], ensure_ascii=False)))
+        print("  versions  plugin %s, durable runtime %s" % (f["plugin_version"], f.get("runtime_version") or
+                                                             ("older than 0.3.0" if f["runtime"]["present"]
+                                                              else "not installed")))
+        up = f.get("update")
+        if up and up["status"] == "update_available":
+            print("  update    %s available (checked %s): use the yobiru-upgrade skill" % (up["latest"],
+                                                                                         up["checked_at"]))
+        elif not up:
+            print("  update    not checked yet: `%s update check`" % PRODUCT)
     return 0
 
 
@@ -1331,6 +1414,1726 @@ def bridge_status(home):
     return 0
 
 
+# ---------------------------------------------------------------- shared helpers for 0.3 commands
+OFFICIAL_REPO_URL = "https://github.com/chekusu/yobiru"
+RELEASES_HOST = "api.github.com"
+RELEASES_PATH = "/repos/chekusu/yobiru/releases?per_page=30"   # the list: works when every release is a prerelease
+RELEASE_URL_PREFIX = OFFICIAL_REPO_URL + "/releases/"
+MAX_RELEASES_BYTES = 2 * 1024 * 1024
+MAX_REPLY_BYTES = 64 * 1024
+NOTICE_KIND = "yobiru-upgrade-notice"
+NOTICES_FILE = "upgrade-notices.json"
+NOTICES_LOCK = ".upgrade-notices.lock"
+UPDATE_FILE = "update-check.json"
+SESSIONS_FILE = "sessions.json"
+PRE_ID = r"(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)"      # SemVer: numeric identifiers have no leading zero
+SEMVER_RE = re.compile(r"^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+                       r"(?:-(" + PRE_ID + r"(?:\." + PRE_ID + r")*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?\Z")
+RUNTIME_VERSION_RE = re.compile(r'^PRODUCT_VERSION = "([0-9A-Za-z.+-]{1,64})"', re.M)
+ISO_RE = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\Z")
+ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{2,39}\Z")
+MAC_TS_CLI = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+WIN_TS_CLI = "C:\\Program Files\\Tailscale\\tailscale.exe"
+TS_DOCS = {"linux": "https://tailscale.com/docs/install/linux", "darwin": "https://tailscale.com/docs/install/mac",
+           "win32": "https://tailscale.com/docs/install/windows", "download": "https://tailscale.com/download",
+           "script": "https://tailscale.com/install.sh"}
+NOTICE_STATUSES = ("pending", "dispatching", "notified", "blocked", "rejected", "uncertain", "verified")
+
+
+def now_iso():
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def clean(value, limit=200):
+    """Remote or user text made safe for a terminal (no escape, control or bidi characters)."""
+    return core().clean_text(value, limit)
+
+
+def parse_semver(text):
+    if not isinstance(text, str) or len(text) > 64:
+        return None
+    m = SEMVER_RE.match(text)
+    if not m:
+        return None
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)), tuple(m.group(4).split(".")) if m.group(4) else ())
+
+
+def semver_key(v):
+    """SemVer 2.0 precedence: a prerelease sorts before its release; numeric identifiers before text."""
+    major, minor, patch, pre = v
+    return (major, minor, patch, 0 if pre else 1,
+            tuple((0, int(x), "") if x.isdigit() else (1, 0, x) for x in pre))
+
+
+def fmt_semver(v):
+    return "%d.%d.%d" % v[:3] + ("-" + ".".join(v[3]) if v[3] else "")
+
+
+def compare_versions(a, b):
+    """-1, 0, 1 for two version strings; None if either is not SemVer."""
+    pa, pb = parse_semver(a), parse_semver(b)
+    if pa is None or pb is None:
+        return None
+    ka, kb = semver_key(pa), semver_key(pb)
+    return (ka > kb) - (ka < kb)
+
+
+def write_json_atomic(path, obj, mode=0o600, backup=False):
+    """Atomic replace through an exclusive temporary file; optional timestamped backup of the old file."""
+    path = Path(path)
+    saved = None
+    if backup and path.is_file():
+        stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        saved = path.with_name("%s.bak-%s" % (path.name, stamp))
+        n = 1
+        while saved.exists():
+            saved = path.with_name("%s.bak-%s-%d" % (path.name, stamp, n))
+            n += 1
+        fd = os.open(str(saved), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as out:
+            out.write(path.read_bytes())
+    tmp = path.with_name(".%s.%s-%d.tmp" % (path.name, PRODUCT, os.getpid()))
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as out:
+            out.write((json.dumps(obj, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+            out.flush()
+            os.fsync(out.fileno())
+        os.chmod(str(tmp), mode)
+        os.replace(str(tmp), str(path))
+    except BaseException:
+        if os.path.lexists(str(tmp)):
+            os.unlink(str(tmp))
+        raise
+    return str(saved) if saved else None
+
+
+class LockBusy(Exception):
+    pass
+
+
+class StateLock(object):
+    """Cross-process exclusive lock on a file in the data home (flock on POSIX, msvcrt on Windows)."""
+
+    def __init__(self, path):
+        self.path, self.fd = Path(path), None
+
+    def __enter__(self):
+        self.fd = os.open(str(self.path), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            try:
+                import fcntl
+            except ImportError:
+                import msvcrt
+                msvcrt.locking(self.fd, msvcrt.LK_NBLCK, 1)
+            else:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(self.fd)
+            self.fd = None
+            raise LockBusy("another %s process is updating %s" % (PRODUCT, self.path.name))
+        return self
+
+    def __exit__(self, *exc):
+        if self.fd is not None:
+            os.close(self.fd)     # closing releases flock / msvcrt locks
+            self.fd = None
+
+
+def runtime_version(home):
+    """Version of the durable <home>/tailmsg.py, read as text (never executed). -> (version or None, how)."""
+    path = home / "tailmsg.py"
+    if not path.is_file():
+        return None, "absent"
+    try:
+        with open(str(path), "rb") as fh:
+            text = fh.read(4 * 1024 * 1024).decode("utf-8", "replace")
+    except OSError:
+        return None, "unreadable"
+    m = RUNTIME_VERSION_RE.search(text)
+    if m and parse_semver(m.group(1)):
+        return m.group(1), "file"
+    return None, "unversioned"      # releases before 0.3.0 carry no product version
+
+
+class Deadline(object):
+    """An absolute time limit for one HTTP exchange: when it passes, the socket is shut down, so a peer that
+    trickles headers or body cannot hold a probe longer than `seconds` (per-read timeouts alone would)."""
+
+    def __init__(self, conn, seconds):
+        import threading
+        self.conn, self.expired, self.sock = conn, False, None
+        self.lock = threading.Lock()
+        self.timer = threading.Timer(max(0.01, seconds), self._expire)
+        self.timer.daemon = True
+
+    def _expire(self):
+        with self.lock:
+            self.expired = True
+            sock = self.sock or self.conn.sock
+        self._abort(sock)
+
+    @staticmethod
+    def _abort(sock):
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    def connect(self):
+        """Connect, then keep the transport socket itself: for HTTP/1.0 or `Connection: close` replies
+        getresponse() detaches conn.sock while the response still reads from that socket."""
+        self.conn.connect()
+        with self.lock:
+            self.sock = self.conn.sock
+            late = self.expired
+        if late:
+            self._abort(self.sock)
+            raise socket.timeout("deadline exceeded")
+
+    def __enter__(self):
+        self.timer.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.timer.cancel()
+        self.conn.close()
+
+    def check(self):
+        if self.expired:
+            raise socket.timeout("deadline exceeded")
+
+
+def http_request(ip, port, method, path, body=None, host=None, timeout=3.0):
+    """-> (status, bytes) with a bounded body, all within `timeout` seconds in total (connect, headers and
+    body). Raises socket.timeout when the deadline passes, otherwise OSError / HTTPException."""
+    c = http.client.HTTPConnection(ip, int(port), timeout=timeout)
+    with Deadline(c, timeout) as d:
+        try:
+            d.connect()
+            headers = {"Host": "%s:%d" % (host or ip, int(port)), "Accept": "application/json"}
+            if body is not None:
+                headers["Content-Type"] = "application/json"
+            c.request(method, path, body=body, headers=headers)
+            r = c.getresponse()
+            data = r.read(MAX_REPLY_BYTES + 1)
+        except (OSError, http.client.HTTPException):
+            d.check()
+            raise
+        d.check()
+        return r.status, data
+
+
+def validate_session_view(s):
+    if not isinstance(s, dict):
+        return None
+    sid = s.get("id")
+    if not isinstance(sid, str) or not core().SESSION_ID_RE.match(sid):
+        return None
+    runtime = s.get("runtime") if isinstance(s.get("runtime"), str) and core().RUNTIME_RE.match(s["runtime"]) else "other"
+    if (runtime == "codex" or s.get("id_source") == "codex-bridge") and not core().UUID_RE.match(sid):
+        return None                   # a Codex session is always identified by its exact lowercase UUID
+    if s.get("id_source") == "codex-bridge" and runtime != "codex":
+        return None
+    status = s.get("native_name_status")
+    out = {"runtime": runtime, "id": sid,
+           "id_source": s.get("id_source") if s.get("id_source") in ("codex-bridge", "configured") else "unknown",
+           "display_name": clean(s.get("display_name")), "confirmed_title": clean(s.get("confirmed_title")),
+           "confirmed_at": s.get("confirmed_at") if isinstance(s.get("confirmed_at"), str)
+           and ISO_RE.match(s["confirmed_at"]) else None,
+           "native_name": clean(s.get("native_name")),
+           "native_name_status": status if status in ("ok", "unnamed", "not_supported", "unavailable", "pending")
+           else "unknown",
+           "native_name_checked_at": s.get("native_name_checked_at") if isinstance(s.get("native_name_checked_at"), str)
+           and ISO_RE.match(s["native_name_checked_at"]) else None,
+           "native_name_cached": s.get("native_name_cached") is True,
+           "native_name_stale": s.get("native_name_stale") is True, "activity": "unknown"}
+    err = s.get("native_name_error")
+    if isinstance(err, str) and ERROR_CODE_RE.match(err):
+        out["native_name_error"] = err
+    if out["native_name_status"] != "ok":
+        out["native_name"] = None
+        out["native_name_stale"] = False
+    return out
+
+
+def validate_info(body, expect_node=None):
+    """Bounded, typed view of a peer's /info body -> (info or None, problem or None). Never trusts it."""
+    if len(body) > MAX_REPLY_BYTES:
+        return None, "response too large"
+    try:
+        obj = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None, "invalid JSON"
+    if not isinstance(obj, dict) or obj.get("ok") is not True or obj.get("v") != 1 or obj.get("product") != PRODUCT:
+        return None, "not a Yobiru /info response"
+    version = parse_semver(obj.get("version"))
+    raw_agents = obj.get("agents")
+    if not isinstance(raw_agents, list):
+        return None, "agents missing"
+    agents = []
+    for item in raw_agents[:32]:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("agent")
+        if not isinstance(name, str) or core().agent_name_error(name) or clean(name, 64) != name:
+            continue
+        agents.append({"agent": name, "default": item.get("default") is True,
+                       "session": validate_session_view(item.get("session"))})
+    node = clean(obj.get("node"), 253)
+    info = {"version": fmt_semver(version) if version else None, "node": node, "agents": agents, "warnings": []}
+    total = obj.get("agents_total")
+    if obj.get("agents_truncated") is True or len(raw_agents) > 32 or \
+            isinstance(total, int) and not isinstance(total, bool) and total > len(agents):
+        info["warnings"].append("agent list truncated: showing %d of %s agents" % (
+            len(agents), total if isinstance(total, int) and not isinstance(total, bool) else "more"))
+    if expect_node and (node or "").lower().rstrip(".") != expect_node:
+        info["warnings"].append("the receiver calls itself %s" % (node or "?"))
+    return info, None
+
+
+def probe_info(ip, port, timeout=3.0, expect_node=None, host=None):
+    """What a receiver tells this machine. kind: info | legacy | blocked | unreachable | malformed | error.
+    A 404 on /info is an older receiver (0.2.x or earlier), not a missing installation; 403 is policy."""
+    res = {"address": "%s:%s" % (ip, port), "kind": "unreachable", "http_status": None, "info": None, "error": None}
+    deadline = time.monotonic() + timeout          # one budget for /info and the /health fallback
+    try:
+        status, body = http_request(ip, port, "GET", "/info", host=host, timeout=timeout)
+    except socket.timeout:
+        res["error"] = "timeout"
+        return res
+    except (OSError, http.client.HTTPException, ValueError) as e:
+        res["error"] = type(e).__name__
+        return res
+    res["http_status"] = status
+    if status == 200:
+        info, problem = validate_info(body, expect_node)
+        res.update(kind="info", info=info) if info else res.update(kind="malformed", error=problem)
+    elif status == 403:
+        res["kind"] = "blocked"
+    elif status == 404:
+        try:
+            left = deadline - time.monotonic()
+            if left <= 0.05:
+                raise socket.timeout("deadline exceeded")
+            hs, hb = http_request(ip, port, "GET", "/health", host=host, timeout=left)
+            h = json.loads(hb.decode("utf-8")) if hs == 200 and len(hb) <= MAX_REPLY_BYTES else None
+        except (OSError, http.client.HTTPException, ValueError):
+            h = None
+        if isinstance(h, dict) and h.get("ok") is True and h.get("v") == 1:
+            res["kind"] = "legacy"
+        else:
+            res.update(kind="malformed", error="no /info and no tailmsg /health")
+    else:
+        res.update(kind="error", error="HTTP %d" % status)
+    return res
+
+
+def tailnet_nodes(cmd, timeout=10):
+    """-> ([{node, host, ip, online, self, os}], error). Read-only `tailscale status --json`."""
+    out, err = run_tailscale(cmd, ["status", "--json"], timeout)
+    if err:
+        return None, err
+    try:
+        st = json.loads(out)
+    except ValueError:
+        return None, "tailscale status returned invalid JSON"
+    if not isinstance(st, dict):
+        return None, "tailscale status returned invalid JSON"
+    running = st.get("BackendState") == "Running"
+    entries = [("self", st.get("Self"))] + [("peer", v) for v in (st.get("Peer") or {}).values()]
+    nodes = []
+    for kind, n in entries:
+        if not isinstance(n, dict):
+            continue
+        fq = clean(str(n.get("DNSName") or ""), 253) or ""
+        fq = fq.rstrip(".").lower()
+        ips = [i for i in (n.get("TailscaleIPs") or []) if isinstance(i, str) and valid_ip(i)]
+        if not fq or not ips:
+            continue
+        v4 = [i for i in ips if ":" not in i]
+        nodes.append({"node": fq, "host": fq.split(".")[0], "ip": (v4 or ips)[0],
+                      "online": running if kind == "self" else n.get("Online") is True,
+                      "self": kind == "self", "os": clean(n.get("OS"), 16)})
+    return nodes, None
+
+
+def valid_ip(text):
+    import ipaddress
+    try:
+        ipaddress.ip_address(text)
+        return True
+    except ValueError:
+        return False
+
+
+def parse_peer_spec(spec, default_port):
+    """'host[:port][/agent]' -> (host, port, agent or None); dies on bad input."""
+    host, agent = (spec.split("/", 1) + [None])[:2] if "/" in spec else (spec, None)
+    port = default_port
+    if host.count(":") == 1:
+        host, p = host.split(":")
+        try:
+            port = int(p)
+        except ValueError:
+            die("bad port in --peer %r" % spec, 2)
+        if not 1 <= port <= 65535:
+            die("bad port in --peer %r" % spec, 2)
+    if not host or not (PEER_RULE_RE.match(host) or valid_ip(host)) or host.startswith(("tag:", "user:")):
+        die("bad --peer %r: use a Tailscale hostname, MagicDNS name or Tailscale IP" % spec, 2)
+    if agent is not None:
+        agent = valid_agent(agent, "agent in --peer")
+    return host.lower().rstrip("."), port, agent
+
+
+def match_node(nodes, host):
+    for n in nodes:
+        if host in (n["node"], n["host"], n["ip"]):
+            return n
+    return None
+
+
+def run_parallel(fn, items, limit=32):
+    """fn(item) for each item with at most `limit` threads; results in input order."""
+    import threading
+    results = [None] * len(items)
+
+    def worker(i):
+        results[i] = fn(items[i])
+    for start in range(0, len(items), limit):
+        ts = [threading.Thread(target=worker, args=(i,)) for i in range(start, min(start + limit, len(items)))]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+    return results
+
+
+def local_info(home, cfg, agents, me):
+    """This machine's own projection from its files (when its receiver does not answer)."""
+    payload = core().info_payload(home, cfg, agents, me or "this-machine",
+                                  lambda b: dict(core().lookup_native_name(home, b), checked_at=now_iso()))
+    info, _ = validate_info(json.dumps(payload).encode("utf-8"))
+    return info
+
+
+# ---------------------------------------------------------------- agents: who is online, which session
+SOURCE_LABEL = {"codex-bridge": "fixed Codex bridge dispatcher", "configured": "configured binding",
+                "unknown": "unknown source"}
+
+
+def session_lines(s):
+    if s is None:
+        return ["no session bound on that machine (no session name or id to show; its wake adapter, if any, "
+                "still decides how this agent is woken)"]
+    lines = []
+    if s.get("native_name"):
+        lines.append('name "%s" (native %s session name, read %s%s)' % (
+            s["native_name"], s["runtime"], s.get("native_name_checked_at") or "?",
+            ", stale: a refresh did not finish" if s.get("native_name_stale") else
+            ", cached" if s.get("native_name_cached") else ""))
+    elif s["native_name_status"] == "pending":
+        lines.append("name: native name lookup in progress on that machine; ask again in a few seconds")
+    elif s["native_name_status"] == "unnamed":
+        lines.append("name: the %s session has no native name set" % s["runtime"])
+    elif s["native_name_status"] == "not_supported":
+        lines.append("name: no read-only native name lookup for %s sessions" % s["runtime"])
+    else:
+        lines.append("name: native name unavailable (%s)" % (s.get("native_name_error") or "unknown"))
+    if s.get("confirmed_title"):
+        lines.append('confirmed title "%s" (confirmed by the user %s; may be outdated)'
+                     % (s["confirmed_title"], s.get("confirmed_at") or "earlier"))
+    if s.get("display_name"):
+        lines.append('alias "%s" (configured label, not the native name)' % s["display_name"])
+    lines.append("id %s (%s); busy/idle: unknown" % (s["id"], SOURCE_LABEL.get(s["id_source"], "unknown")))
+    return lines
+
+
+def discovery_rows(home, f, nodes, wanted, port, timeout, include_self):
+    cfg = f.get("cfg")
+    me = (f["tailscale"].get("node") or "")
+    jobs = []
+    for n in nodes:
+        if n["self"] and not include_self:
+            continue
+        if wanted is not None:
+            spec = [w for w in wanted if w[0] in (n["node"], n["host"], n["ip"])]
+            if not spec:
+                continue
+            p = spec[0][1]
+        else:
+            p = port
+        jobs.append((n, p))
+
+    def probe(job):
+        n, p = job
+        if not n["online"]:
+            return None
+        host = n["ip"]
+        if n["self"] and cfg is not None and cfg.get("bind"):
+            host = cfg["bind"]
+        return probe_info(host, p, timeout, expect_node=n["node"], host=n["node"])
+    probes = run_parallel(probe, jobs)
+    rows = []
+    for (n, p), pr in zip(jobs, probes):
+        row = {"machine": n["host"], "node": n["node"], "self": n["self"], "tailscale_online": n["online"],
+               "address": "%s:%d" % (n["ip"], p), "receiver": "offline" if pr is None else pr["kind"],
+               "http_status": None if pr is None else pr["http_status"], "send_permission": "unknown",
+               "version": None, "agents": None, "source": None, "detail": None, "warnings": []}
+        if pr is None:
+            row["detail"] = "offline in Tailscale; not probed"
+        elif pr["kind"] == "info":
+            row.update(version=pr["info"]["version"], agents=pr["info"]["agents"], source="/info",
+                       send_permission="self" if n["self"] else "allowed", warnings=pr["info"]["warnings"])
+            row["receiver"] = "ok"
+        elif pr["kind"] == "legacy":
+            row.update(detail="receiver runs an older Yobiru/tailmsg (0.2.x or earlier) without /info: version, "
+                              "agents and sessions unknown", version="<=0.2.x")
+        elif pr["kind"] == "blocked":
+            row.update(send_permission="blocked", detail="the receiver answered 403: this machine is not on its "
+                                                         "allow list (policy, not a network failure)")
+        elif pr["kind"] == "unreachable":
+            row["detail"] = "no receiver answered on port %d in time (%s): not running, slow, another port, " \
+                            "ACL or shields-up; this does not mean the machine is offline or Yobiru is not " \
+                            "installed" % (p, pr["error"])
+        else:
+            row["detail"] = "unexpected answer (%s); treated as unknown" % (pr["error"] or "?")
+        if n["self"]:
+            row["send_permission"] = "self"
+            row["local_plugin_version"] = plugin_version()
+            if pr is None or pr["kind"] != "info":
+                running = {"legacy": "this machine's running receiver is older (0.2.x or earlier, no /info): "
+                                     "`install-runtime --upgrade --apply`, then restart it",
+                           "blocked": "this machine's receiver refused /info (403)"}.get(
+                    pr["kind"] if pr else None, "this machine's receiver is not answering")
+                if cfg is not None:
+                    info = local_info(home, cfg, core().parse_config(cfg)[1], me)
+                    row.update(agents=info["agents"], source="local files (not the running receiver)")
+                    row["detail"] = running + "; agents and sessions below come from local files, the version " \
+                                              "column is the running receiver's (installed plugin: %s)" % plugin_version()
+                else:
+                    row["detail"] = "this machine is not set up yet (no config.json)"
+        rows.append(row)
+    rows.sort(key=lambda r: (not r["self"], not r["tailscale_online"], r["node"]))
+    return rows
+
+
+def print_rows(rows):
+    print("%-22s %-9s %-11s %-8s %-9s %s" % ("MACHINE", "TAILSCALE", "RECEIVER", "SEND", "VERSION", "AGENT"))
+    for r in rows:
+        machine = r["machine"] + (" (this)" if r["self"] else "")
+        head = "%-22s %-9s %-11s %-8s %-9s " % (machine[:22], "online" if r["tailscale_online"] else "offline",
+                                               r["receiver"], r["send_permission"], r["version"] or "-")
+        if not r["agents"]:
+            print(head + ("(no agents)" if r["agents"] == [] else "-"))
+        for i, a in enumerate(r["agents"] or []):
+            print((head if i == 0 else " " * len(head)) + "@%s%s" % (a["agent"], " (default)" if a["default"] else ""))
+            for line in session_lines(a["session"]):
+                print("      " + line)
+        if r["detail"]:
+            print("      note: " + r["detail"])
+        for w in r["warnings"]:
+            print("      warning: " + w)
+
+
+def cmd_agents(home, home_source, argv):
+    ap = argparse.ArgumentParser(allow_abbrev=False, prog=PRODUCT + " agents",   # also `peers`
+                                 description="Which machines are online and which agent session handles messages on "
+                                             "each (read-only). Peers are asked over their authenticated /info "
+                                             "endpoint; nothing is written unless --remember is given.")
+    ap.add_argument("--online", action="store_true", help="only machines Tailscale reports online")
+    ap.add_argument("--no-self", action="store_true", help="leave out this machine")
+    ap.add_argument("--peer", action="append", default=[], metavar="HOST[:PORT]",
+                    help="only these machines (repeatable); a port for receivers not on the default port")
+    ap.add_argument("--timeout", type=float, default=5.0,
+                    help="seconds per receiver (default 5; receivers answer a cold session name lookup within "
+                         "about 2 s and report it as pending if it takes longer)")
+    ap.add_argument("--remember", action="store_true",
+                    help="record answering installations for later upgrade notices (upgrade-notices.json)")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args(argv)
+    f = gather(home, home_source, probe=False)
+    cfg = f.get("cfg")
+    port = f.get("port") or 7766
+    cmd = (cfg or {}).get("tailscale_cmd") or ["tailscale"]
+    nodes, err = tailnet_nodes(cmd)
+    if err:
+        msg = "cannot read the tailnet: %s; run `%s onboard` for next steps" % (err, PRODUCT)
+        print(json.dumps({"ok": False, "error": msg}) if a.json else "%s: %s" % (PRODUCT, msg))
+        return 1
+    me = next((n["node"] for n in nodes if n["self"]), None)
+    f["tailscale"]["node"] = me
+    wanted = [parse_peer_spec(p, port)[:2] for p in a.peer] or None
+    rows = discovery_rows(home, f, nodes, wanted, port, max(0.2, min(a.timeout, 30.0)), not a.no_self)
+    if a.online:
+        rows = [r for r in rows if r["tailscale_online"]]
+    remembered = None
+    if a.remember:
+        remembered = remember_installations(home, rows)
+    if a.json:
+        print(json.dumps({"ok": True, "this_machine": me, "machines": rows, "remembered": remembered,
+                          "notes": ["session names carry their source; activity (busy/idle) is never claimed"]},
+                         indent=2, ensure_ascii=False))
+        return 0
+    print("%s agents (read-only; names are labeled by source, busy/idle is not known)" % DISPLAY)
+    print_rows(rows)
+    if remembered is not None:
+        print("remembered %d installation(s) in %s" % (remembered, home / NOTICES_FILE))
+    return 0
+
+
+# ---------------------------------------------------------------- session: explicit agent -> session binding
+def load_sessions_raw(home):
+    path = home / SESSIONS_FILE
+    if not path.is_file():
+        return {"v": 1, "agents": {}}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        die("%s is not valid JSON (%s); fix it by hand, %s will not overwrite it" % (path, e, PRODUCT))
+    if not isinstance(raw, dict) or not isinstance(raw.get("agents", {}), dict):
+        die("%s must be an object with an agents object; fix it by hand" % path)
+    raw.setdefault("agents", {})
+    return raw
+
+
+def label_text(value, what):
+    if value is None:
+        return None
+    v = unicodedata.normalize("NFC", value)
+    if not v or len(v) > 80 or clean(v, 80) != v:
+        die("bad %s: 1-80 printable characters, no control characters or surrounding spaces" % what, 2)
+    return v
+
+
+def cmd_session(home, home_source, argv):
+    ap = argparse.ArgumentParser(allow_abbrev=False, prog=PRODUCT + " session",
+                                 description="Explicit agent -> session bindings shown by `agents` on every machine. "
+                                             "A name never selects or renames a session: bind needs the exact "
+                                             "session id (for Codex: the session UUID).")
+    sub = ap.add_subparsers(dest="action")
+    sub.required = True
+    pl = sub.add_parser("list", help="this machine's bindings with their native names (read-only)")
+    pl.add_argument("--no-lookup", action="store_true", help="do not read native names")
+    pl.add_argument("--json", action="store_true")
+    pb = sub.add_parser("bind", help="bind an agent to one existing session (dry run unless --apply)")
+    pb.add_argument("--agent", required=True)
+    pb.add_argument("--session-id", help="exact id of the existing session (Codex: its UUID); with an installed "
+                                         "Codex bridge, agent codex always uses the bridge's dispatcher")
+    pb.add_argument("--runtime", help="codex, grok, claude or another lowercase label (default: codex for agent "
+                                      "codex, else other)")
+    pb.add_argument("--display-name", help="local alias shown next to the native name (not a rename)")
+    pb.add_argument("--confirmed-title", help="the session title exactly as the user confirmed it, when the runtime "
+                                              "offers no read-only lookup")
+    pb.add_argument("--replace", action="store_true", help="allow replacing an existing different session id")
+    pb.add_argument("--apply", action="store_true")
+    pb.add_argument("--json", action="store_true")
+    pu = sub.add_parser("unbind", help="remove an agent's binding (dry run unless --apply)")
+    pu.add_argument("--agent", required=True)
+    pu.add_argument("--apply", action="store_true")
+    pu.add_argument("--json", action="store_true")
+    a = ap.parse_args(argv)
+    raw_cfg, err = read_config(home)
+    if raw_cfg is None:
+        die(err or "not set up: no %s; run `%s onboard`" % (home / "config.json", PRODUCT), 2)
+    try:
+        cfg, agents = core().parse_config(raw_cfg)
+    except RuntimeError as e:
+        die(str(e), 2)
+    names = core().info_agent_names(cfg, agents)
+    if a.action == "list":
+        bound, errors = core().session_bindings(home, names)
+        out = []
+        for n in names:
+            b = bound.get(n)
+            native = {"status": "not_checked"}
+            if b and not a.no_lookup:
+                native = dict(core().lookup_native_name(home, b), checked_at=now_iso())
+            out.append({"agent": n, "default": n == cfg.get("default_agent"),
+                        "session": validate_session_view(core().session_view(b, native)) if b else None})
+        if a.json:
+            print(json.dumps({"agents": out, "problems": errors}, indent=2, ensure_ascii=False))
+            return 0
+        print("%s sessions on this machine (%s)" % (DISPLAY, home))
+        for x in out:
+            print("@%s%s" % (x["agent"], " (default)" if x["default"] else ""))
+            for line in session_lines(x["session"]):
+                print("    " + line)
+        for e in errors:
+            print("problem: %s" % e)
+        if not out:
+            print("no agent names configured; add one with `%s setup --agent NAME`" % PRODUCT)
+        return 0
+    name = valid_agent(a.agent)
+    if name not in names:
+        die("agent %r is not configured on this machine; add it first: `%s setup --agent %s`" % (name, PRODUCT, name), 2)
+    raw = load_sessions_raw(home)
+    same = [k for k in raw["agents"] if unicodedata.normalize("NFC", k) == name]
+    key = same[0] if same else name
+    current = raw["agents"].get(key) if isinstance(raw["agents"].get(key), dict) else None
+    changes, errors, notes = [], [], []
+    bridge = core().bridge_session(home) if name == "codex" else None
+    if a.action == "unbind":
+        if current is None:
+            notes.append("@%s has no configured binding" % name)
+        else:
+            del raw["agents"][key]
+            changes.append("remove binding of @%s (session %s)" % (name, current.get("session_id")))
+        if bridge:
+            notes.append("the installed Codex bridge still delivers @codex messages to %s and `agents` keeps "
+                         "reporting it; use `codex-bridge rollback` to remove the bridge" % bridge)
+    else:
+        entry = dict(current or {})
+        runtime = a.runtime or entry.get("runtime") or ("codex" if name == "codex" else "other")
+        if not core().RUNTIME_RE.match(runtime):
+            die("bad --runtime %r (lowercase letters, digits, '-')" % runtime, 2)
+        sid = a.session_id
+        if sid is not None and runtime == "codex":
+            try:
+                sid = str(uuid.UUID(sid))
+            except ValueError:
+                die("a Codex session id is the session's UUID", 2)
+        if sid is not None and runtime != "codex" and not core().SESSION_ID_RE.match(sid):
+            die("bad --session-id (1-128 letters, digits and ._:@+=-)", 2)
+        if bridge:
+            if runtime != "codex":
+                errors.append("agent codex is served by the installed Codex bridge; its runtime is codex")
+            if sid is not None and sid != bridge:
+                errors.append("session %s conflicts with the installed Codex bridge dispatcher %s: the bridge "
+                              "delivers @codex messages to that session. A binding cannot redirect it; change "
+                              "the bridge only through `codex-bridge` after draining its queue" % (sid, bridge))
+            sid = bridge
+        if sid is None:
+            sid = entry.get("session_id")
+        if sid is None:
+            die("--session-id is required: name the exact existing session (a name alone never selects one)", 2)
+        old = entry.get("session_id")
+        if old is not None and old != sid and not a.replace:
+            errors.append("@%s is already bound to session %s; pass --replace to bind %s instead" % (name, old, sid))
+        if old != sid:
+            changes.append("@%s session: %s -> %s (%s)" % (name, old, sid, runtime))
+        if entry.get("runtime") != runtime:
+            if entry.get("runtime"):
+                changes.append("@%s runtime: %s -> %s" % (name, entry.get("runtime"), runtime))
+        entry.update(runtime=runtime, session_id=sid)
+        dn = label_text(a.display_name, "--display-name")
+        if dn is not None and entry.get("display_name") != dn:
+            changes.append('@%s alias: %s -> "%s" (local label; the session itself is not renamed)'
+                           % (name, json.dumps(entry.get("display_name"), ensure_ascii=False), dn))
+            entry["display_name"] = dn
+        ct = label_text(a.confirmed_title, "--confirmed-title")
+        if ct is not None and entry.get("confirmed_title") != ct:
+            changes.append('@%s confirmed title: "%s" (as confirmed by the user)' % (name, ct))
+            entry.update(confirmed_title=ct, confirmed_at=now_iso())
+        if old is not None and old != sid and entry.get("confirmed_title") and ct is None:
+            entry.pop("confirmed_title", None)
+            entry.pop("confirmed_at", None)
+            notes.append("the confirmed title belonged to the old session and was dropped")
+        if current is None:
+            entry.setdefault("bound_at", now_iso())
+        _, err = core().validate_binding(name, entry)
+        if err:
+            errors.append(err)
+        if changes and not errors:
+            raw["agents"][key] = entry
+        if runtime == "codex" and not bridge:
+            notes.append("native names are read through an installed Codex bridge; without one `agents` shows "
+                         "the id, the alias and any confirmed title")
+    written, backup = False, None
+    if a.apply and changes and not errors:
+        if not home.is_dir():
+            die("no data home at %s" % home, 2)
+        backup = write_json_atomic(home / SESSIONS_FILE, raw, backup=True)
+        written = True
+    res = {"command": "session " + a.action, "file": str(home / SESSIONS_FILE), "dry_run": not a.apply,
+           "written": written, "backup": backup, "changes": changes, "errors": errors, "notes": notes}
+    if a.json:
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+    else:
+        head = "applied" if written else "refused, nothing written" if errors else \
+            "dry run, nothing written" if changes else "nothing to change"
+        print("%s session %s (%s)" % (PRODUCT, a.action, head))
+        for k, items in (("change", changes), ("error", errors), ("note", notes)):
+            for x in items:
+                print("  %-7s %s" % (k + ":", x))
+        if backup:
+            print("  backup: %s" % backup)
+        if changes and not a.apply and not errors:
+            print("  review the changes above, then re-run the same command with --apply")
+    return 1 if errors else 0
+
+
+# ---------------------------------------------------------------- update check
+class UpdateError(Exception):
+    def __init__(self, code):
+        Exception.__init__(self, code)
+        self.code = code
+
+
+def parse_releases(data):
+    """GitHub release list -> [{version, tag, prerelease, published_at, url}]. Only metadata fields are
+    read; release notes are never printed or executed and URLs are rebuilt for the official repository."""
+    if not isinstance(data, list):
+        raise UpdateError("metadata_invalid")
+    out = []
+    for item in data[:100]:
+        if not isinstance(item, dict) or item.get("draft") is True:
+            continue
+        tag = item.get("tag_name")
+        v = parse_semver(tag)
+        if v is None or clean(tag, 64) != tag:
+            continue
+        published = item.get("published_at")
+        out.append({"version": fmt_semver(v), "tag": tag, "prerelease": item.get("prerelease") is True or bool(v[3]),
+                    "published_at": published if isinstance(published, str) and ISO_RE.match(published) else None,
+                    "url": RELEASE_URL_PREFIX + "tag/" + urllib.parse.quote(tag, safe="")})
+    return out
+
+
+def fetch_releases(timeout=10.0):
+    """The official repository's release list (bounded size and time). Raises UpdateError(code)."""
+    import ssl
+    try:
+        c = http.client.HTTPSConnection(RELEASES_HOST, 443, timeout=timeout, context=ssl.create_default_context())
+        with Deadline(c, timeout) as d:
+            try:
+                d.connect()
+                c.request("GET", RELEASES_PATH, headers={"Accept": "application/vnd.github+json",
+                                                         "User-Agent": "%s/%s" % (PRODUCT, plugin_version()),
+                                                         "X-GitHub-Api-Version": "2022-11-28"})
+                r = c.getresponse()
+                body = r.read(MAX_RELEASES_BYTES + 1)
+                status = r.status
+            except (OSError, http.client.HTTPException):
+                d.check()
+                raise
+            d.check()
+    except socket.timeout:
+        raise UpdateError("timeout")
+    except ssl.SSLError:
+        raise UpdateError("tls_error")
+    except (OSError, http.client.HTTPException):
+        raise UpdateError("network_unavailable")
+    if len(body) > MAX_RELEASES_BYTES:
+        raise UpdateError("metadata_too_large")
+    if status in (403, 429):
+        raise UpdateError("rate_limited")
+    if status == 404:
+        raise UpdateError("repository_not_found")
+    if status != 200:
+        raise UpdateError("http_%d" % status)
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise UpdateError("metadata_invalid")
+    return parse_releases(data)
+
+
+def choose_release(releases, channel):
+    pool = [r for r in releases if channel == "preview" or not r["prerelease"]]
+    return max(pool, key=lambda r: semver_key(parse_semver(r["version"])), default=None)
+
+
+def assess_update(installed, releases, channel):
+    """Pure decision used by `update check`. status: update_available | current | ahead | no_release |
+    no_stable_release."""
+    res = {"channel": channel, "latest": choose_release(releases, channel),
+           "latest_preview": choose_release(releases, "preview")}
+    if not releases:
+        res["status"] = "no_release"
+    elif res["latest"] is None:
+        res["status"] = "no_stable_release"
+    else:
+        c = compare_versions(installed, res["latest"]["version"])
+        res["status"] = "unknown_installed" if c is None else {-1: "update_available", 0: "current", 1: "ahead"}[c]
+    return res
+
+
+def local_versions(home, f):
+    rt, how = runtime_version(home)
+    out = {"plugin": f["plugin_version"], "runtime": rt,
+           "runtime_note": {"absent": "no durable runtime (install-runtime)", "unversioned":
+                            "0.2.x or older (no version recorded)", "unreadable": "unreadable", "file": None}[how],
+           "receiver": None, "receiver_note": None}
+    r = f.get("receiver_info")
+    if r is None:
+        out["receiver_note"] = "not checked"
+    elif r["kind"] == "info":
+        out["receiver"] = r["info"]["version"]
+    elif r["kind"] == "legacy":
+        out["receiver_note"] = "running receiver is 0.2.x or older (no /info): restart it after install-runtime"
+    else:
+        out["receiver_note"] = "receiver not answering (%s)" % (r.get("error") or r["kind"])
+    return out
+
+
+def upgrade_steps(f, target=None):
+    steps = ["update the plugin from the official repository (Codex: `codex plugin marketplace upgrade yobiru` "
+             "then `codex plugin add yobiru@yobiru`; Cursor/Grok Bot: update it from the plugin page), then "
+             "start a new conversation",
+             "`%s install-runtime --upgrade` (review), then `--apply`: a plugin update never changes the durable "
+             "receiver runtime" % PRODUCT,
+             "restart the receiver service so the running receiver loads the new runtime",
+             "`%s doctor` and `%s update status`: plugin, runtime and running receiver should all show %s"
+             % (PRODUCT, PRODUCT, target or "the new version"),
+             "`%s update notify` (dry run), then `--apply`, to tell your other installations" % PRODUCT]
+    if f.get("codex_bridge_installed"):
+        steps.insert(3, "if the Codex bridge is installed: `%s codex-bridge install --thread-id <the same UUID> "
+                        "... --dry-run`, then without --dry-run (keeps the session, names and dispatcher "
+                        "instructions)" % PRODUCT)
+    return steps
+
+
+def gather_versions(home, home_source, timeout=3.0):
+    f = gather(home, home_source, probe=True)
+    if f.get("cfg") is not None and f.get("receiver", {}).get("reachable"):
+        host = f["cfg"].get("bind") or next((i for i in f["tailscale"].get("ips") or [] if ":" not in i), None)
+        f["receiver_info"] = probe_info(host, f["port"], timeout, host=f["tailscale"].get("node")) if host else None
+    elif f.get("cfg") is not None:
+        f["receiver_info"] = {"kind": "unreachable", "error": (f.get("receiver") or {}).get("error")}
+    return f
+
+
+def cmd_update(home, home_source, argv):
+    ap = argparse.ArgumentParser(allow_abbrev=False, prog=PRODUCT + " update",
+                                 description="Update reminders and coordinated upgrade notices. Releases come only "
+                                             "from %s; nothing is downloaded or installed here." % OFFICIAL_REPO_URL)
+    sub = ap.add_subparsers(dest="action")
+    sub.required = True
+    pc = sub.add_parser("check", help="compare installed versions with the latest official release (network)")
+    pc.add_argument("--channel", choices=("stable", "preview"), default="stable",
+                    help="stable ignores prereleases; preview includes them (default stable)")
+    pc.add_argument("--timeout", type=float, default=10.0)
+    pc.add_argument("--record", action="store_true", help="save the result for doctor/status reminders")
+    pc.add_argument("--json", action="store_true")
+    ps = sub.add_parser("status", help="installed, durable runtime and running receiver versions, the last "
+                                       "recorded check and upgrade notices (no network except this machine)")
+    ps.add_argument("--json", action="store_true")
+    pn = sub.add_parser("notify", help="send a versioned upgrade notice to your known installations "
+                                       "(dry run unless --apply)")
+    pn.add_argument("--version", help="the version this machine upgraded to (default: installed plugin version)")
+    pn.add_argument("--peer", action="append", default=[], metavar="HOST[:PORT][/AGENT]",
+                    help="also notify this installation (repeatable)")
+    pn.add_argument("--no-discover", action="store_true",
+                    help="only explicit peers and remembered installations; do not probe other online machines")
+    pn.add_argument("--channel", choices=("stable", "preview"), default="stable",
+                    help="the release channel of --version; a prerelease needs preview")
+    pn.add_argument("--reconcile-uncertain", action="store_true",
+                    help="re-send uncertain notices with the identical message id (receivers deduplicate it)")
+    pn.add_argument("--retry-blocked", action="store_true",
+                    help="ask installations that refused earlier (403) again; without it they are retried only "
+                         "when their /info shows that this machine is allowed again")
+    pn.add_argument("--timeout", type=float, default=3.0, help="seconds per discovery probe (default 3)")
+    pn.add_argument("--apply", action="store_true")
+    pn.add_argument("--json", action="store_true")
+    pr = sub.add_parser("reminder-template", help="print an opt-in periodic `update check --record` definition "
+                                                   "(never installs it)")
+    pr.add_argument("kind", choices=("systemd-user", "launchd", "cron"))
+    pr.add_argument("--channel", choices=("stable", "preview"), default="stable")
+    a = ap.parse_args(argv)
+    if a.action == "check":
+        return update_check(home, home_source, a)
+    if a.action == "status":
+        return update_status(home, home_source, a)
+    if a.action == "notify":
+        return update_notify(home, home_source, a)
+    return reminder_template(home, a)
+
+
+def update_check(home, home_source, a):
+    f = gather_versions(home, home_source)
+    versions = local_versions(home, f)
+    res = {"source": OFFICIAL_REPO_URL, "checked_at": now_iso(), "installed": versions}
+    try:
+        releases = fetch_releases(max(1.0, min(a.timeout, 30.0)))
+        res.update(assess_update(versions["plugin"], releases, a.channel))
+    except UpdateError as e:
+        res.update(channel=a.channel, status="error", error=e.code, latest=None, latest_preview=None)
+    nxt = []
+    if res["status"] == "update_available":
+        nxt = upgrade_steps(f, res["latest"]["version"])
+    elif res["status"] == "no_stable_release" and res.get("latest_preview"):
+        nxt = ["no stable release yet; the latest preview is %s: `%s update check --channel preview`"
+               % (res["latest_preview"]["version"], PRODUCT)]
+    elif res["status"] == "error":
+        nxt = ["could not reach the official release list (%s); nothing changed, try again later" % res["error"]]
+    if versions["runtime"] and versions["runtime"] != versions["plugin"] or versions["runtime_note"] and \
+            "older" in versions["runtime_note"]:
+        nxt.append("the durable runtime is %s but the plugin is %s: `%s install-runtime --upgrade --apply`, then "
+                   "restart the receiver" % (versions["runtime"] or "older", versions["plugin"], PRODUCT))
+    elif versions["receiver"] and versions["receiver"] != versions["runtime"]:
+        nxt.append("the running receiver is %s: restart it to load %s" % (versions["receiver"], versions["runtime"]))
+    elif versions["receiver_note"] and "older" in versions["receiver_note"]:
+        nxt.append(versions["receiver_note"])
+    res["next"] = nxt
+    if a.record:
+        if not home.is_dir():
+            res["record"] = "not recorded: no data home yet"
+        else:
+            write_json_atomic(home / UPDATE_FILE, {k: res.get(k) for k in (
+                "checked_at", "channel", "status", "error", "latest", "latest_preview", "installed")})
+            res["record"] = str(home / UPDATE_FILE)
+    if a.json:
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+    else:
+        print("%s update check (%s channel, source %s)" % (DISPLAY, a.channel, OFFICIAL_REPO_URL))
+        print("  installed plugin   %s" % versions["plugin"])
+        print("  durable runtime    %s" % (versions["runtime"] or versions["runtime_note"]))
+        print("  running receiver   %s" % (versions["receiver"] or versions["receiver_note"]))
+        latest = res.get("latest")
+        print("  latest release     %s" % ("%s%s (%s)" % (latest["version"], " prerelease" if latest["prerelease"]
+                                                         else "", latest["url"]) if latest else "-"))
+        print("  result             %s%s" % (res["status"], " (%s)" % res["error"] if res.get("error") else ""))
+        for x in nxt:
+            print("  next: %s" % x)
+        if res.get("record"):
+            print("  recorded: %s" % res["record"])
+    return 0 if res["status"] != "error" else 1
+
+
+def recorded_update(home):
+    raw, _ = core().read_small_json(home / UPDATE_FILE)
+    if not isinstance(raw, dict) or raw.get("status") not in ("update_available", "current", "ahead", "no_release",
+                                                               "no_stable_release", "error"):
+        return None
+    latest = raw.get("latest") if isinstance(raw.get("latest"), dict) else None
+    version = latest.get("version") if latest and parse_semver(latest.get("version")) else None
+    status = raw["status"]
+    if status == "update_available" and version and compare_versions(plugin_version(), version) != -1:
+        status = "current"          # updated since the check
+    return {"checked_at": raw.get("checked_at") if isinstance(raw.get("checked_at"), str) and
+            ISO_RE.match(raw["checked_at"]) else None, "status": status, "latest": version,
+            "channel": raw.get("channel") if raw.get("channel") in ("stable", "preview") else None}
+
+
+def update_status(home, home_source, a):
+    f = gather_versions(home, home_source)
+    versions = local_versions(home, f)
+    state = load_notice_state(home, strict=False)
+    counts = {}
+    for e in state["notices"].values():
+        counts[e.get("status")] = counts.get(e.get("status"), 0) + 1
+    res = {"installed": versions, "last_check": recorded_update(home), "notices": counts,
+           "installations_remembered": len(state["installations"])}
+    if a.json:
+        res["notice_entries"] = sorted(state["notices"].values(), key=lambda e: e.get("key", ""))
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+        return 0
+    print("%s update status" % DISPLAY)
+    print("  installed plugin   %s" % versions["plugin"])
+    print("  durable runtime    %s" % (versions["runtime"] or versions["runtime_note"]))
+    print("  running receiver   %s" % (versions["receiver"] or versions["receiver_note"]))
+    lc = res["last_check"]
+    print("  last check         %s" % ("%s, %s (latest %s, %s channel)" % (lc["checked_at"], lc["status"],
+                                                                          lc["latest"], lc["channel"])
+                                       if lc else "never recorded (`%s update check`)" % PRODUCT))
+    print("  upgrade notices    %s" % (", ".join("%s %d" % kv for kv in sorted(counts.items())) or "none"))
+    for e in sorted(state["notices"].values(), key=lambda e: e.get("key", "")):
+        print("    %-48s %-11s %s" % (e.get("key", "?")[:48], e.get("status"), e.get("last_error") or ""))
+    return 0
+
+
+def reminder_template(home, a):
+    python = os.path.realpath(sys.executable)
+    args = [python, str(Path(__file__).resolve()), "--home", str(home), "update", "check", "--record",
+            "--channel", a.channel]
+    warn = "# The plugin path below changes when the plugin is updated: print this again after each update."
+    if a.kind == "systemd-user":
+        print("# Opt-in weekly Yobiru update reminder. It only records `update check`; doctor and status then")
+        print("# show the reminder. Nothing is downloaded or installed. Review, then save as")
+        print("#   ~/.config/systemd/user/yobiru-update-check.service and .timer, and run:")
+        print("#   systemctl --user daemon-reload && systemctl --user enable --now yobiru-update-check.timer")
+        print(warn)
+        print("# ---- yobiru-update-check.service")
+        print("[Unit]\nDescription=Yobiru update check (record only)\n\n[Service]\nType=oneshot")
+        print("ExecStart=%s" % " ".join(systemd_quote(x) for x in args))
+        print("# ---- yobiru-update-check.timer")
+        print("[Unit]\nDescription=Weekly Yobiru update check\n\n[Timer]\nOnCalendar=weekly\nPersistent=true\n\n"
+              "[Install]\nWantedBy=timers.target")
+    elif a.kind == "launchd":
+        print("Review, save stdout as ~/Library/LaunchAgents/dev.yobiru.update-check.plist, then: launchctl load -w "
+              "<that file>. It only records `update check`. %s" % warn.lstrip("# "), file=sys.stderr)
+        sys.stdout.write(plistlib.dumps({"Label": "dev.yobiru.update-check", "ProgramArguments": args,
+                                         "StartInterval": 7 * 24 * 3600, "RunAtLoad": False}).decode("utf-8"))
+    else:
+        quote = lambda s: "'" + s.replace("'", "'\\''") + "'"
+        print("# Opt-in weekly Yobiru update reminder (records `update check` only). Add with `crontab -e`.")
+        print(warn)
+        print("17 9 * * 1 %s >/dev/null 2>&1" % " ".join(quote(x) for x in args))
+    return 0
+
+
+# ---------------------------------------------------------------- update notify: coordinated upgrade notices
+def load_notice_state(home, strict=True):
+    path = home / NOTICES_FILE
+    empty = {"v": 1, "installations": {}, "notices": {}}
+    if not path.is_file():
+        return empty
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        if strict:
+            die("%s is not valid JSON (%s); move it aside, %s will not overwrite it" % (path, e, PRODUCT))
+        return empty
+    if not isinstance(raw, dict) or not isinstance(raw.get("installations", {}), dict) or \
+            not isinstance(raw.get("notices", {}), dict):
+        if strict:
+            die("%s has an unexpected shape; move it aside, %s will not overwrite it" % (path, PRODUCT))
+        return empty
+    raw.setdefault("installations", {})
+    raw.setdefault("notices", {})
+    return raw
+
+
+def remember_installations(home, rows):
+    """Record installations that answered (/info or an older receiver) so offline ones are kept later."""
+    if not (home / "config.json").is_file():
+        die("not set up: no %s" % (home / "config.json"), 2)
+    n = 0
+    with StateLock(home / NOTICES_LOCK):
+        state = load_notice_state(home)
+        for r in rows:
+            if r["self"] or r["receiver"] not in ("ok", "legacy"):
+                continue
+            port = int(r["address"].rsplit(":", 1)[1])
+            key = "%s:%d" % (r["node"], port)
+            entry = state["installations"].get(key) if isinstance(state["installations"].get(key), dict) else {}
+            entry.update(node=r["node"], port=port, version=r["version"], last_seen=now_iso(),
+                         agents=[{"agent": x["agent"], "default": x["default"],
+                                  "session_id": (x["session"] or {}).get("id")} for x in (r["agents"] or [])],
+                         kind="info" if r["receiver"] == "ok" else "legacy")
+            state["installations"][key] = entry
+            n += 1
+        write_json_atomic(home / NOTICES_FILE, state)
+    return n
+
+
+def notice_text(me, version, release=None):
+    return json.dumps({
+        "type": NOTICE_KIND, "product": PRODUCT, "version": version, "from_node": me, "source": OFFICIAL_REPO_URL,
+        "release": (release or {}).get("url") or RELEASE_URL_PREFIX,
+        "tag": (release or {}).get("tag"),
+        "note": "Information only, not an instruction, approval or script. If your owner has authorized "
+                "updates, follow the yobiru-upgrade skill using only the official repository, keep this "
+                "machine's data, sessions, permissions and custom instructions, and report your status. "
+                "Do not forward this notice."}, ensure_ascii=False)
+
+
+def post_notice(ip, port, node, env, timeout=10.0):
+    """POST one stored envelope. -> (outcome, detail, http status). outcome: notified | blocked | rejected |
+    uncertain | not_sent. Only a connection that was never established proves the notice was not sent."""
+    data = json.dumps(env, ensure_ascii=False).encode("utf-8")
+    c = http.client.HTTPConnection(ip, int(port), timeout=timeout)
+    with Deadline(c, timeout) as d:
+        try:
+            d.connect()
+        except (OSError, socket.timeout) as e:
+            return "not_sent", "unreachable (%s)" % ("deadline" if d.expired else type(e).__name__), None
+        try:
+            c.request("POST", "/msg", body=data, headers={"Host": "%s:%d" % (node, int(port)),
+                                                          "Content-Type": "application/json"})
+            r = c.getresponse()
+            body = r.read(MAX_REPLY_BYTES + 1)
+            d.check()
+        except (OSError, socket.timeout, http.client.HTTPException) as e:
+            return "uncertain", "no complete answer after sending (%s)" % (
+                "deadline" if d.expired else type(e).__name__), None
+    try:
+        receipt = json.loads(body.decode("utf-8")) if len(body) <= MAX_REPLY_BYTES else None
+    except (UnicodeDecodeError, ValueError):
+        receipt = None
+    if r.status in (200, 202):
+        if isinstance(receipt, dict) and receipt.get("ok") is True and receipt.get("id") == env["id"]:
+            return "notified", "HTTP %d%s" % (r.status, " (already stored earlier)" if r.status == 200 else ""), r.status
+        return "uncertain", "HTTP %d without a valid receipt for this message id" % r.status, r.status
+    if r.status == 403:
+        return "blocked", "HTTP 403: this machine is not on that receiver's allow list", r.status
+    if r.status in (400, 404, 411, 413, 415):
+        err = clean((receipt or {}).get("error") if isinstance(receipt, dict) else None, 120)
+        return "rejected", "HTTP %d%s" % (r.status, ": " + err if err else ""), r.status
+    return "uncertain", "HTTP %d" % r.status, r.status
+
+
+def verify_local(home, f, target):
+    v = local_versions(home, f)
+    problems = []
+    if v["plugin"] != target:
+        problems.append("installed plugin is %s, not %s" % (v["plugin"], target))
+    if v["runtime"] != target:
+        problems.append("durable runtime is %s, not %s (`%s install-runtime --upgrade --apply`)"
+                        % (v["runtime"] or v["runtime_note"], target, PRODUCT))
+    if v["receiver"] != target:
+        problems.append("running receiver is %s, not %s (restart the receiver service)"
+                        % (v["receiver"] or v["receiver_note"], target))
+    return {"ok": not problems, "versions": v, "problems": problems}
+
+
+def notice_key(node, port, agent, version):
+    return "%s:%d/%s@%s" % (node, port, agent or "", version)
+
+
+def official_release(target, channel, timeout=10.0, fetch=None):
+    """-> (release or None, problem or None). The target must be a published, non-draft release of the official
+    repository; a prerelease needs the preview channel. Unreachable metadata is a refusal, never a pass."""
+    try:
+        releases = (fetch or fetch_releases)(timeout)
+    except UpdateError as e:
+        return None, "could not verify the release on %s (%s)" % (OFFICIAL_REPO_URL, e.code)
+    rel = next((r for r in releases if r["version"] == target), None)
+    if rel is None:
+        return None, "%s is not a published release of %s" % (target, OFFICIAL_REPO_URL)
+    if rel["prerelease"] and channel != "preview":
+        return None, "%s is a prerelease: pass --channel preview to announce it" % target
+    return rel, None
+
+
+def decide_notice(status, kind, version, target, reconcile, retry_blocked=False):
+    """Action for one (installation, agent, version) from its persisted status and what discovery saw now.
+    uncertain/dispatching leave only by explicit reconciliation (same message id) or by an authenticated
+    /info showing the target version; nothing else may downgrade them."""
+    at_target = version is not None and compare_versions(version, target) in (0, 1)
+    if status in ("notified", "verified"):
+        return ("verify", "its receiver now runs %s" % version) if status == "notified" and at_target \
+            else ("skip", "already %s" % status)
+    if at_target:
+        return "verify", "its receiver already runs %s (authenticated /info)" % version
+    if status in ("uncertain", "dispatching"):
+        return ("resend_same_id", "reconcile with the identical message id") if reconcile else \
+            ("hold", "outcome uncertain: not resent (see --reconcile-uncertain)")
+    if status == "rejected":
+        return "hold", "rejected earlier; not resent"
+    if status == "blocked" and kind != "info" and not retry_blocked:
+        # Only a fresh authenticated /info (it uses the same allow list as /msg) shows that permission came
+        # back; older receivers cannot show it, so they are not asked again unless --retry-blocked.
+        return "hold", "refused earlier (403); not resent until /info shows access again or --retry-blocked"
+    if kind == "blocked":
+        return "blocked", "this machine is not on its allow list (403); nothing sent"
+    if kind in ("offline", "unreachable", "absent"):
+        return "pending", {"absent": "not in the current tailscale status: kept pending",
+                           "offline": "offline: kept pending for a later run"}.get(kind, "not answering: kept pending")
+    if kind in ("malformed", "error"):
+        return "pending", "unexpected answer (%s): kept pending" % kind
+    return "send", "running %s" % (version or "an older receiver (no /info)")
+
+
+def notice_candidates(state, nodes, peer_specs, port, discover, target):
+    cands, unknown = {}, []
+
+    def add(node, p, source):
+        n = match_node(nodes, node)
+        if n is not None and n["self"]:
+            return None
+        canon = n["node"] if n else node
+        c = cands.setdefault("%s:%d" % (canon, p), {
+            "node": canon, "port": p, "ip": n["ip"] if n else None, "online": bool(n and n["online"]),
+            "in_status": n is not None, "sources": set(), "agents": [], "remembered": None})
+        c["sources"].add(source)
+        return c
+
+    def want(c, agent):
+        if agent not in c["agents"]:
+            c["agents"].append(agent)
+    for host, p, agent in peer_specs:
+        if match_node(nodes, host) is None:
+            unknown.append(host)
+            continue
+        c = add(host, p, "explicit")
+        if c is not None:
+            want(c, agent)
+    for inst in state["installations"].values():
+        if isinstance(inst, dict) and isinstance(inst.get("node"), str) and isinstance(inst.get("port"), int):
+            c = add(inst["node"], inst["port"], "remembered")
+            if c is not None:
+                c["remembered"] = inst
+                for x in inst.get("explicit_agents") or []:
+                    if x is None or isinstance(x, str):
+                        want(c, x)
+    for e in state["notices"].values():           # unfinished notices for this version stay in every plan
+        if isinstance(e, dict) and e.get("version") == target and e.get("status") not in ("notified", "verified") \
+                and isinstance(e.get("node"), str) and isinstance(e.get("port"), int):
+            c = add(e["node"], e["port"], "earlier notice")
+            if c is not None:
+                want(c, e.get("agent"))
+    if discover:
+        for n in nodes:
+            if not n["self"] and n["online"]:
+                add(n["node"], port, "discovered")
+    return sorted(cands.values(), key=lambda c: (c["node"], c["port"])), unknown
+
+
+def notice_plan(state, items, probes, target, reconcile, retry_blocked=False):
+    plan = []
+    for c, pr in zip(items, probes):
+        kind = ("offline" if c["in_status"] else "absent") if pr is None else pr["kind"]
+        if c["sources"] == {"discovered"} and kind not in ("info", "legacy", "blocked"):
+            continue                  # not an installation we know of: never message arbitrary nodes
+        info = pr["info"] if pr and pr["kind"] == "info" else None
+        agents = list(c["agents"])
+        if not agents:
+            if info is not None:
+                agents = [x["agent"] for x in info["agents"] if x["session"]] or \
+                         [next((x["agent"] for x in info["agents"] if x["default"]), None)]
+            elif c["remembered"] and c["remembered"].get("agents"):
+                agents = [x.get("agent") for x in c["remembered"]["agents"] if isinstance(x, dict)
+                          and x.get("session_id")] or [None]
+            else:
+                agents = [None]
+        for agent in agents:
+            key = notice_key(c["node"], c["port"], agent, target)
+            entry = state["notices"].get(key) if isinstance(state["notices"].get(key), dict) else None
+            version = info["version"] if info else None
+            action, why = decide_notice((entry or {}).get("status"), kind, version, target, reconcile, retry_blocked)
+            plan.append({"key": key, "node": c["node"], "port": c["port"], "ip": c["ip"], "agent": agent,
+                         "receiver": kind, "version": version, "status": (entry or {}).get("status"),
+                         "action": action, "why": why, "sources": sorted(c["sources"])})
+    return plan
+
+
+def update_notify(home, home_source, a, fetch=None):
+    f = gather_versions(home, home_source)
+    if f.get("cfg") is None:
+        die("not set up (%s); run `%s onboard`" % (f.get("config_error") or "no config.json", PRODUCT), 2)
+    target_v = parse_semver(a.version or f["plugin_version"])
+    if target_v is None:
+        die("--version must be a release version such as 0.3.0", 2)
+    target = fmt_semver(target_v)
+    cfg, port = f["cfg"], f["port"]
+    nodes, err = tailnet_nodes(cfg["tailscale_cmd"])
+    if err:
+        die("cannot read the tailnet: %s" % err, 1)
+    me = next((n["node"] for n in nodes if n["self"]), None)
+    verification = verify_local(home, f, target)
+    release, release_problem = official_release(target, a.channel, fetch=fetch)
+    state = load_notice_state(home)
+    specs = [parse_peer_spec(x, port) for x in a.peer]
+    items, unknown = notice_candidates(state, nodes, specs, port, not a.no_discover, target)
+    timeout = max(0.2, min(a.timeout, 30.0))
+    probes = run_parallel(lambda c: probe_info(c["ip"], c["port"], timeout, expect_node=c["node"], host=c["node"])
+                          if c["online"] and c["ip"] else None, items)
+    plan = notice_plan(state, items, probes, target, a.reconcile_uncertain, a.retry_blocked)
+    res = {"command": "update notify", "version": target, "channel": a.channel, "dry_run": not a.apply,
+           "verification": verification, "release": release, "release_problem": release_problem,
+           "plan": plan, "unknown_peers": unknown, "results": []}
+    if a.apply:
+        if not verification["ok"]:
+            res["error"] = "the local upgrade is not verified; notices are sent only after this machine runs %s" % target
+        elif release_problem:
+            res["error"] = release_problem
+        else:
+            try:
+                res["results"] = apply_notices(home, me, target, items, probes, a.reconcile_uncertain,
+                                               release=release, retry_blocked=a.retry_blocked)
+            except LockBusy as e:
+                res["error"] = str(e)
+    for item in plan:
+        item.pop("ip", None)
+    if a.json:
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+    else:
+        print("%s update notify %s (%s)" % (PRODUCT, target, "applied" if a.apply and not res.get("error")
+                                            else "refused" if res.get("error") else "dry run, nothing sent or written"))
+        print("  local upgrade: %s" % ("verified (plugin, durable runtime and running receiver at %s)" % target
+                                       if verification["ok"] else "NOT verified: " + "; ".join(verification["problems"])))
+        print("  release:       %s" % ("official %s%s (%s)" % (release["tag"], " prerelease" if release["prerelease"]
+                                                                else "", release["url"]) if release
+                                       else "NOT verified: " + release_problem))
+        if not plan:
+            print("  no known installations: name them with --peer HOST/AGENT, or run `%s agents --remember` while "
+                  "they are online" % PRODUCT)
+        for item in plan:
+            print("  %-46s %-15s %s" % (item["key"][:46], item["action"], item["why"]))
+        for r in res["results"]:
+            print("  -> %-43s %-15s %s" % (r["key"][:43], r["status"], r.get("detail") or ""))
+        for spec in unknown:
+            print("  unknown peer (not in tailscale status, nothing recorded): %s" % spec)
+        if res.get("error"):
+            print("  error: %s" % res["error"])
+        elif not a.apply and plan:
+            print("  review the plan, then re-run with --apply")
+    return 1 if res.get("error") else 0
+
+
+def apply_notices(home, me, target, items, probes, reconcile, post=None, release=None, retry_blocked=False):
+    """Apply under the cross-process lock. Every action is recomputed from the state read under the lock, so a
+    plan made earlier can never downgrade an uncertain or dispatching notice."""
+    results = []
+    with StateLock(home / NOTICES_LOCK):
+        state = load_notice_state(home)
+        for e in state["notices"].values():
+            if isinstance(e, dict) and e.get("status") == "dispatching":
+                # A previous run stopped after recording the attempt: the notice may have been delivered.
+                e.update(status="uncertain", last_error="interrupted after the send was recorded",
+                         updated_at=now_iso())
+        for c, pr in zip(items, probes):
+            key = "%s:%d" % (c["node"], c["port"])
+            answered = pr is not None and pr["kind"] in ("info", "legacy")
+            if not answered and "explicit" not in c["sources"]:
+                continue
+            inst = state["installations"].get(key) if isinstance(state["installations"].get(key), dict) else {}
+            inst.update(node=c["node"], port=c["port"])
+            if "explicit" in c["sources"]:
+                inst["explicit_agents"] = sorted(set((inst.get("explicit_agents") or []) + c["agents"]),
+                                                 key=lambda x: x or "")
+            if answered:
+                info = pr["info"]
+                inst.update(last_seen=now_iso(), version=info["version"] if info else "<=0.2.x", kind=pr["kind"])
+                if info:
+                    inst["agents"] = [{"agent": x["agent"], "default": x["default"],
+                                       "session_id": (x["session"] or {}).get("id")} for x in info["agents"]]
+            state["installations"][key] = inst
+        write_json_atomic(home / NOTICES_FILE, state)
+        for item in notice_plan(state, items, probes, target, reconcile, retry_blocked):
+            key = item["key"]
+            entry = state["notices"].get(key) if isinstance(state["notices"].get(key), dict) else None
+            action = item["action"]
+            if action in ("skip", "hold"):
+                continue
+            if entry is None:
+                entry = {"key": key, "node": item["node"], "port": item["port"], "agent": item["agent"],
+                         "version": target, "status": "pending", "attempts": 0, "created_at": now_iso()}
+                state["notices"][key] = entry
+            now = now_iso()
+            if action == "verify":
+                entry.update(status="verified", verified_at=now, updated_at=now,
+                             detail="authenticated discovery shows the running receiver at %s (software only; no "
+                                    "agent wake is implied)" % item["version"])
+            elif action == "blocked":
+                entry.update(status="blocked", updated_at=now, last_error="403 on /info: not on the allow list")
+            elif action == "pending":
+                entry.update(status="pending", updated_at=now, last_error=item["why"])
+            elif action in ("send", "resend_same_id") and item["ip"]:
+                env = entry.get("envelope") if action == "resend_same_id" else None
+                if not isinstance(env, dict):
+                    env = {"v": 1, "id": secrets.token_hex(8), "from": me, "to": item["node"], "ts": now,
+                           "kind": NOTICE_KIND, "text": notice_text(me, target, release),
+                           "wake": "now"}     # a request only: the receiver's wake policy may lower it
+                    if item["agent"] is not None:     # never dropped or retargeted, also for older receivers
+                        env["agent"] = item["agent"]
+                    entry["envelope"] = env
+                entry.update(status="dispatching", attempts=int(entry.get("attempts") or 0) + 1, updated_at=now)
+                write_json_atomic(home / NOTICES_FILE, state)          # intent is durable before the POST
+                outcome, detail, code = (post or post_notice)(item["ip"], item["port"], item["node"], env)
+                entry.update(updated_at=now_iso(), http_status=code, detail=detail,
+                             last_error=None if outcome == "notified" else detail)
+                entry["status"] = {"notified": "notified", "blocked": "blocked", "rejected": "rejected",
+                                   "uncertain": "uncertain", "not_sent": "pending"}[outcome]
+                if outcome == "notified":
+                    entry["notified_at"] = entry["updated_at"]
+            else:
+                continue
+            write_json_atomic(home / NOTICES_FILE, state)
+            results.append({"key": key, "status": entry["status"], "detail": entry.get("detail") or
+                            entry.get("last_error")})
+    return results
+
+
+# ---------------------------------------------------------------- onboarding: platform-aware next steps
+def environment_facts():
+    import platform as _platform
+    facts = {"platform": sys.platform, "system": _platform.system(), "release": _platform.release(),
+             "machine": _platform.machine(), "root": hasattr(os, "geteuid") and os.geteuid() == 0,
+             "sudo": bool(shutil.which("sudo")), "curl": bool(shutil.which("curl")),
+             "workspace": Path("/workspace").is_dir()}
+    if sys.platform.startswith("linux"):
+        try:
+            with open("/proc/sys/kernel/osrelease") as fh:
+                facts["wsl"] = "microsoft" in fh.read().lower()
+        except OSError:
+            facts["wsl"] = False
+        facts["container"] = os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
+        facts["tun"] = os.path.exists("/dev/net/tun")
+        facts["systemd"] = Path("/run/systemd/system").is_dir()
+        facts["systemd_user"] = False
+        if facts["systemd"] and shutil.which("systemctl"):
+            try:
+                facts["systemd_user"] = subprocess.run(["systemctl", "--user", "show-environment"],
+                                                       capture_output=True, timeout=5).returncode == 0
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+    elif sys.platform == "darwin":
+        facts["mac_app_cli"] = os.path.isfile(MAC_TS_CLI)
+    elif sys.platform == "win32":
+        facts["win_cli"] = os.path.isfile(WIN_TS_CLI)
+    return facts
+
+
+def root_prefix(facts):
+    """'' when already root, 'sudo ' when sudo exists, None when neither (Linux/macOS shells only)."""
+    if facts.get("root"):
+        return ""
+    return "sudo " if facts.get("sudo") else None
+
+
+def permission_guidance(facts, ts_cmd):
+    """How to let Yobiru query Tailscale after `permission denied`, for this platform and configured CLI."""
+    plat = facts["platform"]
+    if plat == "win32":
+        return ("run Yobiru in the same Windows user session that is signed in to the Tailscale app (an "
+                "administrator shell is not needed for status queries); if the CLI is not on PATH: "
+                '`%s setup --tailscale-cmd "%s" --replace tailscale_cmd`' % (PRODUCT, WIN_TS_CLI), [], "user")
+    if plat == "darwin":
+        return ("use the Tailscale app's CLI as the signed-in user: `%s setup --tailscale-cmd %s --replace "
+                "tailscale_cmd`" % (PRODUCT, MAC_TS_CLI), [], "agent")
+    if (ts_cmd or [""])[0] == "sudo":
+        return ("the configured command already uses sudo and was refused; passwordless sudo for tailscale is "
+                "needed, or the administrator can make this user the Tailscale operator", [], "administrator")
+    if facts.get("root"):
+        return ("tailscale refused even root: check that tailscaled runs and its socket is reachable", [], "agent")
+    if facts.get("sudo"):
+        return ("with passwordless sudo, let Yobiru call tailscale through it; otherwise the administrator can make "
+                "this user the Tailscale operator (their decision)",
+                ['%s setup --tailscale-cmd \'["sudo","-n","tailscale"]\' --replace tailscale_cmd' % PRODUCT],
+                "agent (only with passwordless sudo) or administrator")
+    return ("this user cannot query tailscale and has no sudo: the administrator can make this user the "
+            "Tailscale operator (their decision)", [], "administrator")
+
+
+def classify_tailscale(ts):
+    """missing | permission | daemon_unavailable | error | running | logged_out | needs_approval | stopped |
+    starting | unchecked | unknown"""
+    if ts.get("cmd") is None:
+        return "error"
+    if not ts.get("found"):
+        return "missing"
+    err = ts.get("error") or ""
+    if re.search(r"permission denied|access denied|not permitted", err, re.I):
+        return "permission"
+    if re.search(r"tailscaled|connection refused|is not running|doesn.t appear to be running|failed to connect|"
+                 r"no such file|cannot connect", err, re.I):
+        return "daemon_unavailable"
+    if err:
+        return "error"
+    if not ts.get("probed"):
+        return "unchecked"
+    return {"Running": "running", "NeedsLogin": "logged_out", "NeedsMachineAuth": "needs_approval",
+            "Stopped": "stopped", "NoState": "starting", "Starting": "starting"}.get(ts.get("backend"), "unknown")
+
+
+def tailscale_install_steps(facts):
+    """(status, detail, commands, docs, who) for installing Tailscale on this platform."""
+    p = facts["platform"]
+    if p.startswith("linux"):
+        docs = [TS_DOCS["linux"], TS_DOCS["download"]]
+        cmds = ["curl -fsSL %s | sh" % TS_DOCS["script"]]
+        notes = []
+        if not facts.get("curl"):
+            notes.append("curl is missing; install it with the system package manager first")
+        if not facts.get("tun"):
+            return ("blocked", "this host has no /dev/net/tun (container or restricted VM). Tailscale would only "
+                    "run in userspace networking mode, which gives this machine no Tailscale IP address of its "
+                    "own; the Yobiru receiver binds that address and connects to peers directly, so Yobiru cannot "
+                    "work here. Use a TUN-capable host, or ask the administrator to provide /dev/net/tun",
+                    [], docs, "administrator / another host")
+        if not facts.get("systemd"):
+            notes.append("no systemd: the install script cannot start tailscaled as a service; start "
+                         "`tailscaled` yourself (for example in a supervisor or `nohup`) and keep it running")
+        if facts.get("wsl"):
+            notes.append("WSL: Tailscale can run inside the distribution or on Windows; a receiver inside WSL "
+                         "needs Tailscale inside WSL")
+        if facts.get("root") or facts.get("sudo"):
+            return ("todo", "Tailscale is not installed. The official script installs the package (needs root"
+                    + ("" if facts.get("root") else " through sudo") + ")" + ("; " + "; ".join(notes) if notes else ""),
+                    cmds, docs, "agent may run it when the user asked to set up Yobiru")
+        return ("blocked", "Tailscale is not installed and this user has neither root nor sudo, so it cannot be "
+                "installed here; ask the machine's administrator (on Grok Bot team computers: the Enterprise Team "
+                "Setup script)" + ("; " + "; ".join(notes) if notes else ""), cmds, docs, "administrator")
+    if p == "darwin":
+        if facts.get("mac_app_cli"):
+            return ("todo", "the Tailscale app is installed but its CLI is not on PATH",
+                    ["%s setup --tailscale-cmd %s --replace tailscale_cmd   # existing config" % (PRODUCT, MAC_TS_CLI),
+                     "%s setup --allow PEER --tailscale-cmd %s   # new config" % (PRODUCT, MAC_TS_CLI)],
+                    [TS_DOCS["darwin"]], "agent")
+        return ("todo", "install the Tailscale app (Mac App Store or the standalone download), open it, approve "
+                "the VPN / system extension prompt in System Settings, then sign in from the menu bar. The "
+                "app's CLI is %s" % MAC_TS_CLI, [], [TS_DOCS["darwin"], TS_DOCS["download"]],
+                "user (GUI approval needed)")
+    if p == "win32":
+        if facts.get("win_cli"):
+            return ("todo", "Tailscale is installed but not on PATH for this Python",
+                    ['%s setup --tailscale-cmd "%s" --replace tailscale_cmd' % (PRODUCT, WIN_TS_CLI)],
+                    [TS_DOCS["win32"]], "agent")
+        return ("todo", "run the Windows installer from the download page (administrator rights needed), then "
+                "sign in from the Tailscale icon in the notification area. The CLI is %s; paths with spaces must "
+                "stay quoted, and the Codex bridge is not available on Windows" % WIN_TS_CLI, [],
+                [TS_DOCS["win32"], TS_DOCS["download"]], "user (administrator)")
+    return ("blocked", "unsupported platform %s for these instructions" % p, [], [TS_DOCS["download"]], "user")
+
+
+def onboarding_steps(home, f, facts):
+    steps = []
+    plat = facts["platform"]
+
+    def step(sid, status, title, detail, commands=(), docs=(), who="agent"):
+        steps.append({"id": sid, "status": status, "title": title, "detail": detail, "commands": list(commands),
+                      "docs": list(docs), "who": who})
+    ok_py = sys.version_info[:2] >= MIN_PYTHON
+    step("python", "done" if ok_py else "blocked", "Python 3.8+", f["python"]["version"],
+         who="agent" if ok_py else "user")
+    ts = f["tailscale"]
+    state = classify_tailscale(ts)
+    if state == "missing":
+        st, detail, cmds, docs, who = tailscale_install_steps(facts)
+        step("tailscale-install", st, "Install Tailscale", detail, cmds, docs, who)
+    elif state == "error" and ts.get("cmd") is None:
+        step("tailscale-install", "todo", "Fix tailscale_cmd", ts.get("error") or "", [], [], "agent")
+    else:
+        step("tailscale-install", "done", "Install Tailscale", "found %s" % ts.get("found"))
+    login_docs = [TS_DOCS.get(plat if plat in ("darwin", "win32") else "linux")]
+    if state in ("missing",):
+        step("tailscale-login", "todo", "Sign in to Tailscale", "after installing", who="user")
+    elif state == "permission":
+        detail, cmds, who = permission_guidance(facts, ts.get("cmd"))
+        step("tailscale-login", "todo", "Let Yobiru query Tailscale",
+             "tailscale refused this user (%s); %s" % (ts.get("error"), detail), cmds, login_docs, who)
+    elif state == "daemon_unavailable":
+        pre = root_prefix(facts)
+        if plat.startswith("linux") and pre is not None:
+            cmds = ["%ssystemctl enable --now tailscaled" % pre] if facts.get("systemd") else \
+                ["%stailscaled   # keep it running (supervisor or nohup); needs /dev/net/tun" % pre]
+        else:
+            cmds = []
+        step("tailscale-login", "todo", "Start the Tailscale daemon",
+             "tailscaled is not running or not reachable (%s)%s" % (ts.get("error"), "; on macOS/Windows open the "
+             "Tailscale app" if plat in ("darwin", "win32") else ""), cmds, login_docs,
+             "agent with root/sudo, otherwise user")
+    elif state in ("logged_out", "stopped", "starting", "unknown", "error"):
+        cmd = ts.get("cmd") or ["tailscale"]
+        if plat == "win32":
+            exe = "& " + " ".join('"%s"' % x for x in cmd)          # PowerShell call operator for a quoted path
+        else:
+            exe = " ".join("'%s'" % x if " " in x else x for x in cmd)
+        if plat.startswith("linux"):
+            pre = root_prefix(facts)
+            if (ts.get("cmd") or [""])[0] == "sudo":
+                pre = ""
+            up = "%s%s up" % (pre or "", exe)
+            how = "Run `%s`: it prints a login URL%s" % (up, "" if pre is not None else
+                                                        " (this user has no root or sudo: an administrator "
+                                                        "or the machine owner must run it)")
+        else:
+            up = "%s up" % exe
+            how = "Sign in from the Tailscale app (%s); `%s` (%s) from the configured CLI also works and opens " \
+                  "the login page" % ("menu bar" if plat == "darwin" else "notification area icon", up,
+                                      "PowerShell" if plat == "win32" else "Terminal")
+        step("tailscale-login", "todo", "Sign in to Tailscale",
+             {"logged_out": "this machine is logged out", "stopped": "Tailscale is stopped",
+              "starting": "Tailscale is still starting; check again shortly",
+              "unknown": "unexpected state %s" % ts.get("backend"),
+              "error": ts.get("error") or "tailscale status failed"}[state] +
+             ". %s; the user opens it and chooses the account and tailnet themselves (no auth keys in "
+             "chat)" % how, [up], login_docs, "user (identity choice)")
+    elif state == "needs_approval":
+        step("tailscale-login", "todo", "Device approval", "the tailnet requires an administrator to approve this "
+             "device in the Tailscale admin console", [], login_docs, "tailnet administrator")
+    elif state == "unchecked":
+        step("tailscale-login", "unknown", "Sign in to Tailscale", "not checked (--no-probe)")
+    else:
+        step("tailscale-login", "done", "Sign in to Tailscale", "running as %s" % ts.get("node"))
+    if f["config_error"]:
+        step("config", "blocked", "Configure Yobiru", f["config_error"], [], [], "user (fix config.json by hand)")
+    elif not f["config_exists"]:
+        step("config", "todo", "Choose peers and agent names",
+             "ask the user which machines may message this one and what this agent is called; nothing is "
+             "created until --apply",
+             ["%s setup --allow PEER --agent NAME --self-agent NAME --default-agent NAME" % PRODUCT,
+              "%s setup --allow PEER --agent NAME --self-agent NAME --default-agent NAME --apply" % PRODUCT],
+             [], "user chooses, agent applies")
+    else:
+        step("config", "done" if f.get("allow") else "todo", "Choose peers and agent names",
+             "allow: %s" % (", ".join(f["allow"]) or "nobody yet"),
+             [] if f.get("allow") else ["%s setup --allow PEER --apply" % PRODUCT])
+    rt = f["runtime"]
+    step("runtime", "done" if rt["present"] and rt.get("same_as_bundled") else "todo", "Durable receiver runtime",
+         "%s %s" % (rt["path"], "matches the bundled runtime" if rt.get("same_as_bundled") else
+                    "differs from the bundled runtime" if rt["present"] else "missing"),
+         [] if rt["present"] and rt.get("same_as_bundled") else
+         ["%s install-runtime%s --apply" % (PRODUCT, " --upgrade" if rt["present"] else "")])
+    recv = f.get("receiver") or {}
+    if recv.get("reachable") and recv.get("ok"):
+        step("receiver", "done", "Receiver running", "serving at %s" % recv.get("url"))
+    else:
+        if plat == "darwin":
+            kind = "launchd"
+        elif plat == "win32":
+            kind = "windows"
+        elif facts.get("systemd_user"):
+            kind = "systemd-user"
+        elif facts.get("systemd") and (facts.get("root") or facts.get("sudo")):
+            kind = "systemd"
+        else:
+            kind = None
+        if kind:
+            step("receiver", "todo", "Run the receiver as a service",
+                 "print the definition, install it at the place named in its header and start it",
+                 ["%s service-template %s" % (PRODUCT, kind)])
+        else:
+            step("receiver", "todo", "Run the receiver",
+                 "no usable service manager here: run `%s serve` in a persistent terminal or supervisor (it stops "
+                 "when that process ends; on Grok Bot computers long-running receivers are not verified)" % PRODUCT,
+                 ["nohup sh <path to scripts/yobiru> serve >> %s 2>&1 &" % (home / "serve.log")])
+    if f.get("cfg") is not None:
+        names = core().info_agent_names(f["cfg"], core().parse_config(f["cfg"])[1])
+        bound, _ = core().session_bindings(home, names)
+        missing = [n for n in names if n not in bound]
+        step("sessions", "done" if names and not missing else "todo", "Bind each agent to its session",
+             "bound: %s; unbound: %s" % (", ".join(sorted(bound)) or "none", ", ".join(missing) or "none"),
+             ["%s session bind --agent %s --session-id <exact id> --display-name <alias>" % (PRODUCT, n)
+              for n in missing[:3]], [], "user names the existing session; agent applies")
+    if f.get("cfg") is not None:
+        silent = [a["agent"] for a in f.get("adapters", []) if a["adapter"] == "none"]
+        broken = [a["agent"] for a in f.get("adapters", []) if any(st == "error" for st, _ in a["checks"])]
+        cmds = []
+        for n in (silent + broken)[:3]:
+            if n == "codex" and plat in ("linux", "darwin"):
+                cmds.append("%s codex-bridge install --thread-id <session UUID>%s --dry-run" % (
+                    PRODUCT, " --codex-remote unix:///<app-server socket>" if plat == "linux" else ""))
+            else:
+                cmds.append("%s wake-config --agent %s --exec /absolute/notify-program   # or --webhook ..." % (
+                    PRODUCT, n if n is not None else "NAME"))
+        step("delivery", "done" if not silent and not broken else "todo", "Configure how each agent is woken",
+             "a session binding only names the session; delivery is configured separately (Codex bridge, a "
+             "local program or a webhook). Without an adapter, messages wait in `inbox --pending`. "
+             + ("no adapter: %s; " % ", ".join("@%s" % x for x in silent) if silent else "")
+             + ("misconfigured: %s; " % ", ".join("@%s" % x for x in broken) if broken else "")
+             + "verify with a test message sent with --wake now from an allowed peer (or `wake ID`) and check "
+               "`show ID` for wake_delivery", cmds, [], "agent, with the user's choice of adapter")
+    step("verify", "todo", "Verify", "check this machine and the other installations",
+         ["%s doctor" % PRODUCT, "%s agents --online" % PRODUCT, "%s send PEER/AGENT \"hello\"" % PRODUCT])
+    return steps
+
+
+def cmd_onboard(home, home_source, argv):
+    ap = argparse.ArgumentParser(allow_abbrev=False, prog=PRODUCT + " onboard",
+                                 description="Read-only, step-by-step setup plan for this machine and platform: "
+                                             "Tailscale install and sign-in, Yobiru config, durable receiver, "
+                                             "session binding and verification. Works before anything is set up.")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--no-probe", action="store_true", help="skip Tailscale and receiver probes")
+    a = ap.parse_args(argv)
+    f = gather(home, home_source, probe=not a.no_probe)
+    facts = environment_facts()
+    steps = onboarding_steps(home, f, facts)
+    nxt = next((s for s in steps if s["status"] in ("todo", "blocked")), None)
+    if a.json:
+        print(json.dumps({"platform": facts, "home": str(home), "steps": steps, "next": nxt and nxt["id"],
+                          "changed": False}, indent=2, ensure_ascii=False))
+        return 0
+    print("%s onboarding for %s (read-only; nothing was changed)" % (DISPLAY, facts["system"] or facts["platform"]))
+    print("Installing the plugin ran nothing: there is no install hook. These steps make it work.")
+    marks = {"done": "[x]", "todo": "[ ]", "blocked": "[!]", "unknown": "[?]"}
+    for i, s in enumerate(steps, 1):
+        print("%s %d. %s: %s" % (marks.get(s["status"], "[ ]"), i, s["title"], s["detail"]))
+        if s["status"] in ("todo", "blocked"):
+            for c in s["commands"]:
+                print("        $ %s" % c)
+            for d in s["docs"]:
+                print("        docs: %s" % d)
+            print("        who: %s" % s["who"])
+    print("next: %s" % (nxt["title"] if nxt else "all steps done; try `%s agents --online`" % PRODUCT))
+    return 0
+
+
 # ---------------------------------------------------------------- dispatch
 def run_core(home, cmd, rest):
     if not (home / "config.json").is_file():
@@ -1352,7 +3155,8 @@ def run_core(home, cmd, rest):
 
 PLUGIN_COMMANDS = {"paths": cmd_paths, "doctor": cmd_doctor, "status": cmd_status, "setup": cmd_setup,
                    "wake-config": cmd_wake_config, "install-runtime": cmd_install_runtime,
-                   "service-template": cmd_service_template, "codex-bridge": cmd_codex_bridge}
+                   "service-template": cmd_service_template, "codex-bridge": cmd_codex_bridge,
+                   "onboard": cmd_onboard, "agents": cmd_agents, "peers": cmd_agents, "session": cmd_session, "update": cmd_update}
 
 
 def main(argv=None):

@@ -23,7 +23,7 @@ Yobiru gives those agents a small, shared way to communicate:
 - **Chat across machines:** address an agent with `host/agent` and reply to its messages.
 - **Share useful context:** send text, JSON, reports, logs, and other files.
 - **Wake on your terms:** the receiver decides which senders may wake which agent, with quiet hours and rate limits.
-- **Keep your own tools:** one plugin package includes four skills and a Python CLI, with Codex and Cursor manifests and a Grok Bot installation route.
+- **Keep your own tools:** one plugin package includes six skills and a Python CLI, with Codex and Cursor manifests and a Grok Bot installation route.
 - **Keep storage on your machines:** Yobiru operates no messaging or attachment storage service. Files are fetched from the sender over Tailscale.
 
 This is a communication layer, not a new chat app or an autonomous task manager. Agents can coordinate toward a shared goal through messages and replies, but Yobiru does not provide a shared group-room UI, a scheduler, or proof that another agent completed its work.
@@ -82,7 +82,7 @@ codex plugin marketplace add chekusu/yobiru
 codex plugin add yobiru@yobiru
 ```
 
-Start a new conversation, then ask: **“Check whether Yobiru is set up on this machine.”** The four skills are `yobiru-setup`, `yobiru-send`, `yobiru-inbox`, and `yobiru-wake`.
+Start a new conversation, then say: **“Set up Yobiru on this machine.”** Installing the plugin runs nothing (there is no install hook); the `yobiru-setup` skill guides the rest. The six skills are `yobiru-setup`, `yobiru-sessions`, `yobiru-send`, `yobiru-inbox`, `yobiru-wake`, and `yobiru-upgrade`.
 
 This installs through the repository marketplace. It does not imply a listing in the public Codex plugin directory.
 
@@ -113,6 +113,24 @@ sh "$Y" doctor
 ```
 
 For an installed plugin, replace `Y` with its absolute `scripts/yobiru` path. Quote the path, because plugin caches may contain spaces. On Windows use `py -3 "path\to\yobiru\scripts\yobiru.py"`. `doctor` is read-only; on a new machine it will report that setup and a receiver are missing.
+
+## First-time setup, even without Tailscale
+
+Ask your agent to **“set up Yobiru”**, or run the read-only plan yourself:
+
+```sh
+sh "$Y" onboard
+```
+
+`onboard` works on a machine with nothing installed. It checks the platform, Tailscale (missing, daemon not running, logged out, permission denied), the configuration, the durable receiver, how each agent is woken and which session it uses, and prints concrete next steps with the person who has to act:
+
+| Platform | Tailscale step (official sources) |
+|---|---|
+| Linux | `curl -fsSL https://tailscale.com/install.sh \| sh` with root or sudo, then `sudo tailscale up` and open the printed login URL ([docs](https://tailscale.com/docs/install/linux)). Without root/sudo, without `/dev/net/tun` (many containers) or without a way to keep `tailscaled` running, `onboard` reports the blocked reason: userspace networking gives the receiver no Tailscale IP to listen on. |
+| macOS | Install the Tailscale app (Mac App Store or [download](https://tailscale.com/download)), approve the system extension / VPN prompt, sign in from the menu bar ([docs](https://tailscale.com/docs/install/mac)). If the CLI is not on PATH: `setup --tailscale-cmd /Applications/Tailscale.app/Contents/MacOS/Tailscale`. |
+| Windows | Run the installer with administrator rights and sign in from the notification-area icon ([docs](https://tailscale.com/docs/install/windows)). If the CLI is not on PATH: `setup --tailscale-cmd "C:\Program Files\Tailscale\tailscale.exe"`. The Codex bridge is macOS/Linux only. |
+
+Once the user has asked for setup, the agent may run these steps with the host's normal permissions without asking again; the user alone chooses the Tailscale account (they open the login URL; auth keys never go into chat), the allowed peers, the agent names and which existing session belongs to which agent. Yobiru never changes ACLs or shields-up. Details: [setup guide](docs/SETUP.md).
 
 ## Quick start: connect two agents
 
@@ -209,6 +227,23 @@ Existing deployments can keep chosen message kinds out of the dispatcher session
 
 Yobiru does not provide exactly-once task execution or automatic message redelivery. Wake attempts have bounded retries. Treat message IDs, local acknowledgment, and task completion as separate concepts.
 
+## Which agents are online, and which session handles them
+
+```sh
+sh "$Y" agents --online          # `peers` is the same command; drop --online to list offline machines too
+```
+
+For each machine: Tailscale online state, whether its receiver answered, whether this machine may send there, its Yobiru version (not the protocol version), and per agent the **resident session**: its native name with the source (`native codex session name, read <time>`, cached/stale), any user-confirmed title or local alias (labeled as such), and always the exact session id. Busy/idle is never claimed. Receivers answer the new `GET /info` only to machines on their allow list (403 is policy, not a network failure) and return no paths, adapter settings, tokens, message previews or session lists. Older receivers answer 404 and are shown as `legacy` (version and sessions unknown), not as offline.
+
+Name the session that handles an agent with its exact id; a name alone never selects or renames one:
+
+```sh
+sh "$Y" session bind --agent grok --runtime grok --session-id CHAT_ID --display-name "Research desk"
+sh "$Y" session bind --agent grok --runtime grok --session-id CHAT_ID --display-name "Research desk" --apply
+```
+
+With the Codex bridge installed, its fixed dispatcher UUID is reported automatically and its native name (`Thread.name`, read with a metadata-only `thread/read`) is refreshed within about five minutes of a rename; a binding that conflicts with the bridge is refused. Binding names a session; waking it is configured separately (bridge or `wake-config`).
+
 ## Privacy and trust
 
 - **Your machines hold the data.** Inbox/outbox records and staged attachments live in the data home: `--home DIR`, then `$TAILMSG_HOME`, then `~/.tailmsg`. Yobiru runs no central storage service. The chosen agent providers may still process content supplied to their agents.
@@ -229,7 +264,17 @@ codex plugin marketplace upgrade yobiru
 codex plugin add yobiru@yobiru
 ```
 
-Start a new conversation after an update. In Cursor, update from **Customize** or replace the local plugin copy; in Grok Bot, manage it through **Plugins**. Run `doctor` afterwards. To update a separately installed receiver runtime, preview `install-runtime --upgrade`, then add `--apply` and restart the receiver service yourself.
+Start a new conversation after an update. In Cursor, update from **Customize** or replace the local plugin copy; in Grok Bot, manage it through **Plugins**.
+
+A plugin update does **not** update the durable receiver: run `install-runtime --upgrade` (then `--apply`) and restart the receiver service; re-run `codex-bridge install` with the same session UUID if the bridge is installed (names, replies setting and custom dispatcher instructions are kept). Then coordinate your other machines:
+
+```sh
+sh "$Y" update check                     # official releases only; --channel preview includes prereleases
+sh "$Y" update status                    # installed plugin, durable runtime, running receiver, notices
+sh "$Y" update notify --channel preview  # dry run; add --apply after review
+```
+
+`notify` sends a versioned notice only after this machine's plugin, runtime and running receiver run a published official release, and only to known installations (discovered receivers, `--peer`, installations remembered with `agents --remember`, earlier pending notices). Each machine and agent has a durable state: `notified` (202 with a receipt for the message id; not proof of an upgrade), `verified` (later discovery shows that version running; software only), `pending` (offline, retried on the next run), `blocked` (403; asked again only when that receiver's `/info` shows access again, or with `--retry-blocked`), `rejected`, or `uncertain` (never resent automatically; `--reconcile-uncertain` resends the identical message id). Notices request `wake: now`; each receiver's wake policy still decides. A received notice is information for the agent and its owner, not a command. Opt-in reminders: `update reminder-template systemd-user|launchd|cron` prints a weekly `update check --record` job.
 
 To remove the Codex plugin and its marketplace:
 
@@ -258,8 +303,9 @@ python3 tools/build_plugin.py release
 |---|---|
 | Packaging and CLI | Automated checks cover extracted archives, paths with spaces, configuration preservation, and message/file/reply/wake flows with isolated fixtures. |
 | Tailscale transport | With 0.1.0 (not rerun for 0.2.x; the core is unchanged), the upstream `selftest.sh` passed 59 checks using temporary receivers on one Linux machine's real Tailscale address. This is not a two-machine test. |
-| Codex | With 0.1.0 (not repeated for 0.2.x): Linux CLI installation, enabled plugin state, four-skill discovery, and command execution from the plugin cache were verified. In 0.2.x the Linux and macOS bridges are covered only by offline and extracted-package tests with fake CLIs, fake `systemctl` and temporary sockets; no live app-server run is claimed. |
+| Codex | With 0.1.0 (not repeated for 0.2.x or 0.3.0): Linux CLI installation, enabled plugin state, four-skill discovery, and command execution from the plugin cache were verified. In 0.2.x the Linux and macOS bridges are covered only by offline and extracted-package tests with fake CLIs, fake `systemctl` and temporary sockets; no live app-server run is claimed. |
 | Cursor / Grok Bot / DOTS | Cursor/Grok routes follow host documentation; real host acceptance and cross-platform end-to-end collaboration remain unverified. No DOTS connector is shipped. |
+| 0.3.0 onboarding, discovery, updates | Offline tests: onboarding per platform (missing, logged out, daemon, permission, no TUN), authenticated `/info` and secret-free projection, native/confirmed/alias names with UUID, legacy 404 / 403 / unreachable / malformed / slow peers, release parsing and channels, notice dedup, retries and uncertain handling, bridge upgrades keeping names. No real Tailscale, GitHub or peer was contacted. |
 | Public marketplace listings | Not submitted or approved. Repository installation is separate. |
 
 `sh selftest.sh` requires Tailscale and temporary free ports `7866–7883`; it does not use the production port `7766` or the default data home. See [platform notes and sources](docs/PLATFORMS.md) for remaining acceptance steps.

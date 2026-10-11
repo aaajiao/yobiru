@@ -233,6 +233,24 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(custom, local.read_bytes())
         self.assertEqual("version one\n", (self.home / "codex-local/codex_bridge.py").read_text())
 
+    def test_upgrade_keeps_session_names_and_reports_the_dispatcher(self):
+        self.install()
+        sessions = self.home / "sessions.json"
+        sessions.write_text(json.dumps({"v": 1, "agents": {"codex": {"runtime": "codex", "display_name": "Inbox",
+                                                                     "session_id": self.args.thread_id}}}))
+        before = sessions.read_bytes()
+        for name in installer.FILES:
+            (self.source / name).write_text("version two\n")
+        self.install()
+        self.assertEqual(before, sessions.read_bytes())
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("tailmsg_mac_tests", str(Path(__file__).with_name("tailmsg.py")))
+        core = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(core)
+        bound, _ = core.session_bindings(self.home, ["codex"])
+        self.assertEqual((self.args.thread_id, "codex-bridge", "Inbox"),
+                         (bound["codex"]["session_id"], bound["codex"]["id_source"], bound["codex"]["display_name"]))
+
     def test_invalid_routing_config_is_refused_before_writes(self):
         self.install()
         self.customize_bridge_config(excluded_kind_adapter="not-a-list")

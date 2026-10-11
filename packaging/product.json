@@ -2,7 +2,7 @@
   "id": "yobiru",
   "displayName": "Yobiru",
   "nativeName": "ヨビル",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "publisher": "Chekusu",
   "repository": "https://github.com/chekusu/yobiru",
   "license": "MIT",
@@ -21,9 +21,9 @@
     "category": "Productivity",
     "capabilities": ["Interactive", "Read", "Write"],
     "defaultPrompt": [
-      "Check whether Yobiru is set up on this machine",
-      "Show my pending Yobiru messages",
-      "Send this file to the agent on my other machine"
+      "Set up Yobiru on this machine",
+      "Which of my agents are online, and which session handles their messages?",
+      "Check for Yobiru updates"
     ],
     "brandColor": "#4C6EF5",
     "composerIcon": "./assets/icon.png",

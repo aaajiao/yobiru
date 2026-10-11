@@ -495,6 +495,21 @@ class LinuxInstallerTests(unittest.TestCase):
         self.assertEqual(before, snapshot(self.user))
         self.assertEqual([], self.calls())
 
+    def test_upgrade_keeps_session_names_and_reports_the_dispatcher(self):
+        self.ok(self.install("--no-start"))
+        sessions = self.home / "sessions.json"
+        sessions.write_text(json.dumps({"v": 1, "future": True, "agents": {
+            "codex": {"runtime": "codex", "session_id": self.thread, "display_name": "Dispatcher"},
+            "helper": {"runtime": "grok", "session_id": "chat-7", "confirmed_title": "Weekly"}}}))
+        before = sessions.read_bytes()
+        self.ok(self.install("--no-start"))
+        self.assertEqual(before, sessions.read_bytes())                 # names and unknown keys survive
+        core = load_core()
+        bound, problems = core.session_bindings(self.home, ["codex", "helper"])
+        self.assertEqual((self.thread, "codex-bridge", "Dispatcher"),
+                         (bound["codex"]["session_id"], bound["codex"]["id_source"], bound["codex"]["display_name"]))
+        self.assertEqual([], problems)
+
     def test_default_codex_home_is_pinned_against_later_ambient_homes(self):
         default = self.user / ".codex"
         default.mkdir()
@@ -514,6 +529,14 @@ class LinuxInstallerTests(unittest.TestCase):
         plan = self.ok(result)
         self.assertEqual((str(self.codex_home), "$CODEX_HOME"), (plan["codex_home"], plan["codex_home_source"]))
         self.assertFalse(plan["allow_replies"])
+
+
+def load_core():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("tailmsg_for_bridge_tests", str(INSTALLER.with_name("tailmsg.py")))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def systemd_split(text):

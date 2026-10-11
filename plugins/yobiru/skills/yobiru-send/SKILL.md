@@ -27,6 +27,10 @@ yobiru-setup skill first. A non-default data home goes before the command: `sh Y
 
 ## Addresses
 
+To see which machines and agents are online and which session handles each, run `sh Y agents --online`
+(yobiru-sessions skill).
+
+
 - `HOST`: Tailscale hostname, MagicDNS name or Tailscale IP; add `:PORT` if it is not 7766.
 - `HOST/AGENT`: deliver to one named agent on that machine and wake only that one, for example
   `dev-server/codex`. Same as `send HOST --agent AGENT`.

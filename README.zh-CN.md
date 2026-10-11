@@ -23,7 +23,7 @@ Yobiru 为这些 agents 提供了一套轻量、共通的通信方式：
 - **跨机器聊天：** 用 `host/agent` 指定收件 agent，并回复它的消息。
 - **交换有用的上下文：** 发送文字、JSON、报告、日志和其他文件。
 - **按你的规则唤醒：** 收件方决定哪些发送方可以唤醒哪个 agent，并设置静默时间和频率限制。
-- **继续使用自己的工具：** 同一个插件包包含四个 skills 和 Python CLI，提供 Codex、Cursor 插件清单，以及 Grok Bot 的安装路径。
+- **继续使用自己的工具：** 同一个插件包包含六个 skills 和 Python CLI，提供 Codex、Cursor 插件清单，以及 Grok Bot 的安装路径。
 - **数据保存在自己的机器上：** Yobiru 不运营消息或附件存储服务；文件通过 Tailscale 从发送方获取。
 
 这是通信层，不是新的聊天应用或自主任务管理器。Agents 可以通过消息与回复围绕共同目标协作，但 Yobiru 不提供共享群聊界面、调度器，也不能证明对方已经完成工作。
@@ -82,7 +82,7 @@ codex plugin marketplace add chekusu/yobiru
 codex plugin add yobiru@yobiru
 ```
 
-新开一个会话，然后说：**“检查一下这台机器上的 Yobiru 是否已经配置好。”** 四个 skills 分别是 `yobiru-setup`、`yobiru-send`、`yobiru-inbox` 和 `yobiru-wake`。
+新开一个会话，然后说：**“在这台机器上配置 Yobiru。”** 安装插件本身不会运行任何东西（没有安装钩子），后续由 `yobiru-setup` skill 引导完成。六个 skills 分别是 `yobiru-setup`、`yobiru-sessions`、`yobiru-send`、`yobiru-inbox`、`yobiru-wake` 和 `yobiru-upgrade`。
 
 这里使用的是仓库插件市场，并不意味着已经进入 Codex 的公共插件目录。
 
@@ -113,6 +113,24 @@ sh "$Y" doctor
 ```
 
 如果已通过宿主安装插件，将 `Y` 换成安装位置下 `scripts/yobiru` 的绝对路径。路径应保留引号，因为插件缓存路径可能含有空格。Windows 使用 `py -3 "path\to\yobiru\scripts\yobiru.py"`。`doctor` 只读；新机器上会报告配置和接收进程尚未就绪。
+
+## 首次配置（即使还没有 Tailscale）
+
+对你的 agent 说 **“配置 Yobiru”**，或自己运行只读的引导计划：
+
+```sh
+sh "$Y" onboard
+```
+
+`onboard` 在什么都没装的机器上也能运行。它检查平台、Tailscale（未安装、守护进程未运行、未登录、无权限）、配置、常驻接收端、各 agent 的唤醒方式和对应会话，并给出具体的下一步以及应由谁执行：
+
+| 平台 | Tailscale 步骤（官方来源） |
+|---|---|
+| Linux | 有 root 或 sudo 时运行 `curl -fsSL https://tailscale.com/install.sh \| sh`，再运行 `sudo tailscale up` 并打开输出的登录链接（[文档](https://tailscale.com/docs/install/linux)）。没有 root/sudo、没有 `/dev/net/tun`（很多容器）或无法让 `tailscaled` 常驻时，`onboard` 会说明受阻原因：userspace 网络模式不会给接收端一个可监听的 Tailscale IP。 |
+| macOS | 安装 Tailscale 应用（Mac App Store 或[下载页](https://tailscale.com/download)），在系统设置中批准系统扩展／VPN 提示，再从菜单栏登录（[文档](https://tailscale.com/docs/install/mac)）。CLI 不在 PATH 中时：`setup --tailscale-cmd /Applications/Tailscale.app/Contents/MacOS/Tailscale`。 |
+| Windows | 以管理员权限运行安装程序，并从通知区域图标登录（[文档](https://tailscale.com/docs/install/windows)）。CLI 不在 PATH 中时：`setup --tailscale-cmd "C:\Program Files\Tailscale\tailscale.exe"`。Codex 桥接仅支持 macOS/Linux。 |
+
+用户要求配置后，agent 可以在宿主的正常权限内执行这些步骤，无需再次询问；只有用户自己决定 Tailscale 账户（自己打开登录链接，认证密钥绝不放进聊天）、允许的对端、agent 名称，以及哪个已有会话属于哪个 agent。Yobiru 从不修改 ACL 或 shields-up。详见[配置指南](docs/SETUP.zh-CN.md)。
 
 ## 快速开始：连接两个 agents
 
@@ -209,6 +227,23 @@ sh "$Y" codex-bridge status
 
 Yobiru 不提供任务的恰好一次执行保证，也不会自动重新投递消息。唤醒适配器具有有限次数的重试。消息 ID、本地确认和任务完成是不同的概念。
 
+## 哪些 agents 在线，由哪个会话处理
+
+```sh
+sh "$Y" agents --online          # `peers` 是同一个命令；去掉 --online 时也列出离线机器
+```
+
+每台机器显示：Tailscale 在线状态、接收端是否应答、本机能否向它发送、它的 Yobiru 版本（不是协议版本），以及每个 agent 的**常驻会话**：带来源的原生名称（`native codex session name, read <时间>`，cached/stale），用户确认过的标题或本地别名（分别标注），并始终给出准确的会话 ID。从不声称 agent 忙碌或空闲。接收端只对白名单中的机器回答新的 `GET /info`（403 表示策略拒绝，不是网络故障），且不返回路径、适配器设置、令牌、消息预览或会话列表。旧版接收端返回 404，显示为 `legacy`（版本和会话未知），不会被误报为离线。
+
+用准确的 ID 指定处理某个 agent 的会话；名称本身绝不会选择或重命名会话：
+
+```sh
+sh "$Y" session bind --agent grok --runtime grok --session-id CHAT_ID --display-name "研究台"
+sh "$Y" session bind --agent grok --runtime grok --session-id CHAT_ID --display-name "研究台" --apply
+```
+
+已安装 Codex 桥接时，它固定的入口会话 UUID 会被自动报告；其原生名称（`Thread.name`，通过只读元数据的 `thread/read` 读取）在改名后约五分钟内刷新；与桥接冲突的绑定会被拒绝。绑定只是指明会话，唤醒方式需另行配置（桥接或 `wake-config`）。
+
 ## 隐私与信任边界
 
 - **数据保存在你的机器上。** 收件箱、发件箱记录和暂存附件位于数据目录，优先级为 `--home DIR`、`$TAILMSG_HOME`、`~/.tailmsg`。Yobiru 没有集中存储服务；你选择的 agent 平台仍可能处理交给其 agents 的内容。
@@ -229,7 +264,17 @@ codex plugin marketplace upgrade yobiru
 codex plugin add yobiru@yobiru
 ```
 
-更新后新开一个会话。Cursor 通过 **Customize** 更新，或替换本地插件副本；Grok Bot 通过 **Plugins** 管理。之后运行 `doctor`。如需更新单独安装的接收运行时，先预览 `install-runtime --upgrade`，再添加 `--apply` 应用，并自行重启接收服务。
+更新后新开一个会话。Cursor 通过 **Customize** 更新，或替换本地插件副本；Grok Bot 通过 **Plugins** 管理。
+
+插件更新**不会**更新常驻接收端：运行 `install-runtime --upgrade`（再加 `--apply`）并重启接收服务；已安装桥接时用同一个会话 UUID 重新运行 `codex-bridge install`（名称、回复设置和自定义入口指令都会保留）。然后协调其他机器：
+
+```sh
+sh "$Y" update check                     # 只读官方 releases；--channel preview 包含预发布版本
+sh "$Y" update status                    # 已安装插件、常驻运行时、运行中的接收端和升级通知
+sh "$Y" update notify --channel preview  # 预演；确认后加 --apply
+```
+
+只有当本机插件、运行时和运行中的接收端都已是一个已发布的官方版本时，`notify` 才会发送带版本号的通知，并且只发给已知的安装（发现到的接收端、`--peer`、用 `agents --remember` 记住的安装、此前未完成的通知）。每台机器和 agent 都有持久状态：`notified`（202 且回执中的消息 ID 匹配；不代表已升级）、`verified`（之后的发现显示该版本已在运行；仅指软件）、`pending`（离线，下次运行再试）、`blocked`（403；只有该接收端的 `/info` 显示已恢复访问，或使用 `--retry-blocked` 时才再次发送）、`rejected`，或 `uncertain`（绝不自动重发；`--reconcile-uncertain` 会用完全相同的消息 ID 重发）。通知会请求 `wake: now`，最终仍由各接收端的唤醒策略决定。收到的通知是给 agent 及其主人的信息，而不是命令。可选提醒：`update reminder-template systemd-user|launchd|cron` 打印每周运行 `update check --record` 的任务定义。
 
 移除 Codex 插件及其市场：
 
@@ -258,8 +303,9 @@ python3 tools/build_plugin.py release
 |---|---|
 | 打包与 CLI | 自动检查覆盖解压后运行、含空格的路径、配置保留，以及使用隔离测试环境的消息／文件／回复／唤醒流程。 |
 | Tailscale 传输 | 在 0.1.0 上（0.2.x 未重跑，核心未改动），上游 `selftest.sh` 在一台 Linux 机器的真实 Tailscale 地址上使用临时接收进程，通过了 59 项检查；这不是双机测试。 |
-| Codex | 在 0.1.0 上（0.2.x 未重复）已验证 Linux CLI 安装、插件启用状态、四个 skills 的发现，以及从插件缓存执行命令。0.2.x 中 Linux 与 macOS 桥接仅由使用假 CLI、假 `systemctl` 和临时 socket 的离线及解包测试覆盖；未声称已在真实 app-server 上运行。 |
+| Codex | 在 0.1.0 上（0.2.x 与 0.3.0 未重复）已验证 Linux CLI 安装、插件启用状态、四个 skills 的发现，以及从插件缓存执行命令。0.2.x 中 Linux 与 macOS 桥接仅由使用假 CLI、假 `systemctl` 和临时 socket 的离线及解包测试覆盖；未声称已在真实 app-server 上运行。 |
 | Cursor / Grok Bot / DOTS | Cursor／Grok 安装路径依据宿主文档；实机验收与跨平台端到端协作仍未验证。未提供 DOTS 连接器。 |
+| 0.3.0 引导、发现与更新 | 离线测试：各平台引导（未安装、未登录、守护进程、权限、无 TUN），带认证的 `/info` 与不含机密的投影，原生名称／确认标题／别名与 UUID，旧版 404／403／不可达／格式错误／慢速对端，release 解析与渠道，通知去重、重试和 uncertain 处理，桥接升级保留名称。未连接真实 Tailscale、GitHub 或对端。 |
 | 公共市场上架 | 尚未提交或获批；仓库安装与公共上架是两回事。 |
 
 `sh selftest.sh` 需要 Tailscale 和可用的临时端口 `7866–7883`，不会使用生产端口 `7766` 或默认数据目录。其他待验收项目见 [平台说明与来源](docs/PLATFORMS.md)。

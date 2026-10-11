@@ -210,6 +210,27 @@ class LoopbackWorkflowTests(unittest.TestCase):
         self.assertEqual(["codex", "helper"], [a["agent"] for a in st["agents"]])
         self.assertTrue(st["receiver"]["ok"])
 
+    def test_5_agents_shows_versions_and_sessions_over_authenticated_info(self):
+        (self.home["bravo"] / "sessions.json").write_text(json.dumps({"v": 1, "agents": {
+            "helper": {"runtime": "grok", "session_id": "chat-helper-1", "display_name": "Helper desk"}}}))
+        r = self.tm("alpha", "agents", "--json", "--peer", "bravo:%d" % self.port["bravo"])
+        self.assertEqual(0, r.returncode, r.stdout + r.stderr)
+        rows = json.loads(r.stdout)["machines"]
+        self.assertEqual(["bravo.example.ts.net"], [x["node"] for x in rows])
+        bravo = rows[0]
+        self.assertEqual(("ok", "allowed", self.pkg.product["version"]),
+                         (bravo["receiver"], bravo["send_permission"], bravo["version"]))
+        agents = {a["agent"]: a for a in bravo["agents"]}
+        self.assertEqual(["codex", "helper"], sorted(agents))
+        self.assertIsNone(agents["codex"]["session"])
+        self.assertEqual(("chat-helper-1", "Helper desk", "configured", "unknown"),
+                         (agents["helper"]["session"]["id"], agents["helper"]["session"]["display_name"],
+                          agents["helper"]["session"]["id_source"], agents["helper"]["session"]["activity"]))
+        self.assertNotIn("adapter", r.stdout)                         # no adapter paths cross the network
+        text = self.tm("alpha", "peers", "--peer", "bravo:%d" % self.port["bravo"]).stdout
+        self.assertIn('alias "Helper desk"', text)
+        self.assertIn("chat-helper-1", text)
+
 
 if __name__ == "__main__":
     unittest.main()

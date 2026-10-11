@@ -2,7 +2,8 @@
 every call, so tests can prove nothing ever ran `tailscale up`, `set` or similar.
 
 State file (via `--state PATH` before the subcommand, or $FAKE_TS_STATE):
-  {"status": {...}, "whois": {...}, "ip4": "127.0.0.1", "shields_up": false, "calls": "/path/calls.log"}
+  {"status": {...}, "whois": {...}, "ip4": "127.0.0.1", "shields_up": false, "calls": "/path/calls.log",
+   "status_error": "message printed by a failing `status --json`"}
 """
 import json
 import os
@@ -24,7 +25,10 @@ if path:
 if state.get("calls"):
     with open(state["calls"], "a", encoding="utf-8") as f:
         f.write(json.dumps(args) + "\n")
-if args == ["status", "--json"]:
+if args == ["status", "--json"] and state.get("status_error"):
+    sys.stderr.write(state["status_error"] + "\n")
+    sys.exit(1)
+elif args == ["status", "--json"]:
     print(json.dumps(state.get("status", DEFAULT_STATUS)))
 elif args == ["ip", "-4"]:
     print(state.get("ip4", "127.0.0.1"))

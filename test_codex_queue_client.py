@@ -156,6 +156,8 @@ if args[:3] == ["app-server", "--listen", "stdio://"]:
     store = os.path.join(os.environ.get("CODEX_HOME") or "/nonexistent", "fake-thread.json")
     for line in sys.stdin:
         request = json.loads(line)
+        with open(os.path.join(here, "requests.jsonl"), "a") as log:
+            log.write(json.dumps(request) + "\n")
         if request.get("id") == 1:
             print(json.dumps({"id": 1, "result": {}}), flush=True)
         elif request.get("id") == 2:
@@ -321,6 +323,51 @@ class UnixSocketTransportTests(UnixSocketFixture):
         other.mkdir()
         with self.assertRaises(CodexAppError):
             self.client(codex_home=str(other)).call_tool("read_thread", {"threadId": self.thread})
+
+
+class SessionNameTests(UnixSocketFixture):
+    """Metadata-only native name read: thread/read with includeTurns false; Thread.name only."""
+
+    def requests(self):
+        log = self.bin / "requests.jsonl"
+        return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+
+    def store(self, **thread):
+        thread.setdefault("id", self.thread)
+        (self.codex_home / "fake-thread.json").write_text(json.dumps(thread))
+
+    def test_name_is_read_without_turns_and_preview_is_never_used(self):
+        self.store(name="Triage inbox", preview="PRIVATE first user message", status={"type": "notLoaded"},
+                   turns=[{"items": [{"type": "userMessage", "content": [{"type": "text", "text": "PRIVATE"}]}]}])
+        result = self.client().read_thread_name()
+        self.assertEqual({"thread_id": self.thread, "name": "Triage inbox"}, result)
+        reads = [r for r in self.requests() if r.get("method") == "thread/read"]
+        self.assertEqual([{"threadId": self.thread, "includeTurns": False}], [r["params"] for r in reads])
+        self.assertEqual([], [c for c in self.calls() if c["argv"][0] == "queue"])   # no queue, no turn
+
+    def test_missing_name_falls_back_to_none_not_preview(self):
+        self.store(preview="PRIVATE first user message")
+        self.assertEqual({"thread_id": self.thread, "name": None}, self.client().read_thread_name())
+        self.store(name="   ", preview="PRIVATE")
+        self.assertIsNone(self.client().read_thread_name()["name"])
+
+    def test_bridge_session_name_command(self):
+        self.store(name="Renamed later")
+        config = Path(self.root) / "bridge.json"
+        config.write_text(json.dumps({"bridge_home": str(self.root / "state"), "tailmsg_home": str(self.root),
+                                      "dispatcher_thread_id": self.thread, "codex_path": str(self.cli),
+                                      "codex_remote": self.remote, "codex_home": str(self.codex_home)}))
+        script = Path(__file__).resolve().with_name("codex_bridge.py")
+        run = lambda: subprocess.run([sys.executable, str(script), "--config", str(config), "session-name"],
+                                     capture_output=True, text=True, timeout=30)
+        r = run()
+        self.assertEqual(0, r.returncode, r.stderr)
+        self.assertEqual({"thread_id": self.thread, "name": "Renamed later"}, json.loads(r.stdout))
+        self.assertFalse((self.root / "state").exists())               # no queue database is created
+        (self.codex_home / "fake-thread.json").unlink()
+        r = run()
+        self.assertEqual(1, r.returncode)
+        self.assertEqual("codex_bridge: read_failed", r.stderr.strip())
 
 
 class UnixSocketBridgeTests(UnixSocketFixture):

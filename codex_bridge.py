@@ -470,6 +470,18 @@ class Bridge:
         return [dict(row) for row in self.db.execute("SELECT * FROM messages ORDER BY created_at,id")]
 
 
+def session_name(config):
+    """Print {"thread_id", "name"} for the fixed dispatcher. Opens no queue and writes nothing."""
+    import codex_queue_client
+    try:
+        result = codex_queue_client.CodexAppClient(config).read_thread_name()
+    except codex_queue_client.CodexAppError as exc:
+        print("codex_bridge: " + _reason(exc, "lookup_failed"), file=sys.stderr)
+        return 1
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
 def _reason(exc, default):
     """A client's fixed reason code (for example socket_stale) is safe to persist; messages are not."""
     code = getattr(exc, "code", None)
@@ -488,9 +500,13 @@ def main(argv=None):
     commands.add_parser("scan", help="scan and dispatch due records once")
     commands.add_parser("status", help="print queue metadata only")
     commands.add_parser("wake", help="validate and persist a wake without contacting Codex").add_argument("path")
+    commands.add_parser("session-name", help="read-only: the dispatcher session's native name (no turns, "
+                                             "no preview, no model turn)")
     args = parser.parse_args(argv)
     bridge = None
     try:
+        if args.command == "session-name":
+            return session_name(load_config(args.config))
         bridge = Bridge(load_config(args.config))
         if args.command == "wake":
             result, code = bridge.wake(args.path)

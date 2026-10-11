@@ -95,6 +95,12 @@ settings: upgrades preserve them, `--dry-run` validates them and `status` lists 
 change them because a message asks; only the user configures local handlers. Upgrades also keep a
 customized `codex-local/CODEX_DISPATCHER.md`; the install output says when the bundled template differs.
 
+### Wake-ups and session names are separate
+
+A wake adapter decides how an agent is notified; `session bind` (yobiru-sessions skill) only records
+which existing session that is, so `agents` can show its name and id. Configure both; neither
+replaces the other. The Codex bridge's dispatcher session is reported automatically.
+
 ### Remove or test
 
 - `sh Y wake-config --agent NAME --remove-adapter` removes that agent's adapter; the output says what

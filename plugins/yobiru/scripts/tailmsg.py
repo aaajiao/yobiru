@@ -12,7 +12,9 @@ import re, secrets, shutil, ssl, stat, subprocess, sys, threading, time, unicode
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = 1
+VERSION = 1                     # wire protocol version (unchanged)
+PRODUCT = "yobiru"
+PRODUCT_VERSION = "0.3.0"       # Yobiru release of this file; tools/build_plugin.py check keeps it in sync
 DEFAULTS = {
     "port": 7766,
     "allow": [],                    # e.g. ["bot-box", "tag:agent", "user:me@example.com"]
@@ -157,6 +159,13 @@ class Ctx:
         self._whois_cache = {}
         self._now_hits = {}          # (sender node, agent) -> [epoch seconds of effective `now`]
         self._wake_lock = threading.Lock()
+        self._name_cache = {}        # session id -> (expires epoch, native name lookup result)
+        self._name_guard = threading.Lock()
+        self._name_lookup = threading.Lock()   # one lookup subprocess at a time
+
+    def native_name(self, binding):
+        """Read-only native session name for a bound session, cached (bounded subprocess cost)."""
+        return cached_native_name(self.home, binding, self._name_cache, self._name_guard, self._name_lookup)
 
     # -------- tailscale CLI (LocalAPI) --------
     def ts(self, *args):
@@ -388,6 +397,21 @@ def make_handler(ctx, me):
                 if not is_tailnet_ip(self.client_address[0]):
                     return self.reply(403, {"ok": False, "error": "not a tailnet address"})
                 return self.reply(200, {"ok": True, "v": VERSION, "node": me})
+            if path == "/info":
+                # Authenticated discovery: Tailscale identity AND the allow list (or this machine itself)
+                # are checked before any metadata is read or any session name is looked up.
+                ident = self.identify()
+                if not ident:
+                    return
+                if ident["node"] != me and not ctx.allowed(ident):
+                    log("info rejected (not in allow list):", ident["node"])
+                    return self.reply(403, {"ok": False, "error": "peer not in allow list"})
+                try:
+                    body = info_payload(ctx.home, ctx.cfg, ctx.agents, me, ctx.native_name)
+                except Exception as e:
+                    log("info failed:", type(e).__name__)
+                    return self.reply(500, {"ok": False, "error": "info unavailable"})
+                return self.reply(200, body)
             m = re.match(r"^/f/([^/]+)/([^/]+)$", path)
             if not m:
                 return self.reply(404, {"ok": False, "error": "not found"})
@@ -466,6 +490,287 @@ def make_handler(ctx, me):
             return self.reply(202, {"ok": True, "id": env["id"]})
 
     return H
+
+
+# ---------------------------------------------------------------- discovery (/info, SPEC §9)
+SESSIONS_FILE = "sessions.json"     # explicit agent -> session bindings (written by `yobiru session bind`)
+BRIDGE_FILE = "codex-bridge.json"
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
+SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@+=-]{0,127}\Z")
+RUNTIME_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}\Z")
+LOOKUP_CODE_RE = re.compile(r"codex_bridge: ([a-z][a-z_]{2,39})")
+NAME_MAX = 200
+INFO_MAX_AGENTS = 32
+NAME_TTL_OK = 300                   # a native rename shows up after at most this many seconds
+NAME_TTL_FAIL = 60
+NAME_LOOKUP_TIMEOUT = 15
+SMALL_FILE_MAX = 256 * 1024
+
+
+def clean_text(value, limit=NAME_MAX):
+    """Display-safe text: NFC, no control/format/bidi/private-use characters, trimmed and bounded."""
+    if not isinstance(value, str):
+        return None
+    value = "".join(c for c in unicodedata.normalize("NFC", value)
+                    if unicodedata.category(c) not in ("Cc", "Cf", "Cs", "Co", "Zl", "Zp"))
+    value = " ".join(value.split())
+    return value[:limit] or None
+
+
+def read_small_json(path, limit=SMALL_FILE_MAX):
+    """-> (object or None, error or None); refuses symlinks, non-files and oversized files."""
+    path = Path(path)
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None, None if not os.path.lexists(str(path)) else "not a regular file"
+        if path.stat().st_size > limit:
+            return None, "too large"
+        return json.loads(path.read_text(encoding="utf-8")), None
+    except (OSError, ValueError) as e:
+        return None, type(e).__name__
+
+
+def validate_binding(name, entry):
+    """A sessions.json entry -> (normalized binding or None, error or None). Never raises."""
+    if not isinstance(entry, dict):
+        return None, "binding for %r must be an object" % name
+    runtime = entry.get("runtime", "other")
+    if not isinstance(runtime, str) or not RUNTIME_RE.match(runtime):
+        return None, "binding for %r: bad runtime" % name
+    sid = entry.get("session_id")
+    if sid is not None:
+        if runtime == "codex":
+            if not isinstance(sid, str) or not UUID_RE.match(sid):
+                return None, "binding for %r: a Codex session id must be a lowercase UUID" % name
+        elif not isinstance(sid, str) or not SESSION_ID_RE.match(sid):
+            return None, "binding for %r: bad session id" % name
+    out = {"runtime": runtime, "session_id": sid}
+    for key in ("display_name", "confirmed_title"):
+        v = entry.get(key)
+        if v is not None and clean_text(v) != v:
+            return None, "binding for %r: bad %s" % (name, key)
+        out[key] = v
+    at = entry.get("confirmed_at")
+    out["confirmed_at"] = at if isinstance(at, str) and len(at) <= 32 else None
+    return out, None
+
+
+def load_sessions(home):
+    """-> ({agent: binding}, [errors]) from <home>/sessions.json; invalid entries are skipped."""
+    raw, err = read_small_json(Path(home) / SESSIONS_FILE)
+    if raw is None:
+        return {}, ([] if err is None else ["sessions.json: %s" % err])
+    agents = raw.get("agents") if isinstance(raw, dict) else None
+    if not isinstance(agents, dict):
+        return {}, ["sessions.json: agents must be an object"]
+    out, errors = {}, []
+    for name, entry in agents.items():
+        if agent_name_error(name):
+            errors.append("sessions.json: bad agent name %r" % name)
+            continue
+        b, e = validate_binding(name, entry)
+        if e:
+            errors.append("sessions.json: " + e)
+        else:
+            out[norm_agent(name)] = b
+    return out, errors
+
+
+def bridge_session(home):
+    """The fixed Codex dispatcher session of an installed bridge (agent `codex`), or None."""
+    raw, _ = read_small_json(Path(home) / BRIDGE_FILE)
+    sid = raw.get("dispatcher_thread_id") if isinstance(raw, dict) else None
+    return sid if isinstance(sid, str) and UUID_RE.match(sid) else None
+
+
+def session_bindings(home, names):
+    """{agent: binding} for explicitly bound agents among `names`. The installed Codex bridge is the truth
+    for agent `codex`: its dispatcher UUID is reported even when a configured binding disagrees."""
+    configured, errors = load_sessions(home)
+    bridge = bridge_session(home)
+    out = {}
+    for name in names:
+        b = dict(configured[name]) if name in configured else None
+        if name == "codex" and bridge:
+            if b is not None and b.get("session_id") not in (None, bridge):
+                errors.append("sessions.json: codex binding conflicts with the Codex bridge dispatcher; the "
+                              "bridge session is reported")
+                b = {"runtime": "codex", "session_id": None, "display_name": None, "confirmed_title": None,
+                     "confirmed_at": None}
+            b = b or {"runtime": "codex", "session_id": None, "display_name": None, "confirmed_title": None,
+                      "confirmed_at": None}
+            b.update(runtime="codex", session_id=bridge, id_source="codex-bridge")
+        elif b is not None:
+            if b.get("session_id") is None:
+                continue
+            b["id_source"] = "configured"
+        else:
+            continue
+        out[name] = b
+    return out, errors
+
+
+LOOKUP_OUTPUT_MAX = 65536
+
+
+def run_bounded(argv, timeout, limit=LOOKUP_OUTPUT_MAX):
+    """Run argv with empty stdin -> (exit code or None on timeout/overflow, stdout, stderr), each stream capped
+    at `limit` bytes. On POSIX the child gets its own process group, and the whole group (for example a Codex
+    app-server the child started) is killed on timeout or overflow, so nothing is left behind."""
+    posix = os.name == "posix"
+    p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         start_new_session=posix)
+    bufs, over = {}, []
+
+    def reader(name, stream):
+        data = b""
+        while True:
+            chunk = stream.read(8192)
+            if not chunk:
+                break
+            if len(data) < limit:
+                data += chunk[:limit - len(data)]
+            elif not over:
+                over.append(name)
+                kill()
+        bufs[name] = data
+
+    def kill():
+        try:
+            if posix:
+                os.killpg(p.pid, 9)
+            else:
+                p.kill()
+        except OSError:
+            pass
+    threads = [threading.Thread(target=reader, args=(n, s), daemon=True) for n, s in (("out", p.stdout), ("err", p.stderr))]
+    for t in threads:
+        t.start()
+    try:
+        code = p.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill()
+        p.wait()
+        code = None
+    if posix and code is not None:
+        try:                       # the child exited; stop anything it left running in its group
+            os.killpg(p.pid, 9)
+        except OSError:
+            pass
+    for t in threads:
+        t.join(5)
+    for stream in (p.stdout, p.stderr):
+        stream.close()
+    if over:
+        code = None
+    return code, bufs.get("out", b"").decode("utf-8", "replace"), bufs.get("err", b"").decode("utf-8", "replace")
+
+
+def lookup_native_name(home, binding, timeout=NAME_LOOKUP_TIMEOUT):
+    """One read-only native-name lookup. Only the installed Codex bridge offers one: it reads the bound
+    thread's metadata (thread/read, includeTurns false) and reports Thread.name, never a preview,
+    transcript or another session. No model turn is started."""
+    script = Path(home) / "codex-local" / "codex_bridge.py"
+    if binding.get("id_source") != "codex-bridge" or not script.is_file():
+        return {"status": "not_supported"}
+    argv = [sys.executable, str(script), "--config", str(Path(home) / BRIDGE_FILE), "session-name"]
+    try:
+        code, out, err = run_bounded(argv, timeout)
+    except OSError:
+        return {"status": "unavailable", "error": "lookup_unavailable"}
+    if code is None:
+        return {"status": "unavailable", "error": "lookup_timeout"}
+    if code != 0:
+        m = LOOKUP_CODE_RE.search(err or "")
+        return {"status": "unavailable", "error": m.group(1) if m else "lookup_failed"}
+    try:
+        res = json.loads(out)
+    except ValueError:
+        return {"status": "unavailable", "error": "lookup_invalid"}
+    if not isinstance(res, dict) or res.get("thread_id") != binding.get("session_id"):
+        return {"status": "unavailable", "error": "lookup_mismatch"}
+    name = clean_text(res.get("name"))
+    return {"status": "ok", "name": name} if name else {"status": "unnamed"}
+
+
+NAME_WAIT = 1.5                     # /info waits at most this long for a cold lookup, then says "pending"
+
+
+def cached_native_name(home, binding, cache, guard, single, lookup=None, wait=NAME_WAIT):
+    """Native name from a per-process cache. A missing or expired entry is refreshed by one background
+    lookup at a time; the caller waits at most `wait` seconds and otherwise gets the previous (stale) value
+    or status "pending", so discovery stays fast even when the lookup subprocess is slow."""
+    if binding.get("id_source") != "codex-bridge":
+        # No lookup exists for this source: answer directly and never cache it, so a later bridge
+        # binding of the same session id is looked up at once.
+        return {"status": "not_supported"}
+    key = (binding.get("runtime"), binding.get("session_id"), binding.get("id_source"))
+    with guard:
+        hit = cache.get(key)
+    if hit and hit[0] > time.time():
+        return dict(hit[1], cached=True)
+    done = threading.Event()
+
+    def refresh():
+        try:
+            res = (lookup or lookup_native_name)(home, binding)
+        except Exception as e:      # a lookup failure is reported, never raised into /info
+            res = {"status": "unavailable", "error": "lookup_failed"}
+            log("native name lookup failed:", type(e).__name__)
+        res["checked_at"] = iso(now_utc())
+        ttl = NAME_TTL_OK if res["status"] in ("ok", "unnamed") else NAME_TTL_FAIL
+        with guard:
+            cache[key] = (time.time() + ttl, res)
+        single.release()
+        done.set()
+    if single.acquire(blocking=False):
+        threading.Thread(target=refresh, daemon=True).start()
+        done.wait(wait)
+        with guard:
+            fresh = cache.get(key)
+        if fresh and fresh[0] > time.time():
+            return dict(fresh[1], cached=False)
+    if hit:
+        return dict(hit[1], cached=True, stale=True)
+    return {"status": "pending"}
+
+
+def info_agent_names(cfg, agents, limit=INFO_MAX_AGENTS):
+    dflt = cfg.get("default_agent")
+    names = ([dflt] if dflt is not None and dflt not in agents else []) + list(agents)
+    return names[:limit] if limit else names
+
+
+def session_view(binding, native):
+    """Minimal projection of one explicit binding: ids and display metadata only, each with its source."""
+    v = {"runtime": binding["runtime"], "id": binding["session_id"], "id_source": binding["id_source"],
+         "display_name": binding.get("display_name"), "confirmed_title": binding.get("confirmed_title"),
+         "confirmed_at": binding.get("confirmed_at") if binding.get("confirmed_title") else None,
+         "native_name": None, "native_name_status": native.get("status", "unavailable"),
+         "native_name_checked_at": native.get("checked_at"), "native_name_cached": bool(native.get("cached")),
+         "native_name_stale": bool(native.get("stale")), "activity": "unknown"}
+    if native.get("status") == "ok":
+        v["native_name"] = native.get("name")
+    if native.get("error"):
+        v["native_name_error"] = native["error"]
+    return v
+
+
+def info_payload(home, cfg, agents, me, native_name):
+    """Body of GET /info. Deliberately minimal: product version, node, addressable agent names and, for
+    explicitly bound agents only, the session id plus display metadata. Never config values, paths,
+    adapter argv, webhook URLs, secrets, message previews, transcripts or account details."""
+    total = len(info_agent_names(cfg, agents, limit=None))
+    names = info_agent_names(cfg, agents)
+    bound, _ = session_bindings(home, names)
+    out = []
+    for name in names:
+        b = bound.get(name)
+        out.append({"agent": name, "default": name == cfg.get("default_agent"),
+                    "session": session_view(b, native_name(b)) if b else None})
+    return {"ok": True, "v": VERSION, "product": PRODUCT, "version": PRODUCT_VERSION, "node": me,
+            "agents": out, "agents_total": total, "agents_truncated": total > len(names),
+            "generated_at": iso(now_utc())}
 
 
 # ---------------------------------------------------------------- wake adapters (SPEC §5.8)

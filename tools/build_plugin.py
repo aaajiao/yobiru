@@ -335,6 +335,12 @@ def validate(p, root=ROOT):
             errs.append("skills/%s: description must be 1-1024 characters" % sd.name)
         if fm.get("disable-model-invocation") not in (None, False):
             errs.append("skills/%s: must stay model-invocable" % sd.name)
+    # the runtime reports its product version over /info; it must be this release
+    core_src = (root / "tailmsg.py").read_text(encoding="utf-8") if (root / "tailmsg.py").is_file() else \
+        (base / "scripts" / "tailmsg.py").read_text(encoding="utf-8")
+    vm = re.search(r'^PRODUCT_VERSION = "([^"]+)"', core_src, re.M)
+    if not vm or vm.group(1) != p["version"]:
+        errs.append("tailmsg.py: PRODUCT_VERSION must equal packaging/product.json version %s" % p["version"])
     # hygiene
     deny = [(re.compile(rx), why) for rx, why in DENY_PATTERNS]
     extra = os.environ.get("YOBIRU_PRIVATE_DENYLIST")

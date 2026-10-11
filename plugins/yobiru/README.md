@@ -3,7 +3,7 @@
 Agent-to-agent messages, file handoff and receiver-controlled wake-ups between machines on your own
 Tailscale network, using the tailmsg protocol v1. One package for Codex, Cursor and Grok Bot.
 
-Version 0.2.1. Source: <https://github.com/chekusu/yobiru>. Not submitted to or reviewed by any
+Version 0.3.0. Source: <https://github.com/chekusu/yobiru>. Not submitted to or reviewed by any
 marketplace.
 
 ## Contents
@@ -13,7 +13,9 @@ marketplace.
 | `plugin.json` | Agent Plugins 1.0.0 manifest (portable). |
 | `.codex-plugin/plugin.json` | Codex manifest (presentation and skills). |
 | `.cursor-plugin/plugin.json` | Cursor manifest. |
-| `skills/yobiru-setup` | Check, set up, update or troubleshoot this machine. |
+| `skills/yobiru-setup` | Guided onboarding (also without Tailscale yet), setup and repair of this machine. |
+| `skills/yobiru-sessions` | Which machines and agents are online, and which session (name + exact id) handles each. |
+| `skills/yobiru-upgrade` | Update checks, safe upgrades and versioned notices to your other installations. |
 | `skills/yobiru-send` | Send messages, structured data and files; reply. |
 | `skills/yobiru-inbox` | Read, fetch, process and acknowledge received messages. |
 | `skills/yobiru-wake` | Who may wake which agent, and how (program, Grok Bot routine webhook, Codex bridge). |
@@ -36,6 +38,7 @@ may contain spaces). On Windows use `py -3 <plugin>\scripts\yobiru.py`.
 
 ```sh
 Y="/path/to/yobiru/scripts/yobiru"
+sh "$Y" onboard                                          # read-only step-by-step plan for this platform
 sh "$Y" paths                                            # locations as JSON
 sh "$Y" doctor                                           # read-only checks
 sh "$Y" setup --allow laptop --agent codex --self-agent codex --default-agent codex   # plan
@@ -44,6 +47,8 @@ sh "$Y" install-runtime --apply                          # stable tailmsg.py in 
 sh "$Y" service-template systemd-user                    # print a service definition to install
 sh "$Y" send laptop/codex "hello" --file ./notes.md      # 202 = delivered (not done)
 sh "$Y" inbox --pending --agent codex
+sh "$Y" agents --online                                  # versions, agents, session names + ids
+sh "$Y" update check                                     # official releases only
 ```
 
 Data home: `--home DIR` (before the command), else `$TAILMSG_HOME`, else `~/.tailmsg`. Existing
@@ -54,11 +59,15 @@ tailmsg homes are used as they are; `setup` and `wake-config` only add what you 
 
 | Command | Writes? |
 |---|---|
-| `paths`, `doctor`, `status`, `version` | never |
+| `paths`, `doctor`, `status`, `version`, `onboard`, `session list`, `update status` | never |
+| `agents` / `peers` | never (`--remember` records answering installations in `upgrade-notices.json`) |
+| `update check` | never (`--record` saves the result for reminders) |
+| `session bind` / `unbind`, `update notify` | only with `--apply` |
+| `update reminder-template KIND` | never (prints an opt-in weekly check) |
 | `setup`, `wake-config`, `install-runtime` | only with `--apply` |
 | `service-template KIND` | never (prints a definition) |
 | `codex-bridge status` | never; `install` / `rollback` (macOS or Linux) support `--dry-run` (no writes) and `--no-start` (files only) |
-| `send`, `reply`, `inbox`, `show`, `fetch`, `ack`, `wake`, `peers`, `serve` | tailmsg commands, passed through unchanged |
+| `send`, `reply`, `inbox`, `show`, `fetch`, `ack`, `wake`, `serve` | tailmsg commands, passed through unchanged |
 
 ## Safety
 

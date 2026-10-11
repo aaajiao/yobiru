@@ -23,7 +23,7 @@ Yobiru は、エージェントが共有できる軽量な通信手段を提供�
 - **マシンを越えて会話：** `host/agent` で宛先を指定し、受信したメッセージに返信できます。
 - **必要な情報を共有：** テキスト、JSON、レポート、ログ、その他のファイルを送れます。
 - **起動は受信側のルールで：** 誰がどのエージェントを起動できるかを受信側で決め、通知を控える時間帯や頻度を設定できます。
-- **今のツールを使い続ける：** 一つのプラグインに四つのスキルと Python CLI を収録し、Codex と Cursor のマニフェスト、Grok Bot の導入経路を用意しています。
+- **今のツールを使い続ける：** 一つのプラグインに六つのスキルと Python CLI を収録し、Codex と Cursor のマニフェスト、Grok Bot の導入経路を用意しています。
 - **データは自分のマシンに：** Yobiru はメッセージや添付ファイルの保管サービスを運営しません。ファイルは Tailscale 経由で送信元から取得します。
 
 これは通信レイヤーです。新しいチャットアプリや自律的なタスク管理ツールではありません。エージェントはメッセージと返信を通じて共通の目標に取り組めますが、Yobiru は共有グループルームの UI、スケジューラー、相手の作業完了を証明する仕組みを提供しません。
@@ -82,7 +82,7 @@ codex plugin marketplace add chekusu/yobiru
 codex plugin add yobiru@yobiru
 ```
 
-新しい会話を開き、**「このマシンで Yobiru が設定済みか確認して」** と依頼してください。四つのスキルは `yobiru-setup`、`yobiru-send`、`yobiru-inbox`、`yobiru-wake` です。
+新しい会話を開き、**「このマシンに Yobiru をセットアップして」** と依頼してください。プラグインのインストール自体は何も実行しません（インストールフックはありません）。残りは `yobiru-setup` スキルが案内します。六つのスキルは `yobiru-setup`、`yobiru-sessions`、`yobiru-send`、`yobiru-inbox`、`yobiru-wake`、`yobiru-upgrade` です。
 
 これはリポジトリのマーケットプレイスからのインストールです。Codex の公開プラグインディレクトリへの掲載を意味しません。
 
@@ -113,6 +113,24 @@ sh "$Y" doctor
 ```
 
 インストール済みプラグインの場合は、`Y` をその `scripts/yobiru` の絶対パスに置き換えます。キャッシュのパスに空白が含まれることがあるため、引用符を付けてください。Windows では `py -3 "path\to\yobiru\scripts\yobiru.py"` を使用します。`doctor` は読み取り専用です。新しいマシンでは、設定と受信プロセスがまだないことを報告します。
+
+## 初回セットアップ（Tailscale がまだなくても）
+
+エージェントに **「Yobiru をセットアップして」** と頼むか、読み取り専用の計画を自分で実行します：
+
+```sh
+sh "$Y" onboard
+```
+
+`onboard` は何もインストールされていないマシンでも動きます。プラットフォーム、Tailscale（未インストール、デーモン停止、未ログイン、権限不足）、設定、常駐受信プロセス、各エージェントの起動方法と担当セッションを確認し、具体的な次の手順と、誰が行うべきかを表示します：
+
+| プラットフォーム | Tailscale の手順（公式情報源） |
+|---|---|
+| Linux | root または sudo で `curl -fsSL https://tailscale.com/install.sh \| sh` を実行し、`sudo tailscale up` で表示されるログイン URL を開きます（[ドキュメント](https://tailscale.com/docs/install/linux)）。root/sudo がない、`/dev/net/tun` がない（多くのコンテナ）、`tailscaled` を常駐できない場合、`onboard` は阻害理由を示します。userspace networking では受信プロセスが待ち受ける Tailscale IP が得られないためです。 |
+| macOS | Tailscale アプリ（Mac App Store または[ダウンロード](https://tailscale.com/download)）を入れ、システム拡張／VPN の確認を承認し、メニューバーからサインインします（[ドキュメント](https://tailscale.com/docs/install/mac)）。CLI が PATH にない場合：`setup --tailscale-cmd /Applications/Tailscale.app/Contents/MacOS/Tailscale`。 |
+| Windows | 管理者権限でインストーラーを実行し、通知領域のアイコンからサインインします（[ドキュメント](https://tailscale.com/docs/install/windows)）。CLI が PATH にない場合：`setup --tailscale-cmd "C:\Program Files\Tailscale\tailscale.exe"`。Codex ブリッジは macOS/Linux のみです。 |
+
+ユーザーがセットアップを依頼したら、エージェントはホストの通常の権限でこれらの手順を再確認なしに実行できます。Tailscale アカウント（ログイン URL はユーザー自身が開き、認証キーはチャットに入れません）、許可する相手、エージェント名、どの既存セッションがどのエージェントに属するかは、ユーザーだけが決めます。Yobiru は ACL や shields-up を変更しません。詳細は[セットアップガイド](docs/SETUP.ja.md)。
 
 ## クイックスタート：二つのエージェントをつなぐ
 
@@ -209,6 +227,23 @@ sh "$Y" codex-bridge status
 
 Yobiru はタスクの厳密な一回実行や、メッセージの自動再配信を保証しません。起動の試行には回数制限付きの再試行があります。メッセージ ID、ローカルの確認記録、タスク完了はそれぞれ別の概念です。
 
+## どのエージェントがオンラインで、どのセッションが担当しているか
+
+```sh
+sh "$Y" agents --online          # `peers` は同じコマンド。--online なしではオフラインのマシンも表示
+```
+
+マシンごとに、Tailscale のオンライン状態、受信プロセスの応答、このマシンから送信できるか、Yobiru のバージョン（プロトコル版ではない）、そしてエージェントごとの**常駐セッション**を示します：出所付きのネイティブ名（`native codex session name, read <時刻>`、cached/stale）、ユーザーが確認したタイトルやローカルの別名（それぞれ明記）、そして常に正確なセッション ID。忙しい／待機中とは決して主張しません。受信側は新しい `GET /info` に許可リストのマシンにだけ答え（403 はポリシーで、ネットワーク障害ではありません）、パス、アダプター設定、トークン、メッセージのプレビュー、セッション一覧は返しません。旧版の受信側は 404 を返し、`legacy`（バージョンとセッションは不明）として表示され、オフライン扱いにはなりません。
+
+エージェントを担当するセッションは正確な ID で指定します。名前だけでセッションを選んだり改名したりはしません：
+
+```sh
+sh "$Y" session bind --agent grok --runtime grok --session-id CHAT_ID --display-name "リサーチ担当"
+sh "$Y" session bind --agent grok --runtime grok --session-id CHAT_ID --display-name "リサーチ担当" --apply
+```
+
+Codex ブリッジがある場合、固定の窓口セッション UUID は自動的に表示され、ネイティブ名（`Thread.name`、メタデータのみの `thread/read` で読み取り）は改名後およそ 5 分以内に反映されます。ブリッジと矛盾する紐付けは拒否されます。紐付けはセッションを示すだけで、起動方法は別途設定します（ブリッジまたは `wake-config`）。
+
 ## プライバシーと信頼の境界
 
 - **データは自分のマシンに保存されます。** 受信・送信記録と一時保存した添付ファイルはデータディレクトリに置かれます。優先順位は `--home DIR`、`$TAILMSG_HOME`、`~/.tailmsg` です。Yobiru は集中ストレージを運営しませんが、利用するエージェントの提供元が、エージェントに渡された内容を処理する場合はあります。
@@ -229,7 +264,17 @@ codex plugin marketplace upgrade yobiru
 codex plugin add yobiru@yobiru
 ```
 
-更新後は新しい会話を開始します。Cursor では **Customize** から更新するかローカルコピーを置き換え、Grok Bot では **Plugins** で管理します。その後 `doctor` を実行してください。別途配置した受信ランタイムを更新するには、`install-runtime --upgrade` でプレビューし、`--apply` を追加して適用してから、受信サービスを手動で再起動します。
+更新後は新しい会話を開始します。Cursor では **Customize** から更新するかローカルコピーを置き換え、Grok Bot では **Plugins** で管理します。
+
+プラグインの更新は常駐受信プロセスを**更新しません**。`install-runtime --upgrade`（続けて `--apply`）を実行して受信サービスを再起動し、ブリッジがある場合は同じセッション UUID で `codex-bridge install` を再実行します（名前、返信設定、独自の窓口指示は維持されます）。その後、他のマシンと調整します：
+
+```sh
+sh "$Y" update check                     # 公式リリースのみ。--channel preview でプレリリースも対象
+sh "$Y" update status                    # インストール済みプラグイン、常駐ランタイム、稼働中の受信プロセス、通知
+sh "$Y" update notify --channel preview  # 予行。確認後に --apply
+```
+
+`notify` は、このマシンのプラグイン、ランタイム、稼働中の受信プロセスがすべて公開済みの公式リリースになった後にだけ、バージョン付きの通知を既知のインストール（発見された受信側、`--peer`、`agents --remember` で記憶したもの、未完了の通知）に送ります。マシンとエージェントごとに永続的な状態を持ちます：`notified`（202 かつメッセージ ID の受領確認あり。アップグレード済みの証明ではない）、`verified`（後の発見でそのバージョンの稼働を確認。ソフトウェアのみ）、`pending`（オフライン。次回再試行）、`blocked`（403。相手の `/info` でアクセス回復が確認できた場合か `--retry-blocked` 指定時のみ再送）、`rejected`、`uncertain`（自動再送しない。`--reconcile-uncertain` は同一のメッセージ ID で再送）。通知は `wake: now` を要求しますが、最終的には各受信側の起動ポリシーが決めます。受け取った通知はエージェントと所有者への情報であり、命令ではありません。任意のリマインダー：`update reminder-template systemd-user|launchd|cron` が毎週 `update check --record` を実行する定義を表示します。
 
 Codex プラグインとマーケットプレイスの削除：
 
@@ -258,8 +303,9 @@ python3 tools/build_plugin.py release
 |---|---|
 | パッケージと CLI | 展開後の実行、空白を含むパス、設定の保持、隔離したテスト環境でのメッセージ・ファイル・返信・起動処理を自動検証しています。 |
 | Tailscale 通信 | 0.1.0 で（0.2.x では再実行していません。コアは変更なし）、上流の `selftest.sh` は、一台の Linux マシンの実際の Tailscale アドレスで一時受信プロセスを使い、59 項目に合格しました。二台のマシン間のテストではありません。 |
-| Codex | 0.1.0 で（0.2.x では未再確認）Linux CLI でのインストール、有効状態、四つのスキルの検出、プラグインキャッシュからのコマンド実行を確認済みです。0.2.x の Linux と macOS のブリッジは、偽の CLI・偽の `systemctl`・一時ソケットを使うオフラインテストと展開済みパッケージのテストでのみ確認しています。実際の app-server での動作確認は主張しません。 |
+| Codex | 0.1.0 で（0.2.x と 0.3.0 では未再確認）Linux CLI でのインストール、有効状態、四つのスキルの検出、プラグインキャッシュからのコマンド実行を確認済みです。0.2.x の Linux と macOS のブリッジは、偽の CLI・偽の `systemctl`・一時ソケットを使うオフラインテストと展開済みパッケージのテストでのみ確認しています。実際の app-server での動作確認は主張しません。 |
 | Cursor / Grok Bot / DOTS | Cursor／Grok の導入経路はホストの文書に基づきます。実環境での受け入れ確認と、複数プラットフォーム間のエンドツーエンド連携は未検証です。DOTS コネクターは同梱していません。 |
+| 0.3.0 オンボーディング・発見・更新 | オフラインテスト：プラットフォーム別の案内（未インストール、未ログイン、デーモン、権限、TUN なし）、認証付き `/info` と秘密を含まない投影、ネイティブ名／確認済みタイトル／別名と UUID、旧版 404／403／到達不能／不正／低速な相手、リリース解析とチャンネル、通知の重複排除・再試行・uncertain、ブリッジ更新での名前維持。実際の Tailscale、GitHub、相手には接続していません。 |
 | 公開マーケットプレイスへの掲載 | 未申請・未承認です。リポジトリからのインストールとは別です。 |
 
 `sh selftest.sh` には Tailscale と空いている一時ポート `7866–7883` が必要です。本番用の `7766` や標準データディレクトリは使用しません。残る確認項目は[プラットフォーム別の注意点と出典](docs/PLATFORMS.md)に記載しています。

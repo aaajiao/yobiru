@@ -19,6 +19,18 @@ bundled command already cover every operation. A stdio MCP wrapper would need se
 configuration per host, because Cursor does not expand the standard `${PLUGIN_ROOT}` variable in
 `mcp.json`, and a remote MCP endpoint would need a server this project deliberately does not run.
 
+## Tailscale (onboarding)
+
+`yobiru onboard`, `doctor` and the setup docs cite only these official sources (checked 2026-10-11):
+<https://tailscale.com/docs/install/linux>, <https://tailscale.com/docs/install/mac>,
+<https://tailscale.com/docs/install/windows>, <https://tailscale.com/download> and the Linux install
+script <https://tailscale.com/install.sh>. Linux: the script installs the package with root/sudo and
+`tailscale up` prints a login URL the user opens. macOS: the app (Mac App Store or standalone) asks the
+user to approve its system extension / VPN configuration; its CLI lives inside the app bundle. Windows:
+the installer needs administrator rights; sign-in happens in the app. Yobiru's receiver binds the
+machine's own Tailscale address, so hosts that can only run Tailscale in userspace networking mode (no
+`/dev/net/tun`) are reported as blocked rather than worked around.
+
 ## OpenAI Codex
 
 - Plugin format, `.codex-plugin` overlay, `extensions["com.openai"]`, marketplace locations, cache
@@ -85,7 +97,7 @@ are missing.
 ## Remaining acceptance steps
 
 1. Codex: CLI install and skill discovery are done (see [VERIFICATION.md](VERIFICATION.md)). Still open: a new
-   thread asking "Check whether Yobiru is set up", confirming the agent runs `doctor` from the plugin
+   thread asking "Set up Yobiru on this machine", confirming the agent runs `onboard` from the plugin
    cache path, and a look at the Codex desktop app's plugin page.
 2. Cursor: load `plugins/yobiru` with `agent --plugin-dir` or `~/.cursor/plugins/local/yobiru`,
    confirm the skills in **Customize**, run the same prompt.

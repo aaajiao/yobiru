@@ -7,6 +7,9 @@ and executes the real session; this client never creates/resumes a model
 session, never selects `--last`, and never changes permissions.
 `read_thread` uses a short-lived official app-server for a read-only thread/read
 request, returning only Tailmsg markers from user messages for reconciliation.
+`read_thread_name()` is a separate metadata-only thread/read (includeTurns false)
+that returns the fixed session's optional native name (Thread.name), never its
+preview, turns or status.
 
 Configuration: dispatcher_thread_id (or caller_thread_id), codex_cli_path
 (optional on macOS), codex_remote (optional absolute unix:/// socket URL owned
@@ -38,6 +41,8 @@ import uuid
 DEFAULT_CLI_PATH = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
 APP_EXECUTABLE = "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+NAME_READ_TIMEOUT = 10.0     # seconds for the metadata-only name read
+MAX_NAME_CHARS = 200
 MARKER_RE = re.compile(r"\[TAILMSG:[A-Za-z0-9_-]{8,64}\]")
 QUEUE_RECEIPT_RE = re.compile(r"^Queued message ([A-Za-z0-9_-]{8,128}) for thread ([A-Za-z0-9_-]{8,128})\.$", re.MULTILINE)
 
@@ -232,6 +237,26 @@ class CodexAppClient:
             raise CodexAppError("Invalid thread read limit.", False, "invalid_request") from error
         if not 1 <= turn_limit <= 1000:
             raise CodexAppError("Thread read limit must be between 1 and 1000.", False, "invalid_request")
+        thread = self._thread_read(include_turns=True, timeout=self.timeout)
+        return {"ok": True, "threadId": self.thread_id, "hostId": "local", "tailmsgMarkers": _user_markers(thread, turn_limit)}
+
+    def read_thread_name(self) -> dict[str, Any]:
+        """Metadata-only read of the fixed session: its optional native name (Thread.name) and nothing else.
+
+        Uses thread/read with includeTurns false, separate from marker reconciliation. Thread.preview
+        (the first user message), turns and status are never returned: a short-lived reader's status
+        such as notLoaded says nothing about the runtime that owns the session."""
+        if not Path(self.cli_path).is_file() or not os.access(self.cli_path, os.X_OK):
+            raise CodexAppError("The installed official Codex CLI is unavailable.", False, "runtime_unavailable")
+        thread = self._thread_read(include_turns=False, timeout=min(self.timeout, NAME_READ_TIMEOUT))
+        name = thread.get("name")
+        if not isinstance(name, str) or not name.strip():
+            name = None
+        elif len(name) > MAX_NAME_CHARS:
+            name = name[:MAX_NAME_CHARS]
+        return {"thread_id": self.thread_id, "name": name}
+
+    def _thread_read(self, include_turns: bool, timeout: float) -> dict[str, Any]:
         try:
             process = subprocess.Popen(
                 [self.cli_path, "app-server", "--listen", "stdio://"], env=self._env(),
@@ -242,7 +267,7 @@ class CodexAppClient:
         selector = None
         buffer = bytearray()
         pending: list[dict[str, Any]] = []
-        deadline = time.monotonic() + self.timeout
+        deadline = time.monotonic() + timeout
 
         def send(value: dict[str, Any]) -> None:
             process.stdin.write((json.dumps(value) + "\n").encode("utf-8"))
@@ -283,14 +308,15 @@ class CodexAppClient:
             if "error" in initialized:
                 raise CodexAppError("Official Codex app-server initialization failed.", False, "read_failed")
             send({"method": "initialized"})
-            send({"id": 2, "method": "thread/read", "params": {"threadId": self.thread_id, "includeTurns": True}})
+            send({"id": 2, "method": "thread/read", "params": {"threadId": self.thread_id, "includeTurns": include_turns}})
             read_result = response(2)
             if "error" in read_result:
                 raise CodexAppError("Official Codex thread read was rejected.", False, "read_failed")
-            thread = read_result.get("result", {}).get("thread")
+            result = read_result.get("result")
+            thread = result.get("thread") if isinstance(result, dict) else None
             if not isinstance(thread, dict) or thread.get("id") != self.thread_id:
                 raise CodexAppError("Official Codex returned an unexpected thread.", False, "read_failed")
-            return {"ok": True, "threadId": self.thread_id, "hostId": "local", "tailmsgMarkers": _user_markers(thread, turn_limit)}
+            return thread
         except (OSError, ValueError, BrokenPipeError) as error:
             raise CodexAppError("Official Codex read-only app-server failed.", False, "read_failed") from error
         finally:
