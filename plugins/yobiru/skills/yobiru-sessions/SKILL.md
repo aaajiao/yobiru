@@ -34,10 +34,11 @@ When you answer the user, give the name with its source and always the exact id,
 the right conversation among many. Never present an alias or confirmed title as the native name.
 
 Receiver states: `ok` (answered /info), `legacy` (an older Yobiru without /info: version, agents and
-sessions unknown, not offline), `blocked` (403: this machine is not on its allow list; policy, not a
+sessions unknown, not offline), `blocked` (403: its access policy denies this machine; policy, not a
 network failure), `unreachable` (no answer in time: not running, another port, ACL or shields-up;
 not proof that Yobiru is missing), `offline` (Tailscale says so). Peers only reveal this to machines
-on their allow list.
+permitted by their access policy. New installs default to `tailnet`; legacy allowlists remain until
+an authorized migration, and deny rules take precedence.
 
 ## Bind an agent to its existing session
 

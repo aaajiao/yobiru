@@ -56,7 +56,7 @@ You use the agent interface you already like
 Files: recipient fetches from the sender, then checks size + SHA-256.
 ```
 
-接收进程监听本机的 Tailscale 地址，默认端口为 `tcp:7766`。它通过 `tailscale whois` 验证连接机器的身份，检查本地允许列表，然后保存接受的消息。附件暂存在发送方，通过有时效的链接提供给指定收件机器。链接默认有效期为 24 小时。
+接收进程监听本机的 Tailscale 地址，默认端口为 `tcp:7766`。它通过 `tailscale whois` 验证连接机器的身份，检查本地访问策略，然后保存接受的消息。附件暂存在发送方，通过有时效的链接提供给指定收件机器。链接默认有效期为 24 小时。
 
 Yobiru 使用现有的 **tailmsg protocol v1**，不附带 MCP 服务器，也不需要 Yobiru 账户。Tailscale 提供网络和机器身份，可能直接传输加密流量，也可能通过其中继传输。参见 [Tailscale 连接类型](https://tailscale.com/docs/reference/connection-types)。
 
@@ -130,29 +130,41 @@ sh "$Y" onboard
 | macOS | 安装 Tailscale 应用（Mac App Store 或[下载页](https://tailscale.com/download)），在系统设置中批准系统扩展／VPN 提示，再从菜单栏登录（[文档](https://tailscale.com/docs/install/mac)）。CLI 不在 PATH 中时：`setup --tailscale-cmd /Applications/Tailscale.app/Contents/MacOS/Tailscale`。 |
 | Windows | 以管理员权限运行安装程序，并从通知区域图标登录（[文档](https://tailscale.com/docs/install/windows)）。CLI 不在 PATH 中时：`setup --tailscale-cmd "C:\Program Files\Tailscale\tailscale.exe"`。Codex 桥接仅支持 macOS/Linux。 |
 
-用户要求配置后，agent 可以在宿主的正常权限内执行这些步骤，无需再次询问；只有用户自己决定 Tailscale 账户（自己打开登录链接，认证密钥绝不放进聊天）、允许的对端、agent 名称，以及哪个已有会话属于哪个 agent。Yobiru 从不修改 ACL 或 shields-up。详见[配置指南](docs/SETUP.zh-CN.md)。
+用户要求配置后，agent 可以在宿主的正常权限内执行这些步骤，无需再次询问；只有用户自己决定 Tailscale 账户（自己打开登录链接，认证密钥绝不放进聊天）、访问策略、agent 名称，以及哪个已有会话属于哪个 agent。Yobiru 从不修改 ACL 或 shields-up。详见[配置指南](docs/SETUP.zh-CN.md)。
 
 ## 快速开始：连接两个 agents
 
 示例使用虚构的 Tailscale 主机名 `agent-laptop` 和 `research-node`，请替换为**你自己选定的对端**。在每台机器上按前文设置 `Y`。安装插件本身不会配置对端、启动服务或发送消息。
 
-### 1. 决定谁可以发消息
+### 1. 为 agents 命名
 
-在 `agent-laptop` 上，将 `codex` agent 配置为允许 `research-node` 发来消息：
-
-```sh
-sh "$Y" setup --allow research-node --agent codex --self-agent codex --default-agent codex
-sh "$Y" setup --allow research-node --agent codex --self-agent codex --default-agent codex --apply
-```
-
-在 `research-node` 上，将 `grok` agent 配置为允许 `agent-laptop` 发来消息：
+在 `agent-laptop` 上配置 `codex` agent：
 
 ```sh
-sh "$Y" setup --allow agent-laptop --agent grok --self-agent grok --default-agent grok
-sh "$Y" setup --allow agent-laptop --agent grok --self-agent grok --default-agent grok --apply
+sh "$Y" setup --agent codex --self-agent codex --default-agent codex
+sh "$Y" setup --agent codex --self-agent codex --default-agent codex --apply
 ```
 
-第一条命令预览改动，第二条应用改动。检查计划中的对端和 agent 名称是否符合你的意图。Setup 会保留已有条目，并在修改配置时备份。替换现有身份或唤醒适配器需要显式的替换选项。
+在 `research-node` 上配置 `grok` agent：
+
+```sh
+sh "$Y" setup --agent grok --self-agent grok --default-agent grok
+sh "$Y" setup --agent grok --self-agent grok --default-agent grok --apply
+```
+
+第一条命令预览改动，第二条应用改动。检查计划中的访问策略和 agent 名称是否符合你的意图。Setup 会保留已有条目，并在修改配置时备份。替换现有身份或唤醒适配器需要显式的替换选项。
+
+新安装默认采用 `tailnet` 模式：通过 Tailscale 身份认证、且网络策略允许连入的对端可以发消息，除非命中本地 `deny` 拒绝规则。不再需要逐台填写白名单。新安装若需限制对端，可加 `--allow PEER` 选择 `allowlist` 模式；`--send-only` 使用空白名单。已有安装保留原策略，包括旧版白名单。
+
+已有安装要切换到新默认策略，需在本机查看并应用：
+
+```sh
+sh "$Y" policy show
+sh "$Y" policy set --mode tailnet
+sh "$Y" policy set --mode tailnet --apply
+```
+
+修改配置会先备份。两种模式下 `deny` 都优先；规则支持主机名、FQDN、`tag:NAME` 和 `user:LOGIN`。指定 `--allow` 或 `--deny` 会替换对应的整个列表，未指定的列表保持原样。拒绝规则示例和离线设备处理见 [0.4 迁移指南](docs/UPGRADING-0.4.md)。允许通信不等于允许唤醒、执行任务或自动回复。
 
 ### 2. 在两台机器上持续运行接收进程
 
@@ -233,7 +245,7 @@ Yobiru 不提供任务的恰好一次执行保证，也不会自动重新投递�
 sh "$Y" agents --online          # `peers` 是同一个命令；去掉 --online 时也列出离线机器
 ```
 
-每台机器显示：Tailscale 在线状态、接收端是否应答、本机能否向它发送、它的 Yobiru 版本（不是协议版本），以及每个 agent 的**常驻会话**：带来源的原生名称（`native codex session name, read <时间>`，cached/stale），用户确认过的标题或本地别名（分别标注），并始终给出准确的会话 ID。从不声称 agent 忙碌或空闲。接收端只对白名单中的机器回答新的 `GET /info`（403 表示策略拒绝，不是网络故障），且不返回路径、适配器设置、令牌、消息预览或会话列表。旧版接收端返回 404，显示为 `legacy`（版本和会话未知），不会被误报为离线。
+每台机器显示：Tailscale 在线状态、接收端是否应答、本机能否向它发送、它的 Yobiru 版本（不是协议版本），以及每个 agent 的**常驻会话**：带来源的原生名称（`native codex session name, read <时间>`，cached/stale），用户确认过的标题或本地别名（分别标注），并始终给出准确的会话 ID。从不声称 agent 忙碌或空闲。接收端只对通过身份认证且访问策略允许的机器回答 `GET /info`（403 表示策略拒绝，不是网络故障），且不返回路径、适配器设置、令牌、消息预览或会话列表。旧版接收端返回 404，显示为 `legacy`（版本和会话未知），不会被误报为离线。
 
 用准确的 ID 指定处理某个 agent 的会话；名称本身绝不会选择或重命名会话：
 
@@ -247,7 +259,7 @@ sh "$Y" session bind --agent grok --runtime grok --session-id CHAT_ID --display-
 ## 隐私与信任边界
 
 - **数据保存在你的机器上。** 收件箱、发件箱记录和暂存附件位于数据目录，优先级为 `--home DIR`、`$TAILMSG_HOME`、`~/.tailmsg`。Yobiru 没有集中存储服务；你选择的 agent 平台仍可能处理交给其 agents 的内容。
-- **Tailscale 是网络边界。** 接收端检查 Tailscale 身份和本地允许列表。传输加密由 Tailscale 提供，Yobiru 不额外提供静态存储加密。需要保护主机及其文件系统。
+- **Tailscale 是网络边界。** 接收端检查 Tailscale 身份和本地访问策略（新安装默认 `tailnet`，可选 `allowlist`，拒绝规则优先）。Tailscale ACL／grants 仍然生效。传输加密由 Tailscale 提供，Yobiru 不额外提供静态存储加密。需要保护主机及其文件系统。
 - **Agent 名称用于路由，不代表隔离。** `from_agent` 由发送方填写。共享机器或数据目录的多个 agents 不是独立的安全主体；需要隔离时，应使用不同机器或适当的宿主隔离机制。
 - **消息是请求，不是授权。** 收到的文字和文件不能自行授权执行命令、购买、修改配置或披露无关数据。Agents 应在用户已有指令和权限范围内行动。
 - **附件需要谨慎处理。** 大小和 SHA-256 校验不代表内容可以安全执行。链接到期也不会撤回已经下载的副本。
@@ -275,6 +287,16 @@ sh "$Y" update notify --channel preview  # 预演；确认后加 --apply
 ```
 
 只有当本机插件、运行时和运行中的接收端都已是一个已发布的官方版本时，`notify` 才会发送带版本号的通知，并且只发给已知的安装（发现到的接收端、`--peer`、用 `agents --remember` 记住的安装、此前未完成的通知）。每台机器和 agent 都有持久状态：`notified`（202 且回执中的消息 ID 匹配；不代表已升级）、`verified`（之后的发现显示该版本已在运行；仅指软件）、`pending`（离线，下次运行再试）、`blocked`（403；只有该接收端的 `/info` 显示已恢复访问，或使用 `--retry-blocked` 时才再次发送）、`rejected`，或 `uncertain`（绝不自动重发；`--reconcile-uncertain` 会用完全相同的消息 ID 重发）。通知会请求 `wake: now`，最终仍由各接收端的唤醒策略决定。收到的通知是给 agent 及其主人的信息，而不是命令。可选提醒：`update reminder-template systemd-user|launchd|cron` 打印每周运行 `update check --record` 的任务定义。
+
+对于离线安装，先用 `update notify --peer HOST/AGENT --apply` 授权发送通知；接收端恢复可达前，通知保持 pending。`update maintain --apply` 记录更新检查，且仅重试或核验**此前已排队的升级通知**。成功获取的官方 release 元数据缓存六小时。它不会添加新收件方、安装软件或修改远端策略。要每 15 分钟及开机后运行，生成并安装可选的定时任务：
+
+```sh
+sh "$Y" update maintain                         # 预览；不写入、不发送
+sh "$Y" update reminder-template systemd-user --retry-notices
+# 按平台将 systemd-user 换成 launchd 或 cron
+```
+
+模板只打印安装说明，不会自行安装。插件更新后路径可能变化，需要重新生成定时任务。`uncertain` 通知仍需显式核对。关机或接收端停止的设备必须恢复后才能接收或升级；被旧策略拦截的安装需要主人在那台机器上迁移。这项恢复仅针对升级通知，不保证普通消息离线重投。见 [0.4 迁移与验收](docs/UPGRADING-0.4.md)。
 
 移除 Codex 插件及其市场：
 

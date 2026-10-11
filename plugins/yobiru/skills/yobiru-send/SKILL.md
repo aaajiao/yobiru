@@ -62,7 +62,7 @@ To see which machines and agents are online and which session handles each, run 
 |---|---|
 | 202 | Delivered: the receiver checked this machine's Tailscale identity and stored the message. It has not necessarily been read or acted on. |
 | 200 | Already delivered earlier (same id); nothing new happened. |
-| 403 | This machine is not on the receiver's allow list, or the identity did not match. |
+| 403 | The receiver's access policy denied this machine, or the identity did not match. Check deny rules and any active allowlist; do not widen access without the owner's authorization. |
 | 400 | A field was rejected (for example a named agent or wake on an older receiver) or the address was wrong. |
 | 413 | Too large; send the content as a file. |
 | connection error | No receiver reachable: not running, wrong port, ACL or shields-up blocking. |

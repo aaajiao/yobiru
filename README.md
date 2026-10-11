@@ -56,7 +56,7 @@ You use the agent interface you already like
 Files: recipient fetches from the sender, then checks size + SHA-256.
 ```
 
-A receiver listens on its own Tailscale address, normally on `tcp:7766`. It verifies the connecting machine through `tailscale whois`, checks its local allow list, and stores accepted messages. Attachments are staged on the sender behind an expiring link, restricted to the recipient machine. The default link lifetime is 24 hours.
+A receiver listens on its own Tailscale address, normally on `tcp:7766`. It verifies the connecting machine through `tailscale whois`, checks its local access policy, and stores accepted messages. Attachments are staged on the sender behind an expiring link, restricted to the recipient machine. The default link lifetime is 24 hours.
 
 Yobiru uses the existing **tailmsg protocol v1**. It ships no MCP server and needs no Yobiru account. Tailscale supplies the network and machine identity; it can carry encrypted traffic directly or through its relays. See [Tailscale connection types](https://tailscale.com/docs/reference/connection-types).
 
@@ -130,29 +130,41 @@ sh "$Y" onboard
 | macOS | Install the Tailscale app (Mac App Store or [download](https://tailscale.com/download)), approve the system extension / VPN prompt, sign in from the menu bar ([docs](https://tailscale.com/docs/install/mac)). If the CLI is not on PATH: `setup --tailscale-cmd /Applications/Tailscale.app/Contents/MacOS/Tailscale`. |
 | Windows | Run the installer with administrator rights and sign in from the notification-area icon ([docs](https://tailscale.com/docs/install/windows)). If the CLI is not on PATH: `setup --tailscale-cmd "C:\Program Files\Tailscale\tailscale.exe"`. The Codex bridge is macOS/Linux only. |
 
-Once the user has asked for setup, the agent may run these steps with the host's normal permissions without asking again; the user alone chooses the Tailscale account (they open the login URL; auth keys never go into chat), the allowed peers, the agent names and which existing session belongs to which agent. Yobiru never changes ACLs or shields-up. Details: [setup guide](docs/SETUP.md).
+Once the user has asked for setup, the agent may run these steps with the host's normal permissions without asking again; the user alone chooses the Tailscale account (they open the login URL; auth keys never go into chat), the access policy, the agent names and which existing session belongs to which agent. Yobiru never changes ACLs or shields-up. Details: [setup guide](docs/SETUP.md).
 
 ## Quick start: connect two agents
 
 The examples use fictional Tailscale hostnames `agent-laptop` and `research-node`. Replace them with **your own chosen peers**. Resolve `Y` on each machine as shown above. Installing the plugin does not configure peers, start services, or send messages.
 
-### 1. Choose who may send
+### 1. Name your agents
 
-On `agent-laptop`, configure its `codex` agent to accept `research-node`:
-
-```sh
-sh "$Y" setup --allow research-node --agent codex --self-agent codex --default-agent codex
-sh "$Y" setup --allow research-node --agent codex --self-agent codex --default-agent codex --apply
-```
-
-On `research-node`, configure its `grok` agent to accept `agent-laptop`:
+On `agent-laptop`, configure its `codex` agent:
 
 ```sh
-sh "$Y" setup --allow agent-laptop --agent grok --self-agent grok --default-agent grok
-sh "$Y" setup --allow agent-laptop --agent grok --self-agent grok --default-agent grok --apply
+sh "$Y" setup --agent codex --self-agent codex --default-agent codex
+sh "$Y" setup --agent codex --self-agent codex --default-agent codex --apply
 ```
 
-The first command previews changes; the second applies them. Review that the plan matches your intended peers and agent names. Setup preserves existing entries and backs up a changed configuration. Replacing an existing identity or adapter requires an explicit replacement option.
+On `research-node`, configure its `grok` agent:
+
+```sh
+sh "$Y" setup --agent grok --self-agent grok --default-agent grok
+sh "$Y" setup --agent grok --self-agent grok --default-agent grok --apply
+```
+
+The first command previews changes; the second applies them. Review that the access policy and agent names match your intent. Setup preserves existing entries and backs up a changed configuration. Replacing an existing identity or adapter requires an explicit replacement option.
+
+New installations use `tailnet` mode: authenticated Tailscale peers that your network policy lets through can send, unless a local `deny` rule matches. No per-machine allow list is required. For a restricted new installation, add `--allow PEER`; this chooses `allowlist` mode. `--send-only` starts with an empty allow list. Existing installations retain their policy, including legacy allow lists.
+
+To migrate an existing installation to the new default, inspect and apply locally:
+
+```sh
+sh "$Y" policy show
+sh "$Y" policy set --mode tailnet
+sh "$Y" policy set --mode tailnet --apply
+```
+
+A changed configuration is backed up. In either mode, `deny` wins; rules may be a hostname, FQDN, `tag:NAME` or `user:LOGIN`. Setting `--allow` or `--deny` replaces that entire list; omitted lists remain unchanged. See [0.4 migration](docs/UPGRADING-0.4.md) for deny examples and offline devices. Message access does not grant wake-up, task execution or automatic replies.
 
 ### 2. Keep a receiver running on both machines
 
@@ -233,7 +245,7 @@ Yobiru does not provide exactly-once task execution or automatic message redeliv
 sh "$Y" agents --online          # `peers` is the same command; drop --online to list offline machines too
 ```
 
-For each machine: Tailscale online state, whether its receiver answered, whether this machine may send there, its Yobiru version (not the protocol version), and per agent the **resident session**: its native name with the source (`native codex session name, read <time>`, cached/stale), any user-confirmed title or local alias (labeled as such), and always the exact session id. Busy/idle is never claimed. Receivers answer the new `GET /info` only to machines on their allow list (403 is policy, not a network failure) and return no paths, adapter settings, tokens, message previews or session lists. Older receivers answer 404 and are shown as `legacy` (version and sessions unknown), not as offline.
+For each machine: Tailscale online state, whether its receiver answered, whether this machine may send there, its Yobiru version (not the protocol version), and per agent the **resident session**: its native name with the source (`native codex session name, read <time>`, cached/stale), any user-confirmed title or local alias (labeled as such), and always the exact session id. Busy/idle is never claimed. Receivers answer `GET /info` only to authenticated machines permitted by their access policy (403 is policy, not a network failure) and return no paths, adapter settings, tokens, message previews or session lists. Older receivers answer 404 and are shown as `legacy` (version and sessions unknown), not as offline.
 
 Name the session that handles an agent with its exact id; a name alone never selects or renames one:
 
@@ -247,7 +259,7 @@ With the Codex bridge installed, its fixed dispatcher UUID is reported automatic
 ## Privacy and trust
 
 - **Your machines hold the data.** Inbox/outbox records and staged attachments live in the data home: `--home DIR`, then `$TAILMSG_HOME`, then `~/.tailmsg`. Yobiru runs no central storage service. The chosen agent providers may still process content supplied to their agents.
-- **Tailscale is the network boundary.** The receiver checks Tailscale identity and its own allow list. Encryption in transit comes from Tailscale; Yobiru does not add encryption at rest. Protect the host and its filesystem.
+- **Tailscale is the network boundary.** The receiver checks Tailscale identity and its own access policy (`tailnet` by default for new installations, optional `allowlist`, with deny rules taking precedence). Tailscale ACLs/grants still apply. Encryption in transit comes from Tailscale; Yobiru does not add encryption at rest. Protect the host and its filesystem.
 - **Agent names are routing, not isolation.** `from_agent` is sender-selected. Multiple agents sharing a machine or data home are not separate security principals; use separate machines or appropriate host isolation when required.
 - **Messages are requests, not permissions.** Received text and files do not authorize commands, purchases, configuration changes, or disclosure of unrelated data. Agents act within the user's existing instructions and permissions.
 - **Attachments need deliberate handling.** They are verified by size and SHA-256, which does not make their contents safe to execute. Expiring links do not revoke copies already downloaded.
@@ -275,6 +287,16 @@ sh "$Y" update notify --channel preview  # dry run; add --apply after review
 ```
 
 `notify` sends a versioned notice only after this machine's plugin, runtime and running receiver run a published official release, and only to known installations (discovered receivers, `--peer`, installations remembered with `agents --remember`, earlier pending notices). Each machine and agent has a durable state: `notified` (202 with a receipt for the message id; not proof of an upgrade), `verified` (later discovery shows that version running; software only), `pending` (offline, retried on the next run), `blocked` (403; asked again only when that receiver's `/info` shows access again, or with `--retry-blocked`), `rejected`, or `uncertain` (never resent automatically; `--reconcile-uncertain` resends the identical message id). Notices request `wake: now`; each receiver's wake policy still decides. A received notice is information for the agent and its owner, not a command. Opt-in reminders: `update reminder-template systemd-user|launchd|cron` prints a weekly `update check --record` job.
+
+For offline installations, first authorize a notice with `update notify --peer HOST/AGENT --apply`; it stays pending until that receiver becomes reachable. `update maintain --apply` records an update check and retries or verifies **only previously queued upgrade notices**. Successful official-release metadata is cached for six hours. It does not enroll new recipients, install software or change remote policy. To run it every 15 minutes and after startup, generate and install the opt-in timer:
+
+```sh
+sh "$Y" update maintain                         # preview; nothing written or sent
+sh "$Y" update reminder-template systemd-user --retry-notices
+# use launchd or cron instead of systemd-user where appropriate
+```
+
+The template prints instructions; it does not install itself. Regenerate it after plugin updates because its script path may change. `uncertain` notices still require explicit reconciliation. A powered-off device or stopped receiver cannot receive or upgrade until it returns; a policy-blocked legacy installation needs its owner's local migration. This recovery applies to upgrade notices, not ordinary messages. See [0.4 migration and verification](docs/UPGRADING-0.4.md).
 
 To remove the Codex plugin and its marketplace:
 

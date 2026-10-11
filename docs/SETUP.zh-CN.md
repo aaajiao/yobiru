@@ -27,7 +27,7 @@ Windows 上：`py -3 "C:\path\to\yobiru\scripts\yobiru.py" onboard`。非默认�
 | 接收服务 | 安装并启动打印出的服务定义 | — |
 | 唤醒与会话 | 按你的选择配置适配器和绑定 | 指明每个 agent 对应的已有会话 |
 
-Yobiru 从不修改 Tailscale ACL、shields-up 或 DNS，也不会信任所有对端。`help`、`doctor`、`status`、`onboard`、`agents` 和 `update check` 都是只读的。
+Yobiru 从不修改 Tailscale ACL、shields-up 或 DNS。新安装允许通过 Tailscale 身份认证、网络策略允许接入且未命中本地拒绝规则的对端通信；通信权限不构成执行任务或唤醒的授权。`help`、`doctor`、`status`、`onboard`、`agents` 和 `update check` 都是只读的。
 
 ## 1. Tailscale
 
@@ -40,11 +40,13 @@ Yobiru 从不修改 Tailscale ACL、shields-up 或 DNS，也不会信任所有�
 ## 2. 对端与 agent 名称
 
 ```sh
-yobiru setup --allow PEER --agent NAME --self-agent NAME --default-agent NAME          # 计划
-yobiru setup --allow PEER --agent NAME --self-agent NAME --default-agent NAME --apply
+yobiru setup --agent NAME --self-agent NAME --default-agent NAME          # 计划
+yobiru setup --agent NAME --self-agent NAME --default-agent NAME --apply
 ```
 
-`PEER` 是 Tailscale 主机名、`tag:NAME` 或 `user:LOGIN`。已有条目会保留；修改身份需要 `--replace FIELD`；每次写入都会备份 config.json。
+新配置采用 `tailnet` 模式，无需逐个添加白名单。若需限制新安装的通信范围，可加 `--allow PEER`（主机名、FQDN、`tag:NAME` 或 `user:LOGIN`）；`--send-only` 使用空白名单。已有访问策略会保留；修改身份需要 `--replace FIELD`；改动配置时会先备份。
+
+已有安装先用 `yobiru policy show` 查看实际模式。迁移旧白名单时，先运行 `yobiru policy set --mode tailnet` 预览，已有主人授权后加 `--apply`。`--deny RULE` 替换整个拒绝列表，多条规则重复指定；两种模式都以拒绝规则优先。0.4 接收端和桥接在下一次权限检查时读取新策略，单独改策略无需重启；首次升级运行时仍需重启。见 [0.4 迁移指南](UPGRADING-0.4.md)。
 
 ## 3. 常驻接收端
 
@@ -74,3 +76,5 @@ yobiru send PEER/AGENT "hello"
 按原来的安装方式更新插件：Codex／Cursor／Grok Bot 的插件页或市场、新的官方 release 压缩包（先用 `SHA256SUMS` 校验，再解压到新目录，绝不解压到数据目录上），或检出官方标签。之后改用新包里的 `scripts/yobiru`（`yobiru version` 显示新版本）；数据目录不受影响。
 
 见 `yobiru-upgrade` skill 和 `yobiru update --help`：插件更新不会改变常驻运行时（运行 `install-runtime --upgrade --apply`，再重启接收端）；本机运行已发布的版本后，`yobiru update notify` 会通知你的其他已知安装。
+
+已有安装保留旧白名单，策略迁移和软件升级是两件事。`update maintain --apply` 记录更新检查，且仅重试此前排队的升级通知。需要每 15 分钟及启动后运行时，用 `update reminder-template systemd-user --retry-notices`（或 `launchd`／`cron`）打印并按说明安装可选定时任务；插件路径变化后重新生成。它不安装软件、不改策略。见 [0.4 迁移指南](UPGRADING-0.4.md)。

@@ -16,7 +16,7 @@ Tailscale 身份校验 → Tailmsg inbox
 
 - 使用安装版本提供的 `codex queue --thread UUID --message TEXT`。消息只包含本地消息 ID、路径和可信工作流说明，不把外来正文作为 shell 命令或行动批准。
 - `wake now` 立即排队，`batch` 默认延后 30 秒补扫，`none` 只存档。接收端 wake 降级仍生效。
-- 收件前后的白名单、认证来源和目标 agent 均检查；投递时重新检查。适配器不会确认原信，也不会自动发送 Tailmsg 回复。
+- 收件前后的访问策略、认证来源和目标 agent 均检查；投递时重新检查。适配器不会确认原信，也不会自动发送 Tailmsg 回复。
 - 状态 `enqueued` 表示官方 CLI 接收入队，不能据此声称模型已处理。结果未知时只核对会话中的消息标记；无法确认时保留 `uncertain`，不盲目重发。
 - 桌面关闭时暂停投递。服务继续保留本机队列，打开后重试。不存在替代会话或自动切换到 `--last` 的逻辑。
 - 入口工作流见 [CODEX_DISPATCHER.md](CODEX_DISPATCHER.md)。用户授权了任务路由；来信自身不构成执行敏感操作的批准。
@@ -121,14 +121,14 @@ sh "$Y" codex-bridge rollback <backup 路径>
 ```
 
 - `excluded_kinds`：信封 `kind` 字符串列表（每项 1–32 个字符，无控制字符）。`excluded_kind_adapter`：可信本机程序的 argv，第一项必须是绝对路径。`excluded_kind_timeout_seconds`：可选，默认 60，范围 (0, 300]。实际时限取它与“接收端 `hook_timeout_s`（默认 120）减 10 秒”中的较小值，保证适配器在接收端终止它之前先终止处理程序；剩余时间不足 1 秒时不启动处理程序。只读取、不修改用户配置。任一字段无效时，适配器和安装器在任何副作用之前拒绝运行。
-- 先完成与普通消息相同的校验（inbox 路径、Tailscale 来源、白名单、目标 agent `codex`、实际 wake 级别、是否已 ack），之后才按 `kind` 分流。被排除的消息从不进入 Codex 队列：`wake`、`scan` 都不会入队；在配置前已入队的 pending/retry/uncertain 记录，在投递时重新校验并记为 `skipped`（`excluded_kind`）。
+- 先完成与普通消息相同的校验（inbox 路径、Tailscale 来源、访问策略、目标 agent `codex`、实际 wake 级别、是否已 ack），之后才按 `kind` 分流。被排除的消息从不进入 Codex 队列：`wake`、`scan` 都不会入队；在配置前已入队的 pending/retry/uncertain 记录，在投递时重新校验并记为 `skipped`（`excluded_kind`）。
 - 只有接收端对一封未 ack、实际级别为 `now` 的消息直接调用 `wake` 时，才运行该程序：argv 原样，只追加经过校验的规范 inbox 路径；不经 shell，stdin 为空，不展开任何正文。`none`、`batch`、已 ack，或未配置程序时只记为 skipped，消息留在 inbox。`scan`、定时投递、`status` 和核对都不会运行它。
 - 结果写到标准输出（JSON），并在标准错误输出一行固定状态，接收端会把它记入 wake 日志：`forwarded`（程序退出码 0）；`forward_failed`（程序非零退出，`exit_code` 记录其值）；`forward_timeout`（超时，程序及其整个进程组被终止）。这三种情况程序都已启动过，适配器一律以 0 退出，接收端不会重放它；程序失败或超时都不会被自动重试，消息仍留在 inbox 中，由该程序或用户处理。程序未能启动时（`forward_not_started`：可执行文件不可用为 127，没有可用时限为 1）以非零退出，接收端可能按 `wake_attempts` 再试，这是安全的，因为程序从未运行。程序可能在失败或超时前已部分执行，去重与重试由它自己以消息 ID 为键负责；这里不承诺恰好一次。
 - 没有对应的 CLI 选项：直接编辑 `codex-bridge.json`，再用 `codex-bridge install ... --dry-run` 预览（会校验这些字段，并显示 `excluded_kinds`）。两个安装器升级时都保留这些字段，以及调整过的轮询/重试时间、自定义入口指令路径、已记录的 Codex CLI 路径、固定的 Codex 账户设置和已授权的 `allow_replies`。迁移已有部署时，先把原有分流设置写入 `codex-bridge.json`，确认预览无误后再安装，避免消息被误投到入口会话。`codex-bridge status` 会列出当前分流设置，但不会运行程序。
 
 ## 会话名称与发现（0.3.0）
 
-安装桥接后，`yobiru agents` 和其他机器的发现（`GET /info`，仅对白名单内的机器）会自动报告固定入口会话的 UUID。原生名称由 `codex_bridge.py session-name` 只读查询：短时官方 app-server 执行 `thread/read`（`includeTurns: false`），只取 `Thread.name`，从不读取 `preview`、回合或会话列表，不入队、不创建队列数据库、不启动模型回合；接收端在整组进程超时清理和输出上限下调用它并缓存约 5 分钟。别名用 `yobiru session bind --agent codex --display-name 名称` 记录在 `sessions.json`；与桥接入口不同的 UUID 会被拒绝。两个安装器升级时不碰 `sessions.json`，名称因此保留。
+安装桥接后，`yobiru agents` 和其他机器的发现（`GET /info`，仅对访问策略允许的认证机器）会自动报告固定入口会话的 UUID。原生名称由 `codex_bridge.py session-name` 只读查询：短时官方 app-server 执行 `thread/read`（`includeTurns: false`），只取 `Thread.name`，从不读取 `preview`、回合或会话列表，不入队、不创建队列数据库、不启动模型回合；接收端在整组进程超时清理和输出上限下调用它并缓存约 5 分钟。别名用 `yobiru session bind --agent codex --display-name 名称` 记录在 `sessions.json`；与桥接入口不同的 UUID 会被拒绝。两个安装器升级时不碰 `sessions.json`，名称因此保留。
 
 ## 入口指令的升级
 
@@ -140,4 +140,4 @@ sh "$Y" codex-bridge rollback <backup 路径>
 
 桌面会话继续遵守 Codex 原生权限策略。入口能够请求查找、转交和创建任务；如果原生工具要求审批，消息会保留在该入口等待用户处理，适配器不会代替用户批准。部署与真实验收结果见 [IMPLEMENTATION_REPORT.md](IMPLEMENTATION_REPORT.md)。
 
-真实验收应在独立 Tailmsg home/端口接收一封本机发给本机的消息，不扩展生产白名单。确认真实身份收件 → 同一个入口会话读取 → 派生任务写出指定测试产物；第二封请求找到并继续该已有任务。重复扫描和服务重启不能重复派生。HTTP 202、本地排队成功和模型完成必须分别核对。
+真实验收应在独立 Tailmsg home/端口接收一封本机发给本机的消息，不放宽生产访问策略。确认真实身份收件 → 同一个入口会话读取 → 派生任务写出指定测试产物；第二封请求找到并继续该已有任务。重复扫描和服务重启不能重复派生。HTTP 202、本地排队成功和模型完成必须分别核对。

@@ -5,7 +5,7 @@ Every machine runs `tailmsg.py serve`. Messages are small JSON envelopes POSTed 
 http://<peer>:7766/msg. Files are never inside a message: the sender stages them in a
 read-only, expiring, unguessable URL on its own tailnet address; the receiver pulls
 them itself and verifies sha256. Auth = Tailscale identity (`tailscale whois`) +
-per-machine allowlist. Python 3.8+ stdlib only. See SPEC.md.
+per-machine access policy. Python 3.8+ stdlib only. See SPEC.md.
 """
 import argparse, datetime as dt, hashlib, http.client, ipaddress, json, mimetypes, os
 import re, secrets, shutil, ssl, stat, subprocess, sys, threading, time, unicodedata, urllib.parse
@@ -14,10 +14,12 @@ from pathlib import Path
 
 VERSION = 1                     # wire protocol version (unchanged)
 PRODUCT = "yobiru"
-PRODUCT_VERSION = "0.3.0"       # Yobiru release of this file; tools/build_plugin.py check keeps it in sync
+PRODUCT_VERSION = "0.4.0"       # Yobiru release of this file; tools/build_plugin.py check keeps it in sync
 DEFAULTS = {
     "port": 7766,
+    "access_policy": "tailnet",    # authenticated Tailscale peers; use "allowlist" for opt-in restriction
     "allow": [],                    # e.g. ["bot-box", "tag:agent", "user:me@example.com"]
+    "deny": [],                     # same rule syntax; deny always wins
     "tailscale_cmd": ["tailscale"], # e.g. ["sudo", "-n", "tailscale"] if the socket needs root
     "bind": None,                   # default: own Tailscale IPv4
     "wake_adapter": None,           # how to wake the local agent, see SPEC §5.8, e.g.
@@ -113,6 +115,89 @@ def sha256_file(p):
     return h.hexdigest()
 
 
+def parse_access_policy(raw):
+    """Validate policy without mutating config. An explicit legacy allow list stays restrictive.
+
+    This must see the raw config, before defaults are merged: absence of `allow` is different from
+    an existing, intentionally empty allow list. A mode change is always a local configuration choice.
+    """
+    if not isinstance(raw, dict):
+        raise RuntimeError("config must be a JSON object")
+    mode = raw.get("access_policy", "allowlist" if "allow" in raw else "tailnet")
+    if mode not in ("tailnet", "allowlist"):
+        raise RuntimeError("config access_policy must be tailnet or allowlist")
+    policy = {"access_policy": mode}
+    for field in ("allow", "deny"):
+        rules = raw.get(field, [])
+        if not isinstance(rules, list):
+            raise RuntimeError("config %s must be a list of peer rules" % field)
+        normalized = []
+        for rule in rules:
+            valid = isinstance(rule, str) and bool(rule) and len(rule) <= 320
+            if valid:
+                valid = not any(c.isspace() or unicodedata.category(c).startswith("C") for c in rule)
+            if valid:
+                r = rule.lower()
+                if r.startswith("user:"):
+                    valid = bool(r[5:]) and not any(c in r[5:] for c in ":/*\\")
+                elif r.startswith("tag:"):
+                    valid = re.fullmatch(r"tag:[a-z0-9][a-z0-9_-]*", r) is not None
+                else:
+                    r = r.rstrip(".")
+                    valid = len(r) <= 253 and re.fullmatch(
+                        r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+                        r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*", r) is not None
+            if not valid:
+                raise RuntimeError("config %s contains an invalid peer rule" % field)
+            normalized.append(r)
+        policy[field] = normalized
+    return policy
+
+
+def peer_matches(rule, ident):
+    """Shared host/FQDN/tag/user rule matching for transport, dispatcher and wake caps."""
+    r = str(rule).lower()
+    if r.startswith("tag:"):
+        return r in [t.lower() for t in ident.get("tags", [])]
+    if r.startswith("user:"):
+        return bool(ident.get("user")) and r[5:] == ident["user"].lower()
+    r = r.rstrip(".")
+    node = ident.get("node", "").lower().rstrip(".")
+    return bool(r) and r in {node, node.split(".")[0], ident.get("host", "").lower().rstrip(".")}
+
+
+def access_decision(raw, ident, recipient_token=False, self_discovery=False):
+    """(accepted, reason) for an already authenticated Tailscale identity; always fails closed.
+
+    The HTTP boundary additionally requires the actual source IP to be in Tailscale's range and
+    verified by LocalAPI whois. Bridge receipts come from that boundary, never envelope claims.
+    Recipient-bound file tokens and local self-discovery keep their historical allow-list exemption;
+    neither may bypass a deny rule or an invalid policy.
+    """
+    try:
+        policy = parse_access_policy(raw)
+    except (RuntimeError, TypeError, ValueError):
+        return False, "invalid_policy"
+    if not isinstance(ident, dict) or not isinstance(ident.get("node"), str) or not ident["node"].strip(".") or \
+            any(c.isspace() or unicodedata.category(c).startswith("C") for c in ident["node"]):
+        return False, "unknown_peer"
+    if any(not isinstance(ident.get(k, ""), str) for k in ("host", "user")) or \
+            not isinstance(ident.get("tags", []), list) or \
+            any(not isinstance(t, str) for t in ident.get("tags", [])):
+        return False, "unknown_peer"
+    if "ip" in ident and (not isinstance(ident["ip"], str) or not is_tailnet_ip(ident["ip"])):
+        return False, "unknown_peer"
+    if any(peer_matches(rule, ident) for rule in policy["deny"]):
+        return False, "denied"
+    if policy["access_policy"] == "tailnet":
+        return True, "tailnet"
+    if recipient_token or self_discovery:
+        return True, "recipient_token" if recipient_token else "self_discovery"
+    if any(peer_matches(rule, ident) for rule in policy["allow"]):
+        return True, "allowlist"
+    return False, "not_allowed"
+
+
 def parse_config(raw):
     """config.json object -> (cfg merged over DEFAULTS, {agent name: spec}). Pure: no files are read or
     created, so tools can validate a config without side effects. Raises RuntimeError if invalid."""
@@ -120,6 +205,7 @@ def parse_config(raw):
         raise RuntimeError("config must be a JSON object")
     cfg = dict(DEFAULTS)
     cfg.update(raw)
+    cfg.update(parse_access_policy(raw))
     for k in ("self_agent", "default_agent"):
         if cfg.get(k) is not None:
             err = agent_name_error(cfg[k])
@@ -154,7 +240,7 @@ class Ctx:
         cfg_path = self.home / "config.json"
         if not cfg_path.exists():
             atomic_write(cfg_path, json.dumps(DEFAULTS, indent=2).encode())
-            log("created default config", cfg_path, "(allow list is empty: nobody can message you yet)")
+            log("created default config", cfg_path, "(authenticated Tailscale peers may communicate)")
         self.cfg, self.agents = parse_config(json.loads(cfg_path.read_text(encoding="utf-8")))
         self._whois_cache = {}
         self._now_hits = {}          # (sender node, agent) -> [epoch seconds of effective `now`]
@@ -225,16 +311,19 @@ class Ctx:
 
     @staticmethod
     def matches(rule, ident):
-        """allow-list / wake_policy rule: hostname | fqdn | tag:x | user:login"""
-        r = str(rule).lower().rstrip(".")
-        if r.startswith("tag:"):
-            return r in [t.lower() for t in ident["tags"]]
-        if r.startswith("user:"):
-            return bool(ident["user"]) and r[5:] == ident["user"].lower()
-        return r in {ident["node"], ident["node"].split(".")[0], ident["host"]}
+        return peer_matches(rule, ident)
+
+    def access_decision(self, ident, recipient_token=False, self_discovery=False):
+        # Reload only access policy: a local deny/mode change takes effect on the next request, while
+        # adapter configuration, wake caps, session bindings and all other runtime settings stay put.
+        try:
+            raw = json.loads((self.home / "config.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeError):
+            return False, "invalid_policy"
+        return access_decision(raw, ident, recipient_token=recipient_token, self_discovery=self_discovery)
 
     def allowed(self, ident):
-        return any(self.matches(rule, ident) for rule in self.cfg["allow"])
+        return self.access_decision(ident)[0]
 
     def resolve_agent(self, requested):
         """-> (agent name or None, status). status: "default" (no `agent` in message), "known", "unknown"."""
@@ -386,10 +475,19 @@ def make_handler(ctx, me):
                 self.reply(403, {"ok": False, "error": "not a tailnet address"})
                 return None
             ident = ctx.whois(ip)
-            if not ident or not ident["node"]:
+            if not isinstance(ident, dict) or not ident.get("node"):
                 self.reply(403, {"ok": False, "error": "unknown tailnet peer"})
                 return None
             return ident
+
+        def authorize(self, ident, **options):
+            accepted, reason = ctx.access_decision(ident, **options)
+            if not accepted:
+                error = {"not_allowed": "peer not in allow list", "denied": "peer denied by access policy",
+                         "invalid_policy": "invalid access policy", "unknown_peer": "unknown tailnet peer"}[reason]
+                log("access rejected:", ident.get("node"), reason)
+                self.reply(403, {"ok": False, "error": error})
+            return accepted
 
         def do_GET(self):
             path = urllib.parse.urlparse(self.path).path
@@ -398,14 +496,13 @@ def make_handler(ctx, me):
                     return self.reply(403, {"ok": False, "error": "not a tailnet address"})
                 return self.reply(200, {"ok": True, "v": VERSION, "node": me})
             if path == "/info":
-                # Authenticated discovery: Tailscale identity AND the allow list (or this machine itself)
+                # Authenticated discovery: Tailscale identity AND current policy (or this machine itself)
                 # are checked before any metadata is read or any session name is looked up.
                 ident = self.identify()
                 if not ident:
                     return
-                if ident["node"] != me and not ctx.allowed(ident):
-                    log("info rejected (not in allow list):", ident["node"])
-                    return self.reply(403, {"ok": False, "error": "peer not in allow list"})
+                if not self.authorize(ident, self_discovery=ident["node"] == me):
+                    return
                 try:
                     body = info_payload(ctx.home, ctx.cfg, ctx.agents, me, ctx.native_name)
                 except Exception as e:
@@ -417,6 +514,8 @@ def make_handler(ctx, me):
                 return self.reply(404, {"ok": False, "error": "not found"})
             ident = self.identify()
             if not ident:
+                return
+            if not self.authorize(ident, recipient_token=True):
                 return
             token, name = m.group(1), urllib.parse.unquote(m.group(2))
             d = ctx.outbox / token
@@ -444,9 +543,8 @@ def make_handler(ctx, me):
             ident = self.identify()
             if not ident:
                 return
-            if not ctx.allowed(ident):
-                log("rejected (not in allow list):", ident["node"], ident["tags"], ident["user"])
-                return self.reply(403, {"ok": False, "error": "peer not in allow list"})
+            if not self.authorize(ident):
+                return
             if not (self.headers.get("Content-Type") or "").startswith("application/json"):
                 return self.reply(415, {"ok": False, "error": "need application/json"})
             try:
@@ -913,6 +1011,19 @@ def update_record(path, **fields):
         atomic_write(path, json.dumps(r, ensure_ascii=False, indent=2).encode("utf-8"))
 
 
+def wake_access_decision(ctx, rec):
+    """Revalidate the receiver-recorded sender before invoking a wake adapter, including manual retries."""
+    if not isinstance(rec, dict) or not isinstance(rec.get("received"), dict) or \
+            not isinstance(rec.get("envelope"), dict):
+        return False, "missing_verified_receipt"
+    peer = rec["received"].get("peer")
+    sender = rec["envelope"].get("from")
+    if not isinstance(peer, dict) or not isinstance(peer.get("node"), str) or not isinstance(sender, str) or \
+            sender.lower().rstrip(".") != peer["node"].lower().rstrip("."):
+        return False, "sender_mismatch"
+    return ctx.access_decision(peer)
+
+
 def deliver_wake(ctx, path):
     """Run the adapter with retries. Returns True on success. Records the outcome (no secrets) in the
     inbox record as `wake_delivery`; on give-up the message simply stays in `inbox --pending`."""
@@ -932,13 +1043,19 @@ def deliver_wake(ctx, path):
     attempts = max(1, int(ctx.cfg.get("wake_attempts") or 3))
     backoff = float(ctx.cfg.get("wake_backoff_s") if ctx.cfg.get("wake_backoff_s") is not None else 2)
     timeout = ctx.cfg.get("hook_timeout_s") or 120
-    err, n = None, 0
+    err, n, attempted = None, 0, 0
     for n in range(1, attempts + 1):
         try:
             rec = json.loads(Path(path).read_text(encoding="utf-8"))
+            allowed, reason = wake_access_decision(ctx, rec)
+            if not allowed:
+                err = "access policy: " + reason
+                log("wake", mid, "stopped before adapter invocation:", reason)
+                break
+            attempted += 1
             res = call_webhook(a, rec, timeout) if a["type"] == "webhook" else call_exec(a, path, timeout, agent)
             log("wake", mid, "@%s" % agent, a["type"], "ok (attempt %d): %s" % (n, res))
-            update_record(path, wake_delivery={"adapter": a["type"], "agent": agent, "ok": True, "attempts": n,
+            update_record(path, wake_delivery={"adapter": a["type"], "agent": agent, "ok": True, "attempts": attempted,
                                                "at": iso(now_utc())})
             return True
         except AdapterError as e:
@@ -948,9 +1065,9 @@ def deliver_wake(ctx, path):
         log("wake", mid, "@%s" % agent, a["type"], "failed (attempt %d/%d): %s" % (n, attempts, err))
         if n < attempts:
             time.sleep(backoff * 2 ** (n - 1))
-    log("wake", mid, "gave up after %d attempts; message stays pending in inbox" % n)
+    log("wake", mid, "gave up after %d attempts; message stays pending in inbox" % attempted)
     try:
-        update_record(path, wake_delivery={"adapter": a["type"], "agent": agent, "ok": False, "attempts": n,
+        update_record(path, wake_delivery={"adapter": a["type"], "agent": agent, "ok": False, "attempts": attempted,
                                            "at": iso(now_utc()), "error": err})
     except Exception as e:
         log("could not record wake_delivery:", e)
@@ -976,7 +1093,7 @@ def cmd_serve(ctx, a):
     me = ctx.self_node()
     bind = ctx.cfg.get("bind") or ctx.ts("ip", "-4").split()[0]
     port = int(ctx.cfg["port"])
-    if not ctx.cfg["allow"]:
+    if ctx.cfg["access_policy"] == "allowlist" and not ctx.cfg["allow"]:
         log("WARNING: allow list empty - every POST /msg will be rejected")
     names = [None] if not ctx.agents and ctx.cfg.get("default_agent") is None else \
         ([ctx.cfg["default_agent"]] if ctx.cfg.get("default_agent") not in (None, *ctx.agents) else []) + list(ctx.agents)

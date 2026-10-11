@@ -70,10 +70,11 @@ Check and set up (read-only unless --apply):
   doctor [--json]            check Python, Tailscale, config, receiver, sessions and wake adapters
   status [--json]            summarize config, agents, sessions, versions, wake settings and inbox counts
   session {{list,bind,unbind}} explicit agent -> existing session binding (exact id; bind/unbind need --apply)
-  update {{check,status,notify,reminder-template}}
+  policy {{show,set}}         show or deliberately change incoming access policy (tailnet / allowlist + deny)
+  update {{check,status,notify,maintain,reminder-template}}
                              official release check, versions, and upgrade notices to your known
                              installations (notify is a dry run unless --apply)
-  setup ... [--apply]        create or extend config.json with an explicit allow list / agent names
+  setup ... [--apply]        create or extend config.json; new installs trust authenticated tailnet peers
   wake-config ... [--apply]  receiver-side wake policy and per-agent wake adapters
   install-runtime [--upgrade] [--apply]
                              copy the bundled tailmsg.py into the data home for a durable `serve`
@@ -162,9 +163,10 @@ def config_problems(cfg):
         ok = False
     if not ok:
         fatal.append("port must be an integer 1-65535 (got %s)" % json.dumps(port))
-    allow = cfg.get("allow")
-    if not isinstance(allow, list) or not all(isinstance(x, str) for x in allow):
-        fatal.append("allow must be a list of strings (got %s)" % json.dumps(allow, ensure_ascii=False)[:80])
+    try:
+        core().parse_access_policy(cfg)
+    except RuntimeError as e:
+        fatal.append(str(e))
     tc = cfg.get("tailscale_cmd")
     if not isinstance(tc, list) or not tc or not all(isinstance(x, str) and x for x in tc):
         fatal.append("tailscale_cmd must be a non-empty list of strings")
@@ -316,6 +318,9 @@ def gather(home, home_source, probe=True):
     if cfg is not None:
         f["port"] = int(cfg["port"])
         f["allow"] = list(cfg["allow"])
+        f["access_policy"] = cfg["access_policy"]
+        f["deny"] = list(cfg["deny"])
+        f["legacy_allowlist"] = "access_policy" not in raw and "allow" in raw
         f["self_agent"], f["default_agent"] = cfg.get("self_agent"), cfg.get("default_agent")
         f["wake_policy"] = cfg.get("wake_policy")
         f["quiet_hours"] = cfg.get("quiet_hours")
@@ -420,16 +425,21 @@ def doctor_checks(f):
         add("error", "config", f["config_error"], "fix config.json by hand; %s never overwrites it" % PRODUCT)
     elif not f["config_exists"]:
         add("error", "config", "not set up: no %s (nothing was created)" % f["config_path"],
-            "%s setup --allow <peer> --agent <name>   # dry run; add --apply after review" % PRODUCT)
+            "%s setup --agent <name>   # dry run; add --apply after review" % PRODUCT)
     else:
         add("ok", "config", "%s (port %d, home from %s)" % (f["config_path"], f["port"], f["home_source"]))
         for w in f.get("config_warnings") or []:
             add("warn", "config", w)
-        if f["allow"]:
-            add("ok", "allow", "accepts messages from: %s" % ", ".join(map(str, f["allow"])))
-        else:
-            add("warn", "allow", "allow list is empty: every incoming message is rejected",
-                "%s setup --allow <peer>   # then --apply" % PRODUCT)
+        mode = f["access_policy"]
+        detail = "tailnet: accepts authenticated Tailscale peers that can reach this receiver" if mode == "tailnet" \
+            else "allowlist: accepts only matching peers: %s" % (", ".join(f["allow"]) or "(nobody)")
+        detail += "; deny rules take precedence: %s" % (", ".join(f["deny"]) or "(none)")
+        add("warn" if mode == "allowlist" and not f["allow"] else "ok", "access-policy", detail,
+            "%s policy show; use `policy set` to change the policy deliberately" % PRODUCT
+            if mode == "allowlist" and not f["allow"] else None)
+        if f["legacy_allowlist"]:
+            add("info", "policy-migration", "legacy allow list preserved; upgrading never broadens existing access",
+                "to trust authenticated tailnet peers: `%s policy set --mode tailnet` (review, then --apply)" % PRODUCT)
     ts = f["tailscale"]
     state = classify_tailscale(ts)
     linux = sys.platform.startswith("linux")
@@ -571,7 +581,8 @@ def cmd_status(home, home_source, argv):
     a = ap.parse_args(argv)
     f = gather(home, home_source, probe=not a.no_probe)
     out = {k: f.get(k) for k in ("plugin_version", "home", "home_source", "config_path", "config_exists",
-                                 "config_error", "port", "allow", "self_agent", "default_agent", "wake_policy",
+                                 "config_error", "port", "access_policy", "allow", "deny", "legacy_allowlist",
+                                 "self_agent", "default_agent", "wake_policy",
                                  "quiet_hours", "wake_rate", "receiver", "runtime", "inbox",
                                  "codex_bridge_installed") if k in f}
     ts = f["tailscale"]
@@ -592,7 +603,10 @@ def cmd_status(home, home_source, argv):
         print("  config error: %s" % f["config_error"])
     else:
         print("  node      %s   port %s" % (ts.get("node") or "?", f["port"]))
-        print("  allow     %s" % (", ".join(map(str, f["allow"])) or "(nobody)"))
+        print("  policy    %s%s" % (f["access_policy"], " (legacy allow list preserved)" if f["legacy_allowlist"] else ""))
+        print("  allow     %s%s" % (", ".join(map(str, f["allow"])) or "(none)",
+                                     " (inactive in tailnet mode)" if f["access_policy"] == "tailnet" else ""))
+        print("  deny      %s" % (", ".join(map(str, f["deny"])) or "(none)"))
         print("  identity  self_agent=%s default_agent=%s" % (f["self_agent"], f["default_agent"]))
         for x in out["agents"]:
             print("  agent     %s%s: wake %s%s; session %s" % (
@@ -715,7 +729,9 @@ def valid_agent(name, what="agent name"):
 
 
 def valid_peer(rule, what="peer"):
-    if not isinstance(rule, str) or len(rule) > 253 or not PEER_RULE_RE.match(rule):
+    try:
+        core().parse_access_policy({"allow": [rule]})
+    except RuntimeError:
         die("bad %s %r: use a Tailscale hostname or FQDN, tag:<name> or user:<login>" % (what, rule), 2)
     return rule
 
@@ -733,13 +749,88 @@ def set_scalar(plan, key, value, replace, label=None):
     plan.change("%s: %s -> %s" % (label, json.dumps(cur, ensure_ascii=False), json.dumps(value, ensure_ascii=False)))
 
 
+def cmd_policy(home, home_source, argv):
+    ap = argparse.ArgumentParser(allow_abbrev=False, prog=PRODUCT + " policy",
+                                 description="Read or deliberately change incoming access policy. Tailscale "
+                                             "authentication and network rules always apply; deny rules win. "
+                                             "Wake permissions and session bindings are independent.")
+    sub = ap.add_subparsers(dest="action", required=True)
+    show = sub.add_parser("show", allow_abbrev=False, help="show effective policy without network calls")
+    show.add_argument("--json", action="store_true")
+    change = sub.add_parser("set", allow_abbrev=False, help="plan a policy change; --apply writes a backed-up config")
+    change.add_argument("--mode", choices=("tailnet", "allowlist"), required=True)
+    for name in ("allow", "deny"):
+        group = change.add_mutually_exclusive_group()
+        group.add_argument("--" + name, action="append", metavar="PEER",
+                           help="replace the %s list with these rules (repeatable); omitted keeps existing rules" % name)
+        group.add_argument("--clear-" + name, action="store_true", help="explicitly empty the %s list" % name)
+    change.add_argument("--apply", action="store_true", help="write config.json and keep a backup")
+    change.add_argument("--json", action="store_true")
+    a = ap.parse_args(argv)
+    raw, error = read_config(home)
+    if error:
+        die(error, 2)
+    if a.action == "show":
+        try:
+            policy = core().parse_access_policy(raw or {})
+        except RuntimeError as e:
+            die(str(e), 2)
+        legacy = raw is not None and "access_policy" not in raw and "allow" in raw
+        result = {"config": str(home / "config.json"), "config_exists": raw is not None,
+                  "policy": policy, "legacy_allowlist": legacy, "changed": False}
+        if a.json:
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+        else:
+            print("%s access policy (read-only): %s%s" % (
+                PRODUCT, policy["access_policy"], " (new-install default; no config yet)" if raw is None else ""))
+            print("  allow: %s%s" % (", ".join(policy["allow"]) or "(none)",
+                                       " (inactive in tailnet mode)" if policy["access_policy"] == "tailnet" else ""))
+            print("  deny: %s (takes precedence)" % (", ".join(policy["deny"]) or "(none)"))
+            print("  Tailscale authentication and network rules always apply; wake permissions are separate.")
+            if legacy:
+                print("  legacy allow list preserved. To migrate: `%s policy set --mode tailnet` "
+                      "(review, then --apply)." % PRODUCT)
+        return 0
+    plan = Plan(home, "policy set")
+    if not plan.exists:
+        die("not set up: run `%s setup` first (dry run, then --apply)" % PRODUCT, 2)
+    # Validate the current policy too: do not normalize a malformed config into a broader policy.
+    try:
+        core().parse_access_policy(plan.before)
+    except RuntimeError as e:
+        die(str(e), 2)
+    set_scalar(plan, "access_policy", a.mode, True)
+    for name in ("allow", "deny"):
+        supplied = getattr(a, name)
+        if supplied is None and not getattr(a, "clear_" + name):
+            continue
+        rules = []
+        for rule in supplied or []:
+            rule = valid_peer(rule, name + " rule")
+            if rule.lower().rstrip(".") not in [r.lower().rstrip(".") for r in rules]:
+                rules.append(rule)
+        if plan.after.get(name) != rules:
+            plan.after[name] = rules
+            plan.change("%s = %s" % (name, json.dumps(rules, ensure_ascii=False)))
+    if a.mode == "tailnet":
+        plan.note("accept authenticated Tailscale peers that can reach this receiver, except deny matches; "
+                  "saved allow rules are inactive in tailnet mode")
+    elif not plan.after.get("allow"):
+        plan.note("allowlist with no allow rules rejects incoming messages from every peer")
+    plan.note("deny rules take precedence in both modes; Tailscale network rules and shields-up are unchanged")
+    plan.note("a 0.4.0+ receiver reloads access policy for each request; an older receiver must be upgraded first")
+    return plan.finish(a.apply, a.json)
+
+
 def cmd_setup(home, home_source, argv):
     ap = argparse.ArgumentParser(allow_abbrev=False,
         prog=PRODUCT + " setup",
         description="Create or extend config.json in the data home. Dry run unless --apply. Only adds what you "
-                    "name: existing allow entries, agents, adapters and unknown keys are kept as they are.")
+                    "name: existing access policy, agents, adapters and unknown keys are kept as they are. "
+                    "New configs default to authenticated tailnet peers; --allow selects allowlist on first setup.")
     ap.add_argument("--allow", action="append", default=[], metavar="PEER",
-                    help="who may message this machine: hostname, FQDN, tag:<name> or user:<login> (repeatable)")
+                    help="add an allow rule: hostname, FQDN, tag:<name> or user:<login> (repeatable); selects "
+                         "allowlist for a new config, preserves the mode for an existing config")
     ap.add_argument("--send-only", action="store_true",
                     help="create a config that accepts no incoming messages (empty allow list)")
     ap.add_argument("--agent", action="append", default=[], metavar="NAME",
@@ -755,14 +846,26 @@ def cmd_setup(home, home_source, argv):
     ap.add_argument("--apply", action="store_true", help="write the change (a backup of the old file is kept)")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
+    if a.send_only and a.allow:
+        die("--send-only and --allow cannot be used together", 2)
     plan = Plan(home, "setup")
     if not plan.exists:
-        if not a.allow and not a.send_only:
-            die("choose who may message this machine: --allow <peer> (repeatable), or --send-only", 2)
-        plan.after = {"port": 7766, "allow": []}
+        mode = "allowlist" if a.allow or a.send_only else "tailnet"
+        plan.after = {"port": 7766, "access_policy": mode, "allow": [], "deny": []}
         plan.change("create %s with port 7766" % plan.path)
+        plan.note("incoming access policy: %s; authenticated Tailscale identity is always required" % mode)
     elif a.send_only:
-        plan.note("--send-only only applies to a new config; the existing allow list is unchanged")
+        plan.note("--send-only only applies to a new config; the existing access policy is unchanged")
+    try:
+        effective_policy = core().parse_access_policy(plan.after)
+    except RuntimeError as e:
+        die(str(e), 2)
+    if plan.exists and "access_policy" not in plan.after and "allow" not in plan.after and a.allow:
+        # Adding allow rules to an implicit tailnet config must not silently change its effective mode.
+        plan.after["access_policy"] = effective_policy["access_policy"]
+        plan.change("access_policy = tailnet (preserve existing effective mode)")
+    if plan.exists and a.allow and effective_policy["access_policy"] == "tailnet":
+        plan.note("allow rules are saved but inactive in tailnet mode; use `policy set --mode allowlist` to restrict access")
     allow = plan.after.get("allow")
     if allow is None:
         allow = []
@@ -816,7 +919,8 @@ def cmd_setup(home, home_source, argv):
             die("--tailscale-cmd must be a path or a JSON list of strings", 2)
         set_scalar(plan, "tailscale_cmd", cmd, "tailscale_cmd" in a.replace)
     if plan.changes:
-        plan.note("a running receiver reads config.json only at start: restart it to apply changes (%s never restarts services)" % PRODUCT)
+        plan.note("a 0.4.0+ receiver reloads access policy per request; other config changes require a receiver restart "
+                  "(%s never restarts services)" % PRODUCT)
         plan.note("Tailscale ACLs and shields-up are not touched: the tailnet policy must let these peers reach "
                   "tcp:%s" % plan.after.get("port", 7766))
     return plan.finish(a.apply, a.json)
@@ -1891,8 +1995,8 @@ def discovery_rows(home, f, nodes, wanted, port, timeout, include_self):
             row.update(detail="receiver runs an older Yobiru/tailmsg (0.2.x or earlier) without /info: version, "
                               "agents and sessions unknown", version="<=0.2.x")
         elif pr["kind"] == "blocked":
-            row.update(send_permission="blocked", detail="the receiver answered 403: this machine is not on its "
-                                                         "allow list (policy, not a network failure)")
+            row.update(send_permission="blocked", detail="the receiver answered 403: its access policy rejected "
+                                                         "this machine (allowlist or deny rule; not a network failure)")
         elif pr["kind"] == "unreachable":
             row["detail"] = "no receiver answered on port %d in time (%s): not running, slow, another port, " \
                             "ACL or shields-up; this does not mean the machine is offline or Yobiru is not " \
@@ -2327,10 +2431,18 @@ def cmd_update(home, home_source, argv):
     pn.add_argument("--timeout", type=float, default=3.0, help="seconds per discovery probe (default 3)")
     pn.add_argument("--apply", action="store_true")
     pn.add_argument("--json", action="store_true")
+    pm = sub.add_parser("maintain", help="check for updates and retry previously authorized upgrade notices "
+                                         "(dry run unless --apply; no new recipients)")
+    pm.add_argument("--channel", choices=("stable", "preview"), default="stable")
+    pm.add_argument("--timeout", type=float, default=3.0)
+    pm.add_argument("--apply", action="store_true")
+    pm.add_argument("--json", action="store_true")
     pr = sub.add_parser("reminder-template", help="print an opt-in periodic `update check --record` definition "
                                                    "(never installs it)")
     pr.add_argument("kind", choices=("systemd-user", "launchd", "cron"))
     pr.add_argument("--channel", choices=("stable", "preview"), default="stable")
+    pr.add_argument("--retry-notices", action="store_true", help="every 15 minutes and after startup: record "
+                    "update checks and retry already queued notices; never install software or change policy")
     a = ap.parse_args(argv)
     if a.action == "check":
         return update_check(home, home_source, a)
@@ -2338,6 +2450,8 @@ def cmd_update(home, home_source, argv):
         return update_status(home, home_source, a)
     if a.action == "notify":
         return update_notify(home, home_source, a)
+    if a.action == "maintain":
+        return update_maintain(home, home_source, a)
     return reminder_template(home, a)
 
 
@@ -2411,13 +2525,18 @@ def update_status(home, home_source, a):
     f = gather_versions(home, home_source)
     versions = local_versions(home, f)
     state = load_notice_state(home, strict=False)
-    counts = {}
-    for e in state["notices"].values():
-        counts[e.get("status")] = counts.get(e.get("status"), 0) + 1
+    counts, entries = {}, []
+    for key, raw in state["notices"].items():
+        e = dict(raw) if isinstance(raw, dict) else {}
+        e["key"] = clean(e.get("key") or key, 250)
+        if e.get("status") not in ("pending", "dispatching", "uncertain", "notified", "verified", "blocked", "rejected"):
+            e["status"] = "invalid"
+        counts[e["status"]] = counts.get(e["status"], 0) + 1
+        entries.append(e)
     res = {"installed": versions, "last_check": recorded_update(home), "notices": counts,
            "installations_remembered": len(state["installations"])}
     if a.json:
-        res["notice_entries"] = sorted(state["notices"].values(), key=lambda e: e.get("key", ""))
+        res["notice_entries"] = sorted(entries, key=lambda e: e.get("key") or "")
         print(json.dumps(res, indent=2, ensure_ascii=False))
         return 0
     print("%s update status" % DISPLAY)
@@ -2429,38 +2548,47 @@ def update_status(home, home_source, a):
                                                                           lc["latest"], lc["channel"])
                                        if lc else "never recorded (`%s update check`)" % PRODUCT))
     print("  upgrade notices    %s" % (", ".join("%s %d" % kv for kv in sorted(counts.items())) or "none"))
-    for e in sorted(state["notices"].values(), key=lambda e: e.get("key", "")):
+    for e in sorted(entries, key=lambda e: e.get("key") or ""):
         print("    %-48s %-11s %s" % (e.get("key", "?")[:48], e.get("status"), e.get("last_error") or ""))
     return 0
 
 
 def reminder_template(home, a):
     python = os.path.realpath(sys.executable)
-    args = [python, str(Path(__file__).resolve()), "--home", str(home), "update", "check", "--record",
+    retry = getattr(a, "retry_notices", False)
+    args = [python, str(Path(__file__).resolve()), "--home", str(home), "update",
+            "maintain" if retry else "check", "--apply" if retry else "--record",
             "--channel", a.channel]
     warn = "# The plugin path below changes when the plugin is updated: print this again after each update."
     if a.kind == "systemd-user":
-        print("# Opt-in weekly Yobiru update reminder. It only records `update check`; doctor and status then")
-        print("# show the reminder. Nothing is downloaded or installed. Review, then save as")
+        print("# Opt-in Yobiru update maintenance: existing queued notices retry every 15 minutes." if retry else
+              "# Opt-in weekly Yobiru update reminder: records update checks for doctor/status.")
+        print("# No software is installed and no access policy is changed. Review, then save as")
         print("#   ~/.config/systemd/user/yobiru-update-check.service and .timer, and run:")
         print("#   systemctl --user daemon-reload && systemctl --user enable --now yobiru-update-check.timer")
         print(warn)
         print("# ---- yobiru-update-check.service")
-        print("[Unit]\nDescription=Yobiru update check (record only)\n\n[Service]\nType=oneshot")
+        print("[Unit]\nDescription=Yobiru update maintenance\n\n[Service]\nType=oneshot")
         print("ExecStart=%s" % " ".join(systemd_quote(x) for x in args))
         print("# ---- yobiru-update-check.timer")
-        print("[Unit]\nDescription=Weekly Yobiru update check\n\n[Timer]\nOnCalendar=weekly\nPersistent=true\n\n"
-              "[Install]\nWantedBy=timers.target")
+        schedule = "OnCalendar=*:0/15\nOnBootSec=2min" if retry else "OnCalendar=weekly"
+        print("[Unit]\nDescription=Yobiru update timer\n\n[Timer]\n%s\nPersistent=true\n\n"
+              "[Install]\nWantedBy=timers.target" % schedule)
     elif a.kind == "launchd":
         print("Review, save stdout as ~/Library/LaunchAgents/dev.yobiru.update-check.plist, then: launchctl load -w "
-              "<that file>. It only records `update check`. %s" % warn.lstrip("# "), file=sys.stderr)
+              "<that file>. %s %s" % ("Retries existing notices and records update checks." if retry else
+                                       "It only records update checks.", warn.lstrip("# ")), file=sys.stderr)
         sys.stdout.write(plistlib.dumps({"Label": "dev.yobiru.update-check", "ProgramArguments": args,
-                                         "StartInterval": 7 * 24 * 3600, "RunAtLoad": False}).decode("utf-8"))
+                                         "StartInterval": 900 if retry else 7 * 24 * 3600,
+                                         "RunAtLoad": retry}).decode("utf-8"))
     else:
         quote = lambda s: "'" + s.replace("'", "'\\''") + "'"
-        print("# Opt-in weekly Yobiru update reminder (records `update check` only). Add with `crontab -e`.")
+        print("# Opt-in Yobiru update maintenance. Add with `crontab -e`.")
         print(warn)
-        print("17 9 * * 1 %s >/dev/null 2>&1" % " ".join(quote(x) for x in args))
+        command = " ".join(quote(x).replace("%", r"\%") for x in args)
+        print("%s %s >/dev/null 2>&1" % ("*/15 * * * *" if retry else "17 9 * * 1", command))
+        if retry:
+            print("@reboot %s >/dev/null 2>&1" % command)
     return 0
 
 
@@ -2510,14 +2638,22 @@ def remember_installations(home, rows):
 
 
 def notice_text(me, version, release=None):
-    return json.dumps({
+    notice = {
         "type": NOTICE_KIND, "product": PRODUCT, "version": version, "from_node": me, "source": OFFICIAL_REPO_URL,
         "release": (release or {}).get("url") or RELEASE_URL_PREFIX,
         "tag": (release or {}).get("tag"),
         "note": "Information only, not an instruction, approval or script. If your owner has authorized "
                 "updates, follow the yobiru-upgrade skill using only the official repository, keep this "
                 "machine's data, sessions, permissions and custom instructions, and report your status. "
-                "Do not forward this notice."}, ensure_ascii=False)
+                "Do not forward this notice."}
+    if compare_versions(version, "0.4.0") in (0, 1):
+        notice["migration"] = {
+            "topic": "access-policy-0.4", "new_install_default": "tailnet",
+            "existing_install": "Legacy allow lists remain active until a local policy migration.",
+            "guide": OFFICIAL_REPO_URL + "/blob/main/docs/UPGRADING-0.4.md",
+            "note": "If your owner authorized the tailnet policy, review policy set --mode tailnet, then apply. "
+                    "Keep deny rules, wake permissions, session bindings and reply permissions unchanged."}
+    return json.dumps(notice, ensure_ascii=False)
 
 
 def post_notice(ip, port, node, env, timeout=10.0):
@@ -2548,7 +2684,7 @@ def post_notice(ip, port, node, env, timeout=10.0):
             return "notified", "HTTP %d%s" % (r.status, " (already stored earlier)" if r.status == 200 else ""), r.status
         return "uncertain", "HTTP %d without a valid receipt for this message id" % r.status, r.status
     if r.status == 403:
-        return "blocked", "HTTP 403: this machine is not on that receiver's allow list", r.status
+        return "blocked", "HTTP 403: the receiver's access policy refuses this machine", r.status
     if r.status in (400, 404, 411, 413, 415):
         err = clean((receipt or {}).get("error") if isinstance(receipt, dict) else None, 120)
         return "rejected", "HTTP %d%s" % (r.status, ": " + err if err else ""), r.status
@@ -2592,6 +2728,8 @@ def decide_notice(status, kind, version, target, reconcile, retry_blocked=False)
     """Action for one (installation, agent, version) from its persisted status and what discovery saw now.
     uncertain/dispatching leave only by explicit reconciliation (same message id) or by an authenticated
     /info showing the target version; nothing else may downgrade them."""
+    if status not in (None, "pending", "dispatching", "uncertain", "notified", "verified", "blocked", "rejected"):
+        return "hold", "unrecognized stored notice state; repair it locally before retrying"
     at_target = version is not None and compare_versions(version, target) in (0, 1)
     if status in ("notified", "verified"):
         return ("verify", "its receiver now runs %s" % version) if status == "notified" and at_target \
@@ -2604,11 +2742,11 @@ def decide_notice(status, kind, version, target, reconcile, retry_blocked=False)
     if status == "rejected":
         return "hold", "rejected earlier; not resent"
     if status == "blocked" and kind != "info" and not retry_blocked:
-        # Only a fresh authenticated /info (it uses the same allow list as /msg) shows that permission came
+        # Only a fresh authenticated /info (it uses the same access policy as /msg) shows that permission came
         # back; older receivers cannot show it, so they are not asked again unless --retry-blocked.
         return "hold", "refused earlier (403); not resent until /info shows access again or --retry-blocked"
     if kind == "blocked":
-        return "blocked", "this machine is not on its allow list (403); nothing sent"
+        return "blocked", "the receiver's access policy refuses this machine (403); nothing sent"
     if kind in ("offline", "unreachable", "absent"):
         return "pending", {"absent": "not in the current tailscale status: kept pending",
                            "offline": "offline: kept pending for a later run"}.get(kind, "not answering: kept pending")
@@ -2683,7 +2821,13 @@ def notice_plan(state, items, probes, target, reconcile, retry_blocked=False):
             key = notice_key(c["node"], c["port"], agent, target)
             entry = state["notices"].get(key) if isinstance(state["notices"].get(key), dict) else None
             version = info["version"] if info else None
-            action, why = decide_notice((entry or {}).get("status"), kind, version, target, reconcile, retry_blocked)
+            status = entry.get("status") if entry is not None else None
+            if entry is not None and status is None:
+                status = "invalid_missing_status"
+            if entry is not None and any(entry.get(k) != v for k, v in {
+                    "key": key, "node": c["node"], "port": c["port"], "agent": agent, "version": target}.items()):
+                status = "invalid_record_identity"
+            action, why = decide_notice(status, kind, version, target, reconcile, retry_blocked)
             plan.append({"key": key, "node": c["node"], "port": c["port"], "ip": c["ip"], "agent": agent,
                          "receiver": kind, "version": version, "status": (entry or {}).get("status"),
                          "action": action, "why": why, "sources": sorted(c["sources"])})
@@ -2754,7 +2898,24 @@ def update_notify(home, home_source, a, fetch=None):
     return 1 if res.get("error") else 0
 
 
-def apply_notices(home, me, target, items, probes, reconcile, post=None, release=None, retry_blocked=False):
+def valid_notice_envelope(env, item, me, target):
+    """A retry must keep the original id, authenticated sender and exact authorized agent route."""
+    if not isinstance(env, dict) or core().validate_env(env):
+        return False
+    if env.get("from") != me or env.get("to") != item["node"] or env.get("agent") != item["agent"] \
+            or env.get("kind") != NOTICE_KIND:
+        return False
+    try:
+        notice = json.loads(env.get("text", ""))
+    except (ValueError, TypeError):
+        return False
+    return isinstance(notice, dict) and all(notice.get(k) == v for k, v in {
+        "type": NOTICE_KIND, "product": PRODUCT, "version": target, "from_node": me,
+        "source": OFFICIAL_REPO_URL}.items())
+
+
+def apply_notices(home, me, target, items, probes, reconcile, post=None, release=None, retry_blocked=False,
+                  notice_keys=None):
     """Apply under the cross-process lock. Every action is recomputed from the state read under the lock, so a
     plan made earlier can never downgrade an uncertain or dispatching notice."""
     results = []
@@ -2785,7 +2946,11 @@ def apply_notices(home, me, target, items, probes, reconcile, post=None, release
         write_json_atomic(home / NOTICES_FILE, state)
         for item in notice_plan(state, items, probes, target, reconcile, retry_blocked):
             key = item["key"]
+            if notice_keys is not None and key not in notice_keys:
+                continue             # maintenance cannot create recipients or agent routes
             entry = state["notices"].get(key) if isinstance(state["notices"].get(key), dict) else None
+            if notice_keys is not None and entry is None:
+                continue             # a removed notice cancels its authorization to retry
             action = item["action"]
             if action in ("skip", "hold"):
                 continue
@@ -2799,11 +2964,20 @@ def apply_notices(home, me, target, items, probes, reconcile, post=None, release
                              detail="authenticated discovery shows the running receiver at %s (software only; no "
                                     "agent wake is implied)" % item["version"])
             elif action == "blocked":
-                entry.update(status="blocked", updated_at=now, last_error="403 on /info: not on the allow list")
+                entry.update(status="blocked", updated_at=now, last_error="403 on /info: refused by access policy")
             elif action == "pending":
                 entry.update(status="pending", updated_at=now, last_error=item["why"])
             elif action in ("send", "resend_same_id") and item["ip"]:
-                env = entry.get("envelope") if action == "resend_same_id" else None
+                env = entry.get("envelope")    # also keep the id after a known-unsent attempt
+                attempts = entry.get("attempts", 0)
+                bad_attempts = not isinstance(attempts, int) or isinstance(attempts, bool) or attempts < 0
+                needs_original = action == "resend_same_id" or bad_attempts or attempts > 0 or "envelope" in entry
+                if needs_original and (bad_attempts or not valid_notice_envelope(env, item, me, target)):
+                    entry.update(status="uncertain", updated_at=now,
+                                 last_error="stored envelope missing, invalid or mismatched; cannot safely reuse its id/route")
+                    write_json_atomic(home / NOTICES_FILE, state)
+                    results.append({"key": key, "status": "uncertain", "detail": entry["last_error"]})
+                    continue
                 if not isinstance(env, dict):
                     env = {"v": 1, "id": secrets.token_hex(8), "from": me, "to": item["node"], "ts": now,
                            "kind": NOTICE_KIND, "text": notice_text(me, target, release),
@@ -2826,6 +3000,133 @@ def apply_notices(home, me, target, items, probes, reconcile, post=None, release
             results.append({"key": key, "status": entry["status"], "detail": entry.get("detail") or
                             entry.get("last_error")})
     return results
+
+
+def maintenance_releases(home, apply, timeout, fetch=None):
+    """Rate-limit official metadata checks across timer runs. Only an official normalized release
+    list is cached; release text and executable content are never kept. Failed checks retry next tick."""
+    cache, _ = core().read_small_json(home / "maintenance-releases.json")
+    if isinstance(cache, dict) and cache.get("source") == OFFICIAL_REPO_URL:
+        try:
+            age = time.time() - core().parse_iso(cache["checked_at"]).timestamp()
+            if 0 <= age < 6 * 3600:
+                releases = parse_releases(cache["releases"])
+                return releases, cache["checked_at"], True
+        except (KeyError, TypeError, ValueError, UpdateError):
+            pass
+    releases = (fetch or fetch_releases)(timeout)
+    checked = now_iso()
+    if apply:
+        write_json_atomic(home / "maintenance-releases.json", {
+            "source": OFFICIAL_REPO_URL, "checked_at": checked,
+            "releases": [{"tag_name": r["tag"], "prerelease": r["prerelease"],
+                           "published_at": r["published_at"]} for r in releases]})
+    return releases, checked, False
+
+
+def maintenance_candidates(state, nodes, target):
+    """Only exact persisted recipients. No discovery and no newly bound sessions are enrolled."""
+    selected = {key: e for key, e in state["notices"].items() if isinstance(e, dict) and
+                e.get("version") == target and e.get("status") not in ("verified", "rejected")}
+    candidates = {}
+    for key, e in selected.items():
+        node, port, agent = e.get("node"), e.get("port"), e.get("agent")
+        if not isinstance(node, str) or not PEER_RULE_RE.fullmatch(node) or node.startswith(("tag:", "user:")) \
+                or not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535 \
+                or (agent is not None and core().agent_name_error(agent)) \
+                or key != notice_key(node, port, agent, target):
+            continue
+        n = match_node(nodes, node)
+        if n and n["self"]:
+            continue
+        c = candidates.setdefault((node, port), {
+            "node": node, "port": port, "ip": n["ip"] if n else None, "online": bool(n and n["online"]),
+            "in_status": n is not None, "sources": {"earlier notice"}, "agents": [], "remembered": None})
+        if agent not in c["agents"]:
+            c["agents"].append(agent)
+    return list(candidates.values()), set(selected)
+
+
+def maintain_once(home, home_source, a):
+    f = gather_versions(home, home_source)
+    if f.get("cfg") is None:
+        die("not set up; run `%s onboard` first" % PRODUCT, 2)
+    state = load_notice_state(home)
+    versions = local_versions(home, f)
+    res = {"command": "update maintain", "dry_run": not a.apply, "check": None, "plans": [],
+           "results": [], "errors": [], "installed": versions}
+    timeout = max(0.2, min(a.timeout, 30.0))
+    try:
+        releases, checked_at, cached = maintenance_releases(home, a.apply, max(1.0, timeout))
+        check = {"checked_at": checked_at, "cached": cached, "installed": versions,
+                 **assess_update(versions["plugin"], releases, a.channel)}
+    except UpdateError as e:
+        releases = None
+        check = {"checked_at": now_iso(), "channel": a.channel, "status": "error", "error": e.code,
+                 "installed": versions, "latest": None, "latest_preview": None}
+        res["errors"].append("could not verify official releases: " + e.code)
+    res["check"] = check
+    if a.apply:
+        write_json_atomic(home / UPDATE_FILE, check)
+    targets = sorted({e.get("version") for e in state["notices"].values() if isinstance(e, dict) and
+                      parse_semver(e.get("version")) and e.get("status") not in ("verified", "rejected")},
+                     key=lambda v: semver_key(parse_semver(v)))
+    if not targets:
+        return res
+    nodes, err = tailnet_nodes(f["cfg"]["tailscale_cmd"])
+    if err:
+        res["errors"].append("cannot read the tailnet: " + err)
+        return res
+    me = next((n["node"] for n in nodes if n["self"]), None)
+    local_ok = verify_local(home, f, versions["plugin"])["ok"] and bool(me)
+    for target in targets:
+        items, keys = maintenance_candidates(state, nodes, target)
+        probes = run_parallel(lambda c: probe_info(c["ip"], c["port"], timeout, expect_node=c["node"],
+                                                   host=c["node"]) if c["online"] and c["ip"] else None, items)
+        plan = [p for p in notice_plan(state, items, probes, target, False) if p["key"] in keys]
+        rel = next((r for r in releases or [] if r["version"] == target), None)
+        can_send = local_ok and compare_versions(versions["plugin"], target) in (0, 1) and rel is not None
+        if rel and rel["prerelease"] and a.channel != "preview":
+            can_send = False
+        if a.apply and can_send:
+            res["results"].extend(apply_notices(home, me, target, items, probes, False, release=rel,
+                                                 notice_keys=keys))
+        elif a.apply and plan:
+            res["errors"].append("%s: retry held; need matching local plugin/runtime/receiver at this version "
+                                 "or newer and its official release on the selected channel" % target)
+        for p in plan:
+            p.pop("ip", None)
+        res["plans"].append({"version": target, "ready": can_send, "plan": plan})
+    return res
+
+
+def update_maintain(home, home_source, a):
+    if a.apply and not (home / "config.json").is_file():
+        die("not set up; run `%s onboard` first" % PRODUCT, 2)
+    try:
+        if a.apply:
+            with StateLock(home / ".upgrade-maintenance.lock"):
+                res = maintain_once(home, home_source, a)
+        else:
+            res = maintain_once(home, home_source, a)
+    except LockBusy as e:
+        res = {"command": "update maintain", "dry_run": not a.apply, "check": None,
+               "plans": [], "results": [], "errors": [str(e)]}
+    if a.json:
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+    else:
+        print("%s update maintain (%s)" % (PRODUCT, "applied" if a.apply else "dry run; nothing written or sent"))
+        if res["check"]:
+            print("  release check: %s" % res["check"]["status"])
+        for group in res["plans"]:
+            for p in group["plan"]:
+                print("  %-46s %-15s %s" % (p["key"][:46], p["action"], p["why"]))
+        for r in res["results"]:
+            print("  -> %-43s %s" % (r["key"][:43], r["status"]))
+        for err in res["errors"]:
+            print("  error: " + err)
+        print("  No software installed, access policy changed, or new recipients enrolled.")
+    return 1 if res["errors"] else 0
 
 
 # ---------------------------------------------------------------- onboarding: platform-aware next steps
@@ -2942,7 +3243,7 @@ def tailscale_install_steps(facts):
         if facts.get("mac_app_cli"):
             return ("todo", "the Tailscale app is installed but its CLI is not on PATH",
                     ["%s setup --tailscale-cmd %s --replace tailscale_cmd   # existing config" % (PRODUCT, MAC_TS_CLI),
-                     "%s setup --allow PEER --tailscale-cmd %s   # new config" % (PRODUCT, MAC_TS_CLI)],
+                     "%s setup --tailscale-cmd %s   # new config" % (PRODUCT, MAC_TS_CLI)],
                     [TS_DOCS["darwin"]], "agent")
         return ("todo", "install the Tailscale app (Mac App Store or the standalone download), open it, approve "
                 "the VPN / system extension prompt in System Settings, then sign in from the menu bar. The "
@@ -3033,16 +3334,32 @@ def onboarding_steps(home, f, facts):
     if f["config_error"]:
         step("config", "blocked", "Configure Yobiru", f["config_error"], [], [], "user (fix config.json by hand)")
     elif not f["config_exists"]:
-        step("config", "todo", "Choose peers and agent names",
-             "ask the user which machines may message this one and what this agent is called; nothing is "
-             "created until --apply",
-             ["%s setup --allow PEER --agent NAME --self-agent NAME --default-agent NAME" % PRODUCT,
-              "%s setup --allow PEER --agent NAME --self-agent NAME --default-agent NAME --apply" % PRODUCT],
+        step("config", "todo", "Choose agent names and review access policy",
+             "new installs accept authenticated Tailscale peers that can reach this receiver; deny rules are "
+             "optional. Choose this agent's name; nothing is created until --apply. Use --allow PEER on first "
+             "setup only if you want an allowlist instead",
+             ["%s setup --agent NAME --self-agent NAME --default-agent NAME" % PRODUCT,
+              "%s setup --agent NAME --self-agent NAME --default-agent NAME --apply" % PRODUCT],
              [], "user chooses, agent applies")
     else:
-        step("config", "done" if f.get("allow") else "todo", "Choose peers and agent names",
-             "allow: %s" % (", ".join(f["allow"]) or "nobody yet"),
-             [] if f.get("allow") else ["%s setup --allow PEER --apply" % PRODUCT])
+        mode = f.get("access_policy", "allowlist")
+        detail = "access policy: %s; allow: %s; deny: %s" % (
+            mode, ", ".join(f.get("allow") or []) or "(none)", ", ".join(f.get("deny") or []) or "(none)")
+        commands = []
+        if f.get("legacy_allowlist"):
+            detail += ". Legacy allow list preserved; optional migration to tailnet mode needs an explicit policy change"
+            commands.append("%s policy set --mode tailnet   # review, then add --apply to migrate" % PRODUCT)
+        elif mode == "allowlist" and not f.get("allow"):
+            detail += ". Empty allowlist rejects incoming messages; retain it for a send-only installation"
+            commands.append("%s policy show" % PRODUCT)
+        step("config", "done" if mode == "tailnet" or f.get("allow") else "todo",
+             "Review access policy and agent names", detail, commands)
+        # Optional migration is visible even when the existing installation is already configured.
+        if f.get("legacy_allowlist"):
+            step("policy-migration", "optional", "Optional: migrate legacy incoming access",
+                 "the existing allowlist remains active. To accept authenticated Tailscale peers except deny "
+                 "matches, review the policy change below; keeping the allowlist is also supported", commands,
+                 [], "user chooses whether to migrate")
     rt = f["runtime"]
     step("runtime", "done" if rt["present"] and rt.get("same_as_bundled") else "todo", "Durable receiver runtime",
          "%s %s" % (rt["path"], "matches the bundled runtime" if rt.get("same_as_bundled") else
@@ -3121,10 +3438,10 @@ def cmd_onboard(home, home_source, argv):
         return 0
     print("%s onboarding for %s (read-only; nothing was changed)" % (DISPLAY, facts["system"] or facts["platform"]))
     print("Installing the plugin ran nothing: there is no install hook. These steps make it work.")
-    marks = {"done": "[x]", "todo": "[ ]", "blocked": "[!]", "unknown": "[?]"}
+    marks = {"done": "[x]", "todo": "[ ]", "blocked": "[!]", "unknown": "[?]", "optional": "[i]"}
     for i, s in enumerate(steps, 1):
         print("%s %d. %s: %s" % (marks.get(s["status"], "[ ]"), i, s["title"], s["detail"]))
-        if s["status"] in ("todo", "blocked"):
+        if s["status"] in ("todo", "blocked", "optional"):
             for c in s["commands"]:
                 print("        $ %s" % c)
             for d in s["docs"]:
@@ -3137,7 +3454,7 @@ def cmd_onboard(home, home_source, argv):
 # ---------------------------------------------------------------- dispatch
 def run_core(home, cmd, rest):
     if not (home / "config.json").is_file():
-        die("not set up: no %s (nothing was created). Run `%s doctor`, then `%s setup --allow <peer>` "
+        die("not set up: no %s (nothing was created). Run `%s doctor`, then `%s setup --agent <name>` "
             "(dry run, then --apply)." % (home / "config.json", PRODUCT, PRODUCT), 2)
     if not CORE.is_file():
         die("bundled tailmsg.py is missing; reinstall the plugin", 2)
@@ -3154,6 +3471,7 @@ def run_core(home, cmd, rest):
 
 
 PLUGIN_COMMANDS = {"paths": cmd_paths, "doctor": cmd_doctor, "status": cmd_status, "setup": cmd_setup,
+                   "policy": cmd_policy,
                    "wake-config": cmd_wake_config, "install-runtime": cmd_install_runtime,
                    "service-template": cmd_service_template, "codex-bridge": cmd_codex_bridge,
                    "onboard": cmd_onboard, "agents": cmd_agents, "peers": cmd_agents, "session": cmd_session, "update": cmd_update}

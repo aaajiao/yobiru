@@ -24,7 +24,7 @@ Body: 信封（见 §3），默认上限 256 KiB
 | 202 | 已收下并写入收件箱（**只代表送达，不代表对方已处理**） |
 | 200 | 同一 `id` 之前已收过（幂等，可放心重发） |
 | 400 | 格式错误 / 未知字段 / `wake` 取值不对 / `agent`、`from_agent` 名字不合法 / `to` 不是我 / 拉取地址不在发件方主机上 |
-| 403 | 来源不是 tailnet 地址、不在白名单、或 `from` 与 Tailscale 身份不符 |
+| 403 | 来源不是 tailnet 地址、访问策略拒绝、或 `from` 与 Tailscale 身份不符 |
 | 413 | 太大　　415 不是 JSON |
 
 另有 `GET /health` → `{"ok":true,"v":1,"node":"<fqdn>"}`，只回答 tailnet 地址，用于探活（保持不变）。
@@ -83,7 +83,7 @@ agent 名字规则：1–64 个字符，可以用中文等任意 Unicode；不�
 2. 发件方自己的 `serve` 只读地提供 `GET /f/<token>/<name>`，只在本机 Tailscale IP 上。
 3. 每个 token 目录记录 `to` 和 `expires`（默认 24 小时）：
    - 过期了一律 404，过期 1 小时后自动删除；
-   - 只有 `to` 那台机器（按 `tailscale whois` 判断）能拉，其他人拿到链接也是 404。
+   - 只有 `to` 那台机器（按 `tailscale whois` 判断）能拉，其他人拿到链接也是 404。0.4 起本地 `deny` 也能阻止该机器继续获取；既有收件方 token 授权仍可独立于普通消息的 `allow` 白名单，token 不能绕过拒绝规则。
 4. `url` 的主机必须就是 `from` 本身。收件方遇到指向别处的链接会直接拒收整封信，也就不会被诱导去访问第三方地址。
 
 ## 5. 收件方的行为
@@ -91,7 +91,7 @@ agent 名字规则：1–64 个字符，可以用中文等任意 Unicode；不�
 1. **鉴权顺序**：
    - 来源 IP 必须在 `100.64.0.0/10` 或 `fd7a:115c:a1e0::/48` 里，否则 403；
    - 用 `tailscale whois --json <IP>`（LocalAPI）查出对方节点名、tag、登录用户；
-   - 对照本机白名单 `allow`，没命中 403；
+   - 对照本机访问策略：`deny` 命中即 403；`tailnet` 模式允许已认证对端，`allowlist` 模式要求 `allow` 命中，否则 403；
    - 信封里的 `from` 必须等于 whois 查到的节点名，否则 403（防冒名）。
 2. **存储**：原样写入 `~/.tailmsg/inbox/<id>.json`，内容为 `{"envelope": …, "received": {"at", "peer"}}`。`peer` 是 whois 查到的身份，以它为准，不信信封自报的身份。
 3. **拉文件**：由收件方决定什么时候拉（`tailmsg fetch <id>`）。拉下来先存成 `.part`，大小和 sha256 都对得上才改名，放进 `inbox/<id>/files/`；对不上就删掉并报错。
@@ -175,7 +175,7 @@ agent 名字规则：1–64 个字符，可以用中文等任意 Unicode；不�
    - **选适配器**：用 `agents.<名字>.wake_adapter`；没配的话，**只有默认 agent** 回退到顶层 `wake_adapter` / `on_message`（兼容单 agent 的旧配置），其他 agent 没有适配器就不叫醒，信留在 `inbox --pending`。`exec` 适配器多一个环境变量 `TAILMSG_AGENT`。
    - **回信**：发件方配了 `self_agent`（或用 `--as 名字`）时，信封带上 `from_agent`。收件方 `tailmsg reply <id>` 会自动把回信的 `agent` 设成原信的 `from_agent`，于是只叫醒当初发信的那个 agent。
    - **收件箱**：仍然是一个目录。`tailmsg inbox --agent <名字>`（可加 `--pending`）只看点名给它的信；没写 `agent` 的信算默认 agent 的。点名了未知 agent 的信显示为 `@名字?`。
-   - 点名只决定叫醒谁，**不是权限边界**：谁能发信仍然只看 `allow`，信依然只是请求，不是批准。
+   - 点名只决定叫醒谁，**不是权限边界**：谁能发信仍然由本机访问策略决定，信依然只是请求，不是批准。
 
    示例：
 
@@ -204,7 +204,9 @@ agent 名字规则：1–64 个字符，可以用中文等任意 Unicode；不�
 ```json
 {
   "port": 7766,
-  "allow": ["bot-box", "dev-server", "tag:agent", "user:you@example.com"],
+  "access_policy": "tailnet",
+  "allow": [],
+  "deny": [],
   "tailscale_cmd": ["tailscale"],
   "bind": null,
   "wake_adapter": null,
@@ -228,7 +230,9 @@ agent 名字规则：1–64 个字符，可以用中文等任意 Unicode；不�
 }
 ```
 
-- `allow` 支持三种写法：短主机名或 FQDN、`tag:xxx`、`user:登录邮箱`。为空表示谁的信都不收。
+- `access_policy`：`tailnet`（新配置默认）允许通过 `tailscale whois` 验证且网络允许接入的节点；`allowlist` 还要求命中 `allow`。旧配置含 `allow` 但未声明该字段时保留原来的白名单行为，升级不自动扩权。无效策略或规则按拒绝处理。
+- `allow` / `deny` 支持短主机名或 FQDN、`tag:xxx`、`user:登录邮箱`。`deny` 在两种模式下都优先于允许规则。`allowlist` 下空 `allow` 不接收对端消息；`tailnet` 下不要求填写 `allow`。
+- `yobiru policy show` 查看有效策略；`policy set --mode tailnet|allowlist` 预览，`--apply` 才写入并备份。`--allow` / `--deny` 替换整个对应列表，未指定则保留；`--clear-allow` / `--clear-deny` 清空。0.4 接收端和桥接在下一次权限检查时读取本地策略，不需为单独的策略修改重启。策略更新不改变身份、已有数据、agent 路由、会话、适配器、唤醒限制或回复权限。
 - `tailscale_cmd`：如果 CLI 需要 root，改成 `["sudo","-n","tailscale"]`；macOS 的 App 版改成 `["/Applications/Tailscale.app/Contents/MacOS/Tailscale"]`。
 - `wake_adapter`：唤醒适配器，见 §5.8。`null` 表示不叫醒，`now` 的信也只是存起来。旧字段 `on_message: [...]` 等同 `{"type":"exec","argv":[...]}`，两者都写时以 `wake_adapter` 为准。
 - `hook_timeout_s` / `wake_attempts` / `wake_backoff_s`：适配器单次超时、总尝试次数、退避基数（秒）。
@@ -243,14 +247,14 @@ agent 名字规则：1–64 个字符，可以用中文等任意 Unicode；不�
 ## 7. 网络层要求（tailnet 策略）
 
 - 收件机器上 Tailscale 不能开 shields-up（`tailscale set --shields-up=false`），否则别的机器连不进来。
-- 建议在 ACL / grants 里只放行 `tcp:7766`，并且只允许互相通信的这几台机器访问。Tailscale 的访问策略和 tailmsg 自己的 `allow` 白名单是两道独立的门。
+- 建议在 ACL / grants 里只放行 `tcp:7766`，并且只允许互相通信的这几台机器访问。Tailscale 的 ACL / grants 始终生效；Yobiru 的本地访问策略不能绕过它们。使用 `tailnet` 模式时无需再逐台填写 Yobiru 白名单，仍可用 `deny` 拒绝指定节点、tag 或用户。
 
 ## 9. 发现接口 `GET /info`（Yobiru 0.3.0 起，可选）
 
-鉴权顺序与 `/msg` 相同，并且在读取任何元数据、查询任何会话名称**之前**完成：来源必须是 tailnet 地址，`tailscale whois` 查出的节点必须在本机 `allow` 白名单里（或就是本机自己），否则 403。
+鉴权顺序与 `/msg` 相同，并且在读取任何元数据、查询任何会话名称**之前**完成：来源必须是 tailnet 地址，`tailscale whois` 查出的身份必须符合本机访问策略（本机诊断保留本机身份例外），否则 403；拒绝规则优先。
 
 ```json
-{"ok": true, "v": 1, "product": "yobiru", "version": "0.3.0", "node": "dev-server.example.ts.net",
+{"ok": true, "v": 1, "product": "yobiru", "version": "0.4.0", "node": "dev-server.example.ts.net",
  "agents_total": 2, "agents_truncated": false, "generated_at": "2026-10-11T00:00:00Z",
  "agents": [
   {"agent": "codex", "default": true, "session": {
@@ -268,8 +272,14 @@ agent 名字规则：1–64 个字符，可以用中文等任意 Unicode；不�
 
 ### 升级通知（kind `yobiru-upgrade-notice`）
 
-普通的 v1 消息，请求 `wake: "now"`（接收端策略照常降级），`text` 是 JSON：`{"type":"yobiru-upgrade-notice","product":"yobiru","version":"0.3.0","from_node":...,"source":"https://github.com/chekusu/yobiru","release":<已核实的 release 页面>,"tag":...,"note":...}`。它只是信息，不是命令、批准或脚本；收件方不得据此执行任何内容，也不得转发。发件方（`yobiru update notify`）只在本机插件、常驻运行时和运行中的接收端都已是已发布的官方版本后发送，只发给已知安装，并在本地 `upgrade-notices.json` 中按（节点、端口、agent、版本）去重：先持久记录意图和固定的信封 ID 再 POST；只有 202/200 且 `ok=true`、`id` 与信封一致才算 `notified`；发出后超时或回执无效记为 `uncertain`，绝不自动重发（显式核对时用完全相同的 ID 重发，接收端按 ID 去重）。403 记为 `blocked`，只有对方 `/info` 再次通过鉴权（即允许名单已包含本机）或显式 `--retry-blocked` 时才再发。
+普通的 v1 消息，请求 `wake: "now"`（接收端策略照常降级），`text` 是 JSON：`{"type":"yobiru-upgrade-notice","product":"yobiru","version":"0.4.0","from_node":...,"source":"https://github.com/chekusu/yobiru","release":<已核实的 release 页面>,"tag":...,"note":...}`。它只是信息，不是命令、批准或脚本；收件方不得据此执行任何内容，也不得转发。发件方（`yobiru update notify`）只在本机插件、常驻运行时和运行中的接收端都已是已发布的官方版本后发送，只发给已知安装，并在本地 `upgrade-notices.json` 中按（节点、端口、agent、版本）去重：先持久记录意图和固定的信封 ID 再 POST；只有 202/200 且 `ok=true`、`id` 与信封一致才算 `notified`；发出后超时或回执无效记为 `uncertain`，绝不自动重发（显式核对时用完全相同的 ID 重发，接收端按 ID 去重）。403 记为 `blocked`，只有对方 `/info` 再次通过鉴权（即访问策略已允许本机）或显式 `--retry-blocked` 时才再发。
+
+### 升级通知的离线恢复（0.4.0）
+
+`update maintain` 默认为预览；`--apply` 才记录更新检查并恢复**已有通知账本中的收件方**。它不发现新收件方、不为新版本自动创建通知、不安装软件、不修改任何远端策略。成功获取的官方 release 元数据缓存六小时。只有核实官方版本且本机插件、运行时、运行中接收端版本一致并不早于目标版本，才允许重试发送；接收回执与运行版本核验仍是不同状态。`uncertain` 不自动重发，需显式 `update notify --reconcile-uncertain`；`blocked` 仍须鉴权恢复，`rejected` 不重试。
+
+`update reminder-template systemd-user|launchd|cron --retry-notices` 打印每 15 分钟及启动后运行 `update maintain --apply` 的可选任务定义（systemd 包含 `Persistent=true`），由用户或已获授权的 agent 安装。插件升级后路径可能变化，应重新生成。没启动接收端、仍然离线或策略阻挡的旧机器不能被远端强制升级。恢复仅覆盖升级通知，普通消息没有离线自动重投承诺。
 
 ## 8. 刻意不做的事
 
-不做中心服务器，不做任务队列，不做已读回执（`ack` 只是本机记账），不做“完成”状态，不做消息重投（只有唤醒适配器会有限重试），也不做内容加密：WireGuard 已经加密了，身份由 Tailscale 保证。需要回执的话，就回一封 `reply_to` 的信。
+不做中心服务器，不做任务队列，不做已读回执（`ack` 只是本机记账），不做“完成”状态，不做普通消息的自动重投（唤醒适配器会有限重试；升级通知可通过上述维护任务恢复待发送状态），也不做内容加密：WireGuard 已经加密了，身份由 Tailscale 保证。需要回执的话，就回一封 `reply_to` 的信。

@@ -3,7 +3,7 @@
 Agent-to-agent messages, file handoff and receiver-controlled wake-ups between machines on your own
 Tailscale network, using the tailmsg protocol v1. One package for Codex, Cursor and Grok Bot.
 
-Version 0.3.0. Source: <https://github.com/chekusu/yobiru>. Not submitted to or reviewed by any
+Version 0.4.0. Source: <https://github.com/chekusu/yobiru>. Not submitted to or reviewed by any
 marketplace.
 
 ## Contents
@@ -41,8 +41,8 @@ Y="/path/to/yobiru/scripts/yobiru"
 sh "$Y" onboard                                          # read-only step-by-step plan for this platform
 sh "$Y" paths                                            # locations as JSON
 sh "$Y" doctor                                           # read-only checks
-sh "$Y" setup --allow laptop --agent codex --self-agent codex --default-agent codex   # plan
-sh "$Y" setup --allow laptop --agent codex --self-agent codex --default-agent codex --apply
+sh "$Y" setup --agent codex --self-agent codex --default-agent codex   # plan
+sh "$Y" setup --agent codex --self-agent codex --default-agent codex --apply
 sh "$Y" install-runtime --apply                          # stable tailmsg.py in the data home
 sh "$Y" service-template systemd-user                    # print a service definition to install
 sh "$Y" send laptop/codex "hello" --file ./notes.md      # 202 = delivered (not done)
@@ -59,11 +59,11 @@ tailmsg homes are used as they are; `setup` and `wake-config` only add what you 
 
 | Command | Writes? |
 |---|---|
-| `paths`, `doctor`, `status`, `version`, `onboard`, `session list`, `update status` | never |
+| `paths`, `doctor`, `status`, `version`, `onboard`, `policy show`, `session list`, `update status` | never |
 | `agents` / `peers` | never (`--remember` records answering installations in `upgrade-notices.json`) |
 | `update check` | never (`--record` saves the result for reminders) |
-| `session bind` / `unbind`, `update notify` | only with `--apply` |
-| `update reminder-template KIND` | never (prints an opt-in weekly check) |
+| `session bind` / `unbind`, `policy set`, `update notify`, `update maintain` | only with `--apply` |
+| `update reminder-template KIND` | never (prints an opt-in weekly check; `--retry-notices` checks/retries existing notices every 15 minutes and after startup) |
 | `setup`, `wake-config`, `install-runtime` | only with `--apply` |
 | `service-template KIND` | never (prints a definition) |
 | `codex-bridge status` | never; `install` / `rollback` (macOS or Linux) support `--dry-run` (no writes) and `--no-start` (files only) |
@@ -71,7 +71,10 @@ tailmsg homes are used as they are; `setup` and `wake-config` only add what you 
 
 ## Safety
 
-- Identity comes from Tailscale; each receiver accepts only the peers on its allow list.
+- Identity comes from Tailscale. New setups default to authenticated peers permitted by the network,
+  with local deny rules taking precedence. Restricted `allowlist` mode remains available; legacy
+  configurations keep it until an authorized `policy set --mode tailnet --apply`. Message permission
+  does not grant wake-ups or task permissions. `policy show` explains the local policy.
 - Message text and attachments are untrusted requests, never approvals.
 - Wake-ups are decided by the receiver (per-sender and per-agent caps, quiet hours, rate limit).
 - Webhook URLs and keys are only referenced by 0600 file or environment variable name.

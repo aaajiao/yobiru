@@ -293,6 +293,36 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(1, self.bridge.dispatch_due()["skipped"])
         self.assertEqual([], self.client.calls)
 
+    def test_tailnet_policy_accepts_new_peer_without_allow_rule(self):
+        self.local = {"access_policy": "tailnet", "default_agent": "codex", "allow": []}
+        self.write_local()
+        self.assertEqual("queued", self.bridge.ingest(self.message())["status"])
+        self.assertEqual(1, self.bridge.dispatch_due()["enqueued"])
+
+    def test_deny_policy_is_rechecked_before_dispatch(self):
+        for rule in ("grok-bot", "grok-bot.tailnet.ts.net", "user:test@example.invalid"):
+            with self.subTest(rule=rule):
+                self.local = {"access_policy": "tailnet", "default_agent": "codex"}
+                self.write_local()
+                mid = "message_deny_%d" % len(self.bridge.status())
+                self.bridge.ingest(self.message(mid))
+                self.local["deny"] = [rule]
+                self.write_local()
+                self.assertEqual(1, self.bridge.dispatch_due()["skipped"])
+                self.assertEqual([], self.client.calls)
+
+    def test_invalid_policy_and_unknown_identity_fail_closed_in_tailnet_mode(self):
+        path = self.message()
+        self.local = {"access_policy": "tailnet", "deny": None}
+        self.write_local()
+        with self.assertRaisesRegex(Rejected, "invalid_access_policy"):
+            self.bridge.ingest(path)
+        self.local = {"access_policy": "tailnet"}
+        self.write_local()
+        self.rewrite(path, lambda r: r["received"]["peer"].update({"tags": "malformed"}))
+        with self.assertRaisesRegex(Rejected, "missing_verified_peer"):
+            self.bridge.ingest(path)
+
     def test_single_dispatch_process_lock(self):
         import fcntl
         self.bridge.ingest(self.message())

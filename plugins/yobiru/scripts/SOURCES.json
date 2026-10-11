@@ -4,7 +4,7 @@
   "files": {
     "scripts/tailmsg.py": {
       "source": "tailmsg.py",
-      "sha256": "5db16e291baf3408fe64ca53723306ce215e37bcd8b5992409183296dac17695"
+      "sha256": "d16fa13d0c156fbcf0704b3104eb5a95627f21ee38b011697ab21c29fce7bb43"
     },
     "scripts/codex_bridge/CODEX_DISPATCHER.md": {
       "source": "CODEX_DISPATCHER.md",
@@ -12,7 +12,7 @@
     },
     "scripts/codex_bridge/codex_bridge.py": {
       "source": "codex_bridge.py",
-      "sha256": "634c4eb1213548b46f775262cd76614d499ad94800f686e1eb8a365b1116d31a"
+      "sha256": "73f4938f028201f458d0de90020298e0f611d1f7171127f452e484e4c1d256ed"
     },
     "scripts/codex_bridge/codex_queue_client.py": {
       "source": "codex_queue_client.py",

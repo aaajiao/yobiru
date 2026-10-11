@@ -27,7 +27,7 @@ Windows では `py -3 "C:\path\to\yobiru\scripts\yobiru.py" onboard`。既定以
 | 受信サービス | 表示された定義をインストールして起動 | — |
 | 起動方法とセッション | 選ばれたアダプターと紐付けを設定 | 各エージェントの既存セッションを指定 |
 
-Yobiru は Tailscale の ACL、shields-up、DNS を変更せず、すべての相手を信頼することもありません。`help`、`doctor`、`status`、`onboard`、`agents`、`update check` は読み取り専用です。
+Yobiru は Tailscale の ACL、shields-up、DNS を変更しません。新規インストールでは、Tailscale が認証し、ネットワークポリシーが接続を許可し、ローカル拒否ルールに一致しない相手と通信できます。通信の許可はタスク実行や起動の許可にはなりません。`help`、`doctor`、`status`、`onboard`、`agents`、`update check` は読み取り専用です。
 
 ## 1. Tailscale
 
@@ -40,11 +40,13 @@ Yobiru は Tailscale の ACL、shields-up、DNS を変更せず、すべての�
 ## 2. 相手とエージェント名
 
 ```sh
-yobiru setup --allow PEER --agent NAME --self-agent NAME --default-agent NAME          # 計画
-yobiru setup --allow PEER --agent NAME --self-agent NAME --default-agent NAME --apply
+yobiru setup --agent NAME --self-agent NAME --default-agent NAME          # 計画
+yobiru setup --agent NAME --self-agent NAME --default-agent NAME --apply
 ```
 
-`PEER` は Tailscale のホスト名、`tag:NAME`、`user:LOGIN` です。既存の項目は維持され、ID の変更には `--replace FIELD` が必要で、書き込みのたびに config.json をバックアップします。
+新規設定は `tailnet` モードで、相手ごとの許可リストは不要です。新規インストールで相手を限定するには `--allow PEER`（ホスト名、FQDN、`tag:NAME`、`user:LOGIN`）を追加します。`--send-only` は空の許可リストを使います。既存のアクセスポリシーは維持され、ID の変更には `--replace FIELD` が必要です。変更前の設定はバックアップされます。
+
+既存インストールでは `yobiru policy show` で実際のモードを確認します。従来の許可リストを移行するには、`yobiru policy set --mode tailnet` をプレビューし、所有者の許可があれば `--apply` を付けます。`--deny RULE` は拒否リスト全体を置き換え、複数のルールは繰り返して指定します。どちらのモードでも拒否が優先されます。0.4 の受信プロセスとブリッジは次の認可確認時に新しいポリシーを読むので、ポリシーだけの変更に再起動は不要です。最初のランタイム更新には再起動が必要です。[0.4 移行ガイド](UPGRADING-0.4.md)を参照してください。
 
 ## 3. 常駐受信プロセス
 
@@ -74,3 +76,5 @@ yobiru send PEER/AGENT "hello"
 プラグインはインストールした方法で更新します：Codex／Cursor／Grok Bot のプラグインページやマーケットプレイス、新しい公式リリースアーカイブ（`SHA256SUMS` で検証し、データディレクトリの上ではなく新しいフォルダーに展開）、または公式タグのチェックアウト。その後は新しいパッケージの `scripts/yobiru` を使います（`yobiru version` で新バージョンを確認）。データディレクトリには触れません。
 
 `yobiru-upgrade` スキルと `yobiru update --help` を参照してください。プラグインの更新は常駐ランタイムを変えません（`install-runtime --upgrade --apply` の後に受信プロセスを再起動）。このマシンが公開済みリリースで動くようになったら、`yobiru update notify` が他の既知のインストールに知らせます。
+
+既存インストールは元の許可リストを維持し、ポリシー移行とソフトウェア更新は別です。`update maintain --apply` は更新確認を記録し、既存のアップグレード通知だけを再試行します。15 分ごとと起動後に実行するには、`update reminder-template systemd-user --retry-notices`（または `launchd`／`cron`）を表示し、手順どおりに任意ジョブをインストールします。プラグインのパス変更後は再生成します。ソフトウェアのインストールやポリシー変更は行いません。[0.4 移行ガイド](UPGRADING-0.4.md)を参照してください。

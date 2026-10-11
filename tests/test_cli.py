@@ -159,16 +159,21 @@ class SetupTests(Base):
         r = self.yobiru(*(args + ["--apply", "--json"]))
         res = json.loads(r.stdout)
         self.assertTrue(res["written"])
-        self.assertEqual({"port": 7766, "allow": ["laptop"], "agents": {"codex": {}}, "self_agent": "codex",
+        self.assertEqual({"port": 7766, "access_policy": "allowlist", "allow": ["laptop"], "deny": [],
+                          "agents": {"codex": {}}, "self_agent": "codex",
                           "default_agent": "codex"}, self.config())
         self.assertEqual(0o600, stat.S_IMODE((self.home / "config.json").stat().st_mode))
         self.assertEqual(["config.json"], sorted(p.name for p in self.home.iterdir()))
 
-    def test_fresh_setup_requires_an_explicit_choice(self):
+    def test_fresh_setup_defaults_to_tailnet_and_still_requires_apply(self):
         r = self.yobiru("setup", "--agent", "codex")
-        self.assertEqual(2, r.returncode)
-        self.assertIn("--allow", r.stderr)
+        self.assertEqual(0, r.returncode, r.stderr)
+        self.assertIn("tailnet", r.stdout)
         self.assertFalse(self.home.exists())
+        r = self.yobiru("setup", "--agent", "codex", "--apply")
+        self.assertEqual(0, r.returncode, r.stderr)
+        self.assertEqual("tailnet", self.config()["access_policy"])
+        self.assertEqual([], self.config()["deny"])
 
     def test_existing_config_keeps_agents_adapters_and_unknown_keys(self):
         original = {"port": 7766, "allow": ["laptop"], "self_agent": "grok", "default_agent": "grok",

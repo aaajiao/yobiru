@@ -56,7 +56,7 @@ You use the agent interface you already like
 Files: recipient fetches from the sender, then checks size + SHA-256.
 ```
 
-受信プロセスは自分の Tailscale アドレスで待ち受けます。通常のポートは `tcp:7766` です。`tailscale whois` で接続元マシンの身元を確認し、ローカルの許可リストを照合してからメッセージを保存します。添付ファイルは送信元に一時保存され、宛先マシンだけが取得できる期限付きリンクで提供されます。リンクの標準有効期限は 24 時間です。
+受信プロセスは自分の Tailscale アドレスで待ち受けます。通常のポートは `tcp:7766` です。`tailscale whois` で接続元マシンの身元を確認し、ローカルのアクセスポリシーを照合してからメッセージを保存します。添付ファイルは送信元に一時保存され、宛先マシンだけが取得できる期限付きリンクで提供されます。リンクの標準有効期限は 24 時間です。
 
 Yobiru は既存の **tailmsg protocol v1** を使用します。MCP サーバーは同梱せず、Yobiru アカウントも不要です。ネットワークとマシンの身元確認は Tailscale が担い、暗号化された通信は直接、またはリレー経由で運ばれます。[Tailscale の接続方式](https://tailscale.com/docs/reference/connection-types)を参照してください。
 
@@ -130,29 +130,41 @@ sh "$Y" onboard
 | macOS | Tailscale アプリ（Mac App Store または[ダウンロード](https://tailscale.com/download)）を入れ、システム拡張／VPN の確認を承認し、メニューバーからサインインします（[ドキュメント](https://tailscale.com/docs/install/mac)）。CLI が PATH にない場合：`setup --tailscale-cmd /Applications/Tailscale.app/Contents/MacOS/Tailscale`。 |
 | Windows | 管理者権限でインストーラーを実行し、通知領域のアイコンからサインインします（[ドキュメント](https://tailscale.com/docs/install/windows)）。CLI が PATH にない場合：`setup --tailscale-cmd "C:\Program Files\Tailscale\tailscale.exe"`。Codex ブリッジは macOS/Linux のみです。 |
 
-ユーザーがセットアップを依頼したら、エージェントはホストの通常の権限でこれらの手順を再確認なしに実行できます。Tailscale アカウント（ログイン URL はユーザー自身が開き、認証キーはチャットに入れません）、許可する相手、エージェント名、どの既存セッションがどのエージェントに属するかは、ユーザーだけが決めます。Yobiru は ACL や shields-up を変更しません。詳細は[セットアップガイド](docs/SETUP.ja.md)。
+ユーザーがセットアップを依頼したら、エージェントはホストの通常の権限でこれらの手順を再確認なしに実行できます。Tailscale アカウント（ログイン URL はユーザー自身が開き、認証キーはチャットに入れません）、アクセスポリシー、エージェント名、どの既存セッションがどのエージェントに属するかは、ユーザーだけが決めます。Yobiru は ACL や shields-up を変更しません。詳細は[セットアップガイド](docs/SETUP.ja.md)。
 
 ## クイックスタート：二つのエージェントをつなぐ
 
 例では架空の Tailscale ホスト名 `agent-laptop` と `research-node` を使用します。**自分で選んだ接続先**に置き換えてください。各マシンで前述の方法に従って `Y` を設定します。プラグインのインストールだけでは、接続先の設定、サービスの起動、メッセージ送信は行われません。
 
-### 1. 送信を許可する相手を決める
+### 1. エージェントに名前を付ける
 
-`agent-laptop` で、`codex` エージェントが `research-node` から受信できるようにします。
-
-```sh
-sh "$Y" setup --allow research-node --agent codex --self-agent codex --default-agent codex
-sh "$Y" setup --allow research-node --agent codex --self-agent codex --default-agent codex --apply
-```
-
-`research-node` で、`grok` エージェントが `agent-laptop` から受信できるようにします。
+`agent-laptop` で `codex` エージェントを設定します。
 
 ```sh
-sh "$Y" setup --allow agent-laptop --agent grok --self-agent grok --default-agent grok
-sh "$Y" setup --allow agent-laptop --agent grok --self-agent grok --default-agent grok --apply
+sh "$Y" setup --agent codex --self-agent codex --default-agent codex
+sh "$Y" setup --agent codex --self-agent codex --default-agent codex --apply
 ```
 
-最初のコマンドは変更をプレビューし、二つ目が適用します。相手とエージェント名が意図どおりか確認してください。Setup は既存の項目を保持し、設定変更時にバックアップを作成します。既存の識別設定や起動アダプターを置き換える場合は、明示的な置換オプションが必要です。
+`research-node` で `grok` エージェントを設定します。
+
+```sh
+sh "$Y" setup --agent grok --self-agent grok --default-agent grok
+sh "$Y" setup --agent grok --self-agent grok --default-agent grok --apply
+```
+
+最初のコマンドは変更をプレビューし、二つ目が適用します。アクセスポリシーとエージェント名が意図どおりか確認してください。Setup は既存の項目を保持し、設定変更時にバックアップを作成します。既存の識別設定や起動アダプターを置き換える場合は、明示的な置換オプションが必要です。
+
+新規インストールの既定は `tailnet` モードです。Tailscale が認証し、ネットワークポリシーが接続を許す相手は、ローカルの `deny` ルールに一致しない限り送信できます。マシンごとの許可リストは不要です。新規設定で相手を限定するには `--allow PEER` を付けて `allowlist` モードを選びます。`--send-only` は空の許可リストを使います。既存インストールは従来の許可リストを含め、元のポリシーを維持します。
+
+既存インストールを新しい既定に移行するには、そのマシンで確認して適用します：
+
+```sh
+sh "$Y" policy show
+sh "$Y" policy set --mode tailnet
+sh "$Y" policy set --mode tailnet --apply
+```
+
+変更前の設定はバックアップされます。どちらのモードも `deny` が優先され、ホスト名、FQDN、`tag:NAME`、`user:LOGIN` を指定できます。`--allow` または `--deny` を指定すると、そのリスト全体を置き換えます。省略したリストは維持されます。拒否ルールの例とオフライン端末については [0.4 移行ガイド](docs/UPGRADING-0.4.md)を参照してください。通信の許可は、起動、タスク実行、自動返信の許可にはなりません。
 
 ### 2. 両方のマシンで受信プロセスを動かす
 
@@ -233,7 +245,7 @@ Yobiru はタスクの厳密な一回実行や、メッセージの自動再配�
 sh "$Y" agents --online          # `peers` は同じコマンド。--online なしではオフラインのマシンも表示
 ```
 
-マシンごとに、Tailscale のオンライン状態、受信プロセスの応答、このマシンから送信できるか、Yobiru のバージョン（プロトコル版ではない）、そしてエージェントごとの**常駐セッション**を示します：出所付きのネイティブ名（`native codex session name, read <時刻>`、cached/stale）、ユーザーが確認したタイトルやローカルの別名（それぞれ明記）、そして常に正確なセッション ID。忙しい／待機中とは決して主張しません。受信側は新しい `GET /info` に許可リストのマシンにだけ答え（403 はポリシーで、ネットワーク障害ではありません）、パス、アダプター設定、トークン、メッセージのプレビュー、セッション一覧は返しません。旧版の受信側は 404 を返し、`legacy`（バージョンとセッションは不明）として表示され、オフライン扱いにはなりません。
+マシンごとに、Tailscale のオンライン状態、受信プロセスの応答、このマシンから送信できるか、Yobiru のバージョン（プロトコル版ではない）、そしてエージェントごとの**常駐セッション**を示します：出所付きのネイティブ名（`native codex session name, read <時刻>`、cached/stale）、ユーザーが確認したタイトルやローカルの別名（それぞれ明記）、そして常に正確なセッション ID。忙しい／待機中とは決して主張しません。受信側は `GET /info` に、認証済みでアクセスポリシーが許可するマシンにだけ答え（403 はポリシーで、ネットワーク障害ではありません）、パス、アダプター設定、トークン、メッセージのプレビュー、セッション一覧は返しません。旧版の受信側は 404 を返し、`legacy`（バージョンとセッションは不明）として表示され、オフライン扱いにはなりません。
 
 エージェントを担当するセッションは正確な ID で指定します。名前だけでセッションを選んだり改名したりはしません：
 
@@ -247,7 +259,7 @@ Codex ブリッジがある場合、固定の窓口セッション UUID は自�
 ## プライバシーと信頼の境界
 
 - **データは自分のマシンに保存されます。** 受信・送信記録と一時保存した添付ファイルはデータディレクトリに置かれます。優先順位は `--home DIR`、`$TAILMSG_HOME`、`~/.tailmsg` です。Yobiru は集中ストレージを運営しませんが、利用するエージェントの提供元が、エージェントに渡された内容を処理する場合はあります。
-- **ネットワークの境界は Tailscale です。** 受信側は Tailscale の身元情報とローカルの許可リストを確認します。通信の暗号化は Tailscale が提供し、Yobiru は保存時の暗号化を追加しません。ホストとファイルシステムを保護してください。
+- **ネットワークの境界は Tailscale です。** 受信側は Tailscale の身元情報とローカルのアクセスポリシー（新規は既定で `tailnet`、任意で `allowlist`、拒否ルール優先）を確認します。Tailscale の ACL／grants は引き続き適用されます。通信の暗号化は Tailscale が提供し、Yobiru は保存時の暗号化を追加しません。ホストとファイルシステムを保護してください。
 - **エージェント名はルーティング用であり、隔離ではありません。** `from_agent` は送信側が指定します。同じマシンやデータディレクトリを共有するエージェントは、独立したセキュリティ主体ではありません。必要に応じてマシンを分けるか、適切なホスト側の隔離を利用してください。
 - **メッセージは依頼であり、許可ではありません。** 受信した文章やファイルによって、コマンド実行、購入、設定変更、無関係な情報の開示が許可されることはありません。エージェントはユーザーの既存の指示と権限の範囲で行動します。
 - **添付ファイルは慎重に扱います。** サイズと SHA-256 の検証は、内容を安全に実行できることを意味しません。リンクが期限切れになっても、取得済みのコピーは回収されません。
@@ -275,6 +287,16 @@ sh "$Y" update notify --channel preview  # 予行。確認後に --apply
 ```
 
 `notify` は、このマシンのプラグイン、ランタイム、稼働中の受信プロセスがすべて公開済みの公式リリースになった後にだけ、バージョン付きの通知を既知のインストール（発見された受信側、`--peer`、`agents --remember` で記憶したもの、未完了の通知）に送ります。マシンとエージェントごとに永続的な状態を持ちます：`notified`（202 かつメッセージ ID の受領確認あり。アップグレード済みの証明ではない）、`verified`（後の発見でそのバージョンの稼働を確認。ソフトウェアのみ）、`pending`（オフライン。次回再試行）、`blocked`（403。相手の `/info` でアクセス回復が確認できた場合か `--retry-blocked` 指定時のみ再送）、`rejected`、`uncertain`（自動再送しない。`--reconcile-uncertain` は同一のメッセージ ID で再送）。通知は `wake: now` を要求しますが、最終的には各受信側の起動ポリシーが決めます。受け取った通知はエージェントと所有者への情報であり、命令ではありません。任意のリマインダー：`update reminder-template systemd-user|launchd|cron` が毎週 `update check --record` を実行する定義を表示します。
+
+オフラインのインストールには、先に `update notify --peer HOST/AGENT --apply` で通知を許可します。受信側に届くまで pending として保持します。`update maintain --apply` は更新確認を記録し、**すでにキューにあるアップグレード通知だけ**を再試行・検証します。取得済みの公式リリース情報は 6 時間キャッシュします。新しい宛先の追加、ソフトウェアのインストール、遠隔ポリシー変更は行いません。15 分ごとと起動後に実行するには、任意の定期ジョブを生成・インストールします：
+
+```sh
+sh "$Y" update maintain                         # プレビュー。書き込み・送信なし
+sh "$Y" update reminder-template systemd-user --retry-notices
+# 環境に応じて systemd-user を launchd または cron に変更
+```
+
+テンプレートは手順を表示するだけで、自動インストールはしません。プラグイン更新でパスが変わる場合があるため再生成してください。`uncertain` の通知は引き続き明示的な照合が必要です。電源オフや受信プロセス停止中の端末は復帰するまで受信・更新できません。旧ポリシーで拒否される端末は所有者によるローカル移行が必要です。この復旧はアップグレード通知専用で、通常メッセージのオフライン再送は保証しません。[0.4 移行と確認](docs/UPGRADING-0.4.md)を参照してください。
 
 Codex プラグインとマーケットプレイスの削除：
 

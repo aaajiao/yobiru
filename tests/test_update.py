@@ -415,5 +415,231 @@ class NotifyTests(unittest.TestCase):
         self.assertEqual("pending", self.entry("bravo")["status"])
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), "uses several loopback addresses")
+class MaintenanceTests(unittest.TestCase):
+    setUp = NotifyTests.setUp
+    write_status = NotifyTests.write_status
+    notify = NotifyTests.notify
+    state = NotifyTests.state
+    entry = NotifyTests.entry
+
+    def maintain(self, *args):
+        out = io.StringIO()
+        with mock.patch.object(Y, "fetch_releases", lambda t: Y.parse_releases(self.releases)), \
+                contextlib.redirect_stdout(out):
+            code = Y.main(["--home", str(self.home), "update", "maintain", "--json", "--channel", "preview",
+                           "--timeout", "1"] + list(args))
+        return code, json.loads(out.getvalue())
+
+    def queue_offline(self):
+        self.peers["bravo"]["online"] = False
+        self.write_status()
+        self.notify("--apply", "--no-discover", "--peer", "bravo/codex")
+        self.assertEqual("pending", self.entry("bravo")["status"])
+
+    def test_dry_run_does_not_write_or_send(self):
+        self.queue_offline()
+        before = {p.name: p.read_bytes() for p in self.home.iterdir() if p.is_file()}
+        code, res = self.maintain()
+        self.assertEqual(0, code, res)
+        self.assertEqual(before, {p.name: p.read_bytes() for p in self.home.iterdir() if p.is_file()})
+        self.assertEqual([], self.bravo.posts)
+
+    def test_restart_and_online_recovery_only_retries_saved_recipients(self):
+        self.queue_offline()
+        code, _ = self.maintain("--apply")
+        self.assertEqual(0, code)
+        self.peers["bravo"]["online"] = True
+        self.write_status()
+        stranger = FakeReceiver("127.0.0.3", self.port, "charlie.example.ts.net")
+        self.addCleanup(stranger.close)
+        # Simulate another invocation: nothing needed from the previous process's memory.
+        code, res = self.maintain("--apply")
+        self.assertEqual(0, code, res)
+        self.assertEqual("notified", self.entry("bravo")["status"])
+        self.assertEqual(1, len(self.bravo.posts))
+        self.assertEqual([], stranger.posts)
+        self.maintain("--apply")
+        self.assertEqual(1, len(self.bravo.posts))
+        self.bravo.version = VERSION
+        self.maintain("--apply")
+        self.assertEqual("verified", self.entry("bravo")["status"])
+
+    def test_new_remote_session_is_not_automatically_enrolled(self):
+        self.queue_offline()
+        self.peers["bravo"]["online"] = True
+        self.write_status()
+        self.bravo.agents.append({"agent": "new-agent", "default": False, "session": {
+            "runtime": "codex", "id": UUID, "id_source": "binding", "native_name_status": "unsupported"}})
+        self.maintain("--apply")
+        self.assertEqual(["codex"], [p.get("agent") for p in self.bravo.posts])
+        self.assertEqual(1, len(self.state()["notices"]))
+
+    def test_uncertain_never_retries_and_stays_visible(self):
+        self.bravo.msg = "noid"
+        self.notify("--apply")
+        self.bravo.msg = "ok"
+        code, res = self.maintain("--apply")
+        self.assertEqual(0, code, res)
+        self.assertEqual("uncertain", self.entry("bravo")["status"])
+        self.assertEqual(1, len(self.bravo.posts))
+        self.assertEqual("hold", res["plans"][0]["plan"][0]["action"])
+
+    def test_known_unsent_retry_reuses_stored_envelope(self):
+        with mock.patch.object(Y, "post_notice", return_value=("not_sent", "connection refused", None)):
+            self.notify("--apply")
+        envelope = self.entry("bravo")["envelope"]
+        self.maintain("--apply")
+        self.assertEqual(envelope, self.bravo.posts[0])
+
+    def test_blocked_peer_recovers_when_access_policy_allows(self):
+        self.bravo.info = "403"
+        self.notify("--apply")
+        self.maintain("--apply")
+        self.assertEqual([], self.bravo.posts)
+        self.bravo.info = True
+        self.maintain("--apply")
+        self.assertEqual(1, len(self.bravo.posts))
+
+    def test_newer_local_version_can_finish_an_old_queued_notice(self):
+        self.queue_offline()
+        old = VERSION
+        newer = "9.0.0"
+        self.me.version = newer
+        (self.home / "tailmsg.py").write_text('PRODUCT_VERSION = "9.0.0"\n')
+        self.peers["bravo"]["online"] = True
+        self.write_status()
+        self.releases.append(release("v" + newer))
+        with mock.patch.object(Y, "plugin_version", return_value=newer):
+            code, res = self.maintain("--apply")
+        self.assertEqual(0, code, res)
+        self.assertEqual(old, json.loads(self.bravo.posts[0]["text"])["version"])
+
+    def test_no_saved_notices_does_not_announce_to_any_peer(self):
+        code, res = self.maintain("--apply")
+        self.assertEqual(0, code, res)
+        self.assertEqual([], self.bravo.posts)
+        self.assertFalse((self.home / "upgrade-notices.json").exists())
+        self.assertTrue((self.home / "update-check.json").exists())
+
+    def test_cache_limits_network_and_invalid_or_stale_cache_is_refreshed(self):
+        fetch = mock.Mock(return_value=Y.parse_releases(self.releases))
+        first = Y.maintenance_releases(self.home, True, 1, fetch)
+        second = Y.maintenance_releases(self.home, True, 1, fetch)
+        self.assertFalse(first[2])
+        self.assertTrue(second[2])
+        self.assertEqual(1, fetch.call_count)
+        path = self.home / "maintenance-releases.json"
+        cache = json.loads(path.read_text())
+        cache["checked_at"] = "2020-01-01T00:00:00Z"
+        path.write_text(json.dumps(cache))
+        self.assertFalse(Y.maintenance_releases(self.home, True, 1, fetch)[2])
+        self.assertEqual(2, fetch.call_count)
+
+    def test_parallel_maintenance_is_refused(self):
+        with Y.StateLock(self.home / ".upgrade-maintenance.lock"):
+            code, res = self.maintain("--apply")
+        self.assertEqual(1, code)
+        self.assertIn("another yobiru process", res["errors"][0])
+        self.assertEqual([], self.bravo.posts)
+
+    def test_notice_removed_after_plan_is_not_recreated_or_sent(self):
+        self.queue_offline()
+        f = Y.gather_versions(self.home, "--home")
+        nodes, _ = Y.tailnet_nodes(f["cfg"]["tailscale_cmd"])
+        items, keys = Y.maintenance_candidates(self.state(), nodes, VERSION)
+        for c in items:
+            c.update(online=True, ip="127.0.0.2")
+        probes = [Y.probe_info("127.0.0.2", self.port, 1, expect_node="bravo.example.ts.net")]
+        state = self.state()
+        state["notices"] = {}       # another local operation cancels it between plan and apply
+        Y.write_json_atomic(self.home / "upgrade-notices.json", state)
+        Y.apply_notices(self.home, "alpha.example.ts.net", VERSION, items, probes, False, notice_keys=keys)
+        self.assertEqual({}, self.state()["notices"])
+        self.assertEqual([], self.bravo.posts)
+
+    def test_unknown_status_and_missing_uncertain_envelope_never_create_a_send(self):
+        self.notify("--apply")
+        for status in ("corrupt", "uncertain"):
+            state = self.state()
+            entry = next(iter(state["notices"].values()))
+            entry["status"] = status
+            entry.pop("envelope", None)
+            Y.write_json_atomic(self.home / "upgrade-notices.json", state)
+            self.notify("--apply", "--reconcile-uncertain")
+        self.assertEqual(1, len(self.bravo.posts))
+        self.assertEqual("uncertain", self.entry("bravo")["status"])
+        self.assertIn("stored envelope", self.entry("bravo")["last_error"])
+
+    def test_existing_missing_status_is_not_treated_as_new_authorization(self):
+        self.notify("--apply")
+        state = self.state()
+        entry = next(iter(state["notices"].values()))
+        entry.pop("status")
+        entry.pop("envelope")
+        Y.write_json_atomic(self.home / "upgrade-notices.json", state)
+        self.maintain("--apply")
+        self.assertEqual(1, len(self.bravo.posts))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = Y.main(["--home", str(self.home), "update", "status", "--json"])
+        self.assertEqual(0, code)
+        self.assertEqual({"invalid": 1}, json.loads(out.getvalue())["notices"])
+
+    def test_pending_envelope_cannot_switch_agents_or_be_regenerated(self):
+        with mock.patch.object(Y, "post_notice", return_value=("not_sent", "connection refused", None)):
+            self.notify("--apply")
+        state = self.state()
+        entry = next(iter(state["notices"].values()))
+        entry["envelope"]["agent"] = "new-agent"
+        Y.write_json_atomic(self.home / "upgrade-notices.json", state)
+        self.maintain("--apply")
+        self.assertEqual([], self.bravo.posts)
+        self.assertEqual("uncertain", self.entry("bravo")["status"])
+        entry["status"] = "pending"
+        entry.pop("envelope")
+        Y.write_json_atomic(self.home / "upgrade-notices.json", state)
+        self.maintain("--apply")
+        self.assertEqual([], self.bravo.posts)
+        self.assertEqual("uncertain", self.entry("bravo")["status"])
+
+    def test_record_changed_after_plan_is_held_under_lock(self):
+        self.queue_offline()
+        f = Y.gather_versions(self.home, "--home")
+        nodes, _ = Y.tailnet_nodes(f["cfg"]["tailscale_cmd"])
+        items, keys = Y.maintenance_candidates(self.state(), nodes, VERSION)
+        for c in items:
+            c.update(online=True, ip="127.0.0.2")
+        probes = [Y.probe_info("127.0.0.2", self.port, 1, expect_node="bravo.example.ts.net")]
+        state = self.state()
+        entry = next(iter(state["notices"].values()))
+        entry["agent"] = "new-agent"
+        Y.write_json_atomic(self.home / "upgrade-notices.json", state)
+        Y.apply_notices(self.home, "alpha.example.ts.net", VERSION, items, probes, False, notice_keys=keys)
+        self.assertEqual([], self.bravo.posts)
+
+    def test_templates_opt_in_retry_and_startup_without_installing(self):
+        import plistlib
+        for kind in ("systemd-user", "launchd", "cron"):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                Y.main(["--home", str(self.home), "update", "reminder-template", kind, "--retry-notices"])
+            text = out.getvalue()
+            if kind == "launchd":
+                p = plistlib.loads(text.encode())
+                self.assertEqual(900, p["StartInterval"])
+                self.assertTrue(p["RunAtLoad"])
+                self.assertIn("maintain", p["ProgramArguments"])
+                self.assertIn("--apply", p["ProgramArguments"])
+            elif kind == "systemd-user":
+                self.assertIn("OnCalendar=*:0/15", text)
+                self.assertIn("OnBootSec=2min", text)
+                self.assertIn("Persistent=true", text)
+            else:
+                self.assertIn("*/15 * * * *", text)
+                self.assertIn("@reboot", text)
+        self.assertFalse((self.home / "upgrade-notices.json").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

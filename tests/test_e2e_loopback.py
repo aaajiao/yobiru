@@ -88,6 +88,8 @@ class LoopbackWorkflowTests(unittest.TestCase):
             if name == "alpha":
                 cfg.update(self_agent="grok", default_agent="grok", agents={"grok": {}})
             else:
+                # A fresh 0.4 receiver needs no per-peer allow rule. Alpha remains a legacy installation.
+                cfg.pop("allow")
                 cfg.update(self_agent="codex", default_agent="codex",
                            agents={"codex": {"wake_adapter": {"type": "exec", "argv": [str(adapters / "codex.sh")]}},
                                    "helper": {"wake_adapter": {"type": "exec", "argv": [str(adapters / "helper.sh")]}}},
@@ -230,6 +232,21 @@ class LoopbackWorkflowTests(unittest.TestCase):
         text = self.tm("alpha", "peers", "--peer", "bravo:%d" % self.port["bravo"]).stdout
         self.assertIn('alias "Helper desk"', text)
         self.assertIn("chat-helper-1", text)
+
+    def test_6_policy_migration_and_deny_apply_without_receiver_restart(self):
+        before = [p.pid for p in self.procs]
+        old = self.tm_json("alpha", "policy", "show", "--json")
+        self.assertTrue(old["legacy_allowlist"])
+        self.assertEqual("allowlist", old["policy"]["access_policy"])
+        self.tm_json("alpha", "policy", "set", "--mode", "tailnet", "--apply", "--json")
+        self.tm_json("bravo", "policy", "set", "--mode", "tailnet", "--deny", "alpha", "--apply", "--json")
+        out = self.tm("alpha", "send", "bravo:%d/codex" % self.port["bravo"], "blocked", "--wake", "none")
+        self.assertEqual(403, json.loads(out.stdout.splitlines()[-1])["status"])
+        self.tm_json("bravo", "policy", "set", "--mode", "tailnet", "--clear-deny", "--apply", "--json")
+        sent = self.tm_json("alpha", "send", "bravo:%d/codex" % self.port["bravo"], "allowed again", "--wake", "none")
+        self.assertEqual(202, sent["status"])
+        self.assertEqual(before, [p.pid for p in self.procs])
+        self.assertTrue(all(p.poll() is None for p in self.procs))
 
 
 if __name__ == "__main__":

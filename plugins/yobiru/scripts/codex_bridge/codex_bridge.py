@@ -14,6 +14,7 @@ Scans, dispatch and status never run that handler; it owns its own dedup and ret
 import argparse
 import datetime
 import fcntl
+import importlib.util
 import json
 import math
 import os
@@ -37,6 +38,7 @@ MIN_HANDLER_BUDGET = 1
 MAX_RECORD_BYTES = 1024 * 1024
 TOOL_SEND = "send_message_to_thread"
 TOOL_READ = "read_thread"
+_POLICY_CORE = None
 
 
 class Rejected(ValueError):
@@ -68,25 +70,28 @@ def _node(value):
     return value.lower().rstrip(".") if isinstance(value, str) else ""
 
 
-def _allowed(peer, rules):
-    node = _node(peer.get("node"))
-    host = _node(peer.get("host"))
-    tags = peer.get("tags", [])
-    tags = [_node(t) for t in tags] if isinstance(tags, list) else []
-    user = _node(peer.get("user"))
-    for rule in rules:
-        rule = _node(rule)
-        if not rule:
-            continue
-        if rule.startswith("tag:"):
-            if rule in tags:
-                return True
-        elif rule.startswith("user:"):
-            if user and rule[5:] == user:
-                return True
-        elif rule in (node, node.split(".")[0], host):
-            return True
-    return False
+def _access_decision(config, peer):
+    """Use the receiver's policy evaluator from source, plugin bundle or installed codex-local layout.
+
+    Load lazily so installer validation remains independent of an installed receiver. Policy data is
+    always read afresh by _record; only trusted local code definitions are cached here.
+    """
+    global _POLICY_CORE
+    if _POLICY_CORE is None:
+        here = Path(__file__).resolve().parent
+        source = next((p for p in (here / "tailmsg.py", here.parent / "tailmsg.py") if p.is_file()), None)
+        if source is None:
+            raise Rejected("invalid_access_policy")
+        try:
+            spec = importlib.util.spec_from_file_location("yobiru_bridge_policy_core", str(source))
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            if not callable(getattr(module, "access_decision", None)):
+                raise ValueError("missing policy evaluator")
+            _POLICY_CORE = module
+        except (OSError, ImportError, ValueError, SyntaxError):
+            raise Rejected("invalid_access_policy")
+    return _POLICY_CORE.access_decision(config, peer)
 
 
 def _timestamp(value):
@@ -232,9 +237,10 @@ class Bridge:
         if _node(env.get("from")) != _node(peer["node"]):
             raise Rejected("sender_mismatch")
         local = _read_json(self.tailmsg_home / "config.json")
-        allow = local.get("allow")
-        if not isinstance(allow, list) or not _allowed(peer, allow):
-            raise Rejected("peer_not_allowed")
+        allowed, policy_reason = _access_decision(local, peer)
+        if not allowed:
+            raise Rejected({"invalid_policy": "invalid_access_policy", "denied": "peer_denied",
+                            "unknown_peer": "missing_verified_peer"}.get(policy_reason, "peer_not_allowed"))
         requested_agent = env.get("agent")
         agent = received.get("agent", requested_agent or local.get("default_agent"))
         if agent != "codex" or requested_agent not in (None, "codex") or \
@@ -250,7 +256,7 @@ class Bridge:
         kind = env.get("kind", "text")
         if not isinstance(kind, str) or len(kind) > MAX_KIND_CHARS:
             raise Rejected("invalid_kind")
-        # Routing is decided only after identity, allow list, target agent and wake are verified.
+        # Routing is decided only after identity, current access policy, target agent and wake are verified.
         return absolute, mid, wake, received_at, bool(record.get("acked_at")), kind in self.excluded_kinds
 
     def ingest(self, path):

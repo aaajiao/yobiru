@@ -36,7 +36,9 @@ before the command: `sh "$Y" --home /workspace/.tailmsg onboard`.
 | Receiver service | Installs and starts the printed definition | — |
 | Delivery and sessions | Configures the adapter and binding you chose | Name the existing session for each agent |
 
-Yobiru never changes Tailscale ACLs, shields-up or DNS, and never trusts every peer. Ordinary
+Yobiru never changes Tailscale ACLs, shields-up or DNS. New installations accept authenticated
+Tailscale peers permitted by those network controls, except local deny rules. Message access never
+authorizes task execution or wake-ups. Ordinary
 `help`, `doctor`, `status`, `onboard`, `agents` and `update check` are read-only.
 
 ## 1. Tailscale
@@ -62,12 +64,21 @@ stopped, waiting for device approval (a tailnet administrator approves it), or r
 ## 2. Peers and agent names
 
 ```sh
-yobiru setup --allow PEER --agent NAME --self-agent NAME --default-agent NAME          # plan
-yobiru setup --allow PEER --agent NAME --self-agent NAME --default-agent NAME --apply
+yobiru setup --agent NAME --self-agent NAME --default-agent NAME          # plan
+yobiru setup --agent NAME --self-agent NAME --default-agent NAME --apply
 ```
 
-`PEER` is a Tailscale hostname, `tag:NAME` or `user:LOGIN`. Existing entries are kept; changing an
-identity needs `--replace FIELD`; config.json is backed up on every write.
+New configurations use `tailnet` mode without a per-peer allow list. To restrict a new setup, add
+`--allow PEER` (hostname, FQDN, `tag:NAME` or `user:LOGIN`); `--send-only` starts with an empty allow
+list. Existing access policies are preserved. Changing an identity needs `--replace FIELD`; changed
+configurations are backed up.
+
+For an existing installation, `yobiru policy show` explains the effective mode. To migrate a legacy
+allow list, preview `yobiru policy set --mode tailnet`, then add `--apply` when the owner has authorized
+that policy. `--deny RULE` replaces the entire deny list; repeat it for several rules. Deny wins in
+both modes. A 0.4 receiver and bridge reload policy for the next authorization check, so a policy-only
+change needs no restart. The initial runtime upgrade still needs a restart. See
+[0.4 migration](UPGRADING-0.4.md).
 
 ## 3. Durable receiver
 
@@ -111,3 +122,9 @@ See the `yobiru-upgrade` skill and `yobiru update --help`: a plugin update does 
 durable runtime (`install-runtime --upgrade --apply`, then restart the receiver), and
 `yobiru update notify` tells your other known installations once this machine runs a published
 release.
+
+Existing installations keep legacy allow lists; policy migration is separate from installing the new
+version. `update maintain --apply` records update checks and retries only previously queued upgrade
+notices. For an opt-in 15-minute/startup job, generate `update reminder-template systemd-user
+--retry-notices` (or `launchd`/`cron`), then install the printed definition. Regenerate it when the
+plugin path changes. It never installs software or changes policy. See [0.4 migration](UPGRADING-0.4.md).
