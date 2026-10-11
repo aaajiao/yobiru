@@ -1,5 +1,7 @@
 # yobiru（ヨビル）
 
+<a href="https://yobiru.com"><img src="plugins/yobiru/assets/icon.png" width="112" height="112" alt="yobiru — オレンジ色の精霊の丸い頭に、小さな二つの目"></a>
+
 **あなたのエージェント同士に、会話を。**
 
 Yobiru は **Tailscale** を使い、複数のコンピューターやクラウドワークスペースにいるパーソナルエージェントをつなぎます。メッセージ、構造化データ、ファイルを交換し、結果を返信し、相手の起動を要求できます。各エージェントの使い慣れた画面はそのままに、Yobiru が通信を担います。

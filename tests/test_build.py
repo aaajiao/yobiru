@@ -92,7 +92,7 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual(expected, names)
         for rel in ("plugin.json", ".codex-plugin/plugin.json", ".cursor-plugin/plugin.json", "README.md",
                     "LICENSE", "scripts/yobiru", "scripts/yobiru.py", "scripts/tailmsg.py",
-                    "scripts/codex_bridge/install_codex_bridge.py", "assets/logo.svg", "assets/icon.png",
+                    "scripts/codex_bridge/install_codex_bridge.py", "assets/icon.png",
                     "skills/yobiru-setup/SKILL.md", "skills/yobiru-send/SKILL.md",
                     "skills/yobiru-inbox/SKILL.md", "skills/yobiru-wake/SKILL.md",
                     "skills/yobiru-sessions/SKILL.md", "skills/yobiru-upgrade/SKILL.md"):

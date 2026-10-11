@@ -2,7 +2,7 @@
   "id": "yobiru",
   "displayName": "Yobiru",
   "nativeName": "ヨビル",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "publisher": "Chekusu",
   "repository": "https://github.com/chekusu/yobiru",
   "license": "MIT",
@@ -25,7 +25,7 @@
       "Which of my agents are online, and which session handles their messages?",
       "Check for Yobiru updates"
     ],
-    "brandColor": "#4C6EF5",
+    "brandColor": "#ff5b1f",
     "composerIcon": "./assets/icon.png",
     "logo": "./assets/icon.png",
     "marketplaceCategory": "Productivity",
@@ -33,7 +33,7 @@
     "authentication": "ON_INSTALL"
   },
   "cursor": {
-    "logo": "assets/logo.svg"
+    "logo": "assets/icon.png"
   },
   "bundle": {
     "core": {"tailmsg.py": "scripts/tailmsg.py"},

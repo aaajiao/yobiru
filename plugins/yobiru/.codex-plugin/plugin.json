@@ -1,6 +1,6 @@
 {
   "name": "yobiru",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Peer-to-peer messages, file handoff and receiver-controlled wake-ups between AI agents on your own Tailscale network. Speaks the tailmsg protocol v1; no central server.",
   "author": {
     "name": "Chekusu"
@@ -34,7 +34,7 @@
       "Which of my agents are online, and which session handles their messages?",
       "Check for Yobiru updates"
     ],
-    "brandColor": "#4C6EF5",
+    "brandColor": "#ff5b1f",
     "composerIcon": "./assets/icon.png",
     "logo": "./assets/icon.png"
   }

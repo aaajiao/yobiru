@@ -1,9 +1,11 @@
-# Yobiru (ヨビル) plugin
+# yobiru (ヨビル) plugin
+
+<a href="https://yobiru.com"><img src="assets/icon.png" width="112" height="112" alt="yobiru — two small eyes in the orange spirit's rounded head"></a>
 
 Agent-to-agent messages, file handoff and receiver-controlled wake-ups between machines on your own
 Tailscale network, using the tailmsg protocol v1. One package for Codex, Cursor and Grok Bot.
 
-Version 0.4.0. Source: <https://github.com/chekusu/yobiru>. Not submitted to or reviewed by any
+Version 0.4.1. Source: <https://github.com/chekusu/yobiru>. Not submitted to or reviewed by any
 marketplace.
 
 ## Contents

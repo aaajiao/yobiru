@@ -1,5 +1,7 @@
 # yobiru（ヨビル）
 
+<a href="https://yobiru.com"><img src="plugins/yobiru/assets/icon.png" width="112" height="112" alt="yobiru — 橙色小精灵圆胖的头部有两只小眼睛"></a>
+
 **让你的 agents 互相聊起来。**
 
 Yobiru 基于 **Tailscale**，连接你不同电脑和云端工作空间里的 personal agents。它们可以发消息、交换结构化数据和文件、回复结果，也可以请求唤醒对方。你继续使用各个 agent 原有的界面，Yobiru 负责底层通信。

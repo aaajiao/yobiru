@@ -11,8 +11,12 @@ Everything is plain Python 3.8+ with the standard library; no network access is 
 - Generated, never edited by hand: `plugins/yobiru/plugin.json`, `plugins/yobiru/.codex-plugin/plugin.json`,
   `plugins/yobiru/.cursor-plugin/plugin.json`, `.agents/plugins/marketplace.json`,
   `.cursor-plugin/marketplace.json`, the bundled copies, `plugins/yobiru/LICENSE` and `SOURCES.json`.
-- Hand-written: `scripts/yobiru`, `scripts/yobiru.py`, `skills/*/SKILL.md`, `README.md`, `assets/`
-  (`assets/icon.png` is rendered by `tools/make_icon.py`).
+- Hand-written: `scripts/yobiru`, `scripts/yobiru.py`, `skills/*/SKILL.md` and `README.md`.
+- `plugins/yobiru/assets/icon.png` is the approved Image Generation master, shared byte-for-byte
+  with the mark on [yobiru.com](https://yobiru.com). Both plugin manifests and all READMEs use this
+  same asset. Preserve its three petals and the two black eyes at the rounded lower end of the
+  orange petal. Replace it with the approved master when the brand changes; do not redraw it.
+  The demo image's brand edit is recorded in `docs/assets/yobiru-demo.brand-update.prompt.txt`.
 
 ## Commands
 
@@ -82,7 +86,8 @@ protocol v1 release from before @agent addressing. Its runtime files go to `test
 
 ## Version bumps
 
-Change `version` in `packaging/product.json`, run `sync`, `check`, the tests and `release`, then commit
+Change `version` in `packaging/product.json` and `PRODUCT_VERSION` in the canonical `tailmsg.py`,
+run `sync`, `check`, the relevant tests and `release`, then commit
 the regenerated files. Codex reinstalls a local plugin when its version changes.
 
 ## Renaming

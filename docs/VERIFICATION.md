@@ -1,7 +1,16 @@
 # What has been verified
 
-Yobiru 0.4.0. This page separates what has actually been run from what has not. It is not a
+Yobiru 0.4.1. This page separates what has actually been run from what has not. It is not a
 security guarantee: the tests show the behaviors listed below, nothing more.
+
+## Branding patch (0.4.1)
+
+This release updates the shared icon, Codex brand color, Cursor logo reference and README images.
+The only runtime change is the reported product version; protocol and behavior remain at 0.4.0.
+`tools/build_plugin.py check` and all 16 existing packaging tests passed, including the installed
+Codex manifest validator and reproducible archive checks. Both release archives carry the same
+approved icon as yobiru.com. README image paths and the updated demonstration were inspected.
+The runtime and real-network test results below are retained from 0.4.0, not claimed as new runs.
 
 ## Automated checks in this repository
 
