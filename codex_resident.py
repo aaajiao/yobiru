@@ -150,7 +150,7 @@ class ResidentDispatcher:
         self.client = CodexAppClient(config)  # validates exact UUID, explicit socket, fixed account
         if self.client.socket_path is None or config.get("dispatcher_host_id", "local") != "local":
             raise ValueError("resident dispatcher requires a local Unix socket")
-        self.home = Path(config["bridge_home"])
+        self.home = Path(config["bridge_home"]).expanduser().resolve()
         self.stop = threading.Event()
         self.thread = None
 

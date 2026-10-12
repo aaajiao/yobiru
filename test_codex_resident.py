@@ -292,6 +292,32 @@ class ResidentTests(unittest.TestCase):
             restarted.terminate()
             restarted.wait(timeout=5)
 
+    def test_daemon_and_status_expand_tilde_bridge_home(self):
+        server = FakeServer(self.root, self.thread_id)
+        self.addCleanup(server.close)
+        self.config.update(bridge_home="~/bridge state", tailmsg_home=str(self.root), poll_seconds=0.05)
+        config_path = self.root / "codex-bridge.json"
+        config_path.write_text(json.dumps(self.config))
+        environment = dict(os.environ, HOME=str(self.root))
+        command = [sys.executable, str(Path(__file__).with_name("codex_bridge.py")),
+                   "--config", str(config_path), "daemon"]
+        process = subprocess.Popen(command, env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        try:
+            eventually(lambda: server.loaded)
+            state = self.root / "bridge state"
+            self.assertTrue((state / "bridge.sqlite3").is_file())
+            self.assertEqual("connected", resident_status(state, self.thread_id)["state"])
+            script = Path(__file__).parent / "plugins/yobiru/scripts/yobiru.py"
+            status = subprocess.run([sys.executable, str(script), "--home", str(self.root),
+                                     "codex-bridge", "status"], env=environment,
+                                    capture_output=True, text=True, timeout=5)
+            self.assertEqual(0, status.returncode, status.stderr)
+            self.assertEqual("connected", json.loads(status.stdout)["resident"]["state"])
+        finally:
+            process.terminate()
+            _, error = process.communicate(timeout=5)
+        self.assertEqual(0, process.returncode, error)
+
     def test_fragmented_json_ping_and_frame_size_limit(self):
         client, peer = socket.socketpair()
         self.addCleanup(client.close)
