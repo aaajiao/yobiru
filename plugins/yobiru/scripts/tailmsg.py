@@ -8,7 +8,7 @@ them itself and verifies sha256. Auth = Tailscale identity (`tailscale whois`) +
 per-machine access policy. Python 3.8+ stdlib only. See SPEC.md.
 """
 import argparse, datetime as dt, hashlib, http.client, ipaddress, json, mimetypes, os
-import re, secrets, shutil, ssl, stat, subprocess, sys, threading, time, unicodedata, urllib.parse
+import re, secrets, shlex, shutil, ssl, stat, subprocess, sys, threading, time, unicodedata, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -1186,6 +1186,22 @@ def cmd_serve(ctx, a):
 
 
 # ---------------------------------------------------------------- client
+class TransportError(RuntimeError):
+    """No complete HTTP response was received; a write may already have reached the peer."""
+
+
+def transport_diagnostic(peer, ip, port, operation, error):
+    """Describe the attempted route, without guessing the failed network layer or exposing URLs."""
+    endpoint = "[%s]:%s" % (ip, port) if ":" in ip else "%s:%s" % (ip, port)
+    # BadStatusLine can contain arbitrary peer output, including an echoed attachment grant URL.
+    reason = "invalid or incomplete HTTP response" if isinstance(error, http.client.HTTPException) else str(error)
+    reason = "".join(" " if unicodedata.category(c).startswith("C") else c for c in reason[:200])
+    return ("%s to %s (%s) failed: %s: %s. Check that the receiver is running on port %s; "
+            "check the Tailscale path with `tailscale ping --c 3 --timeout 3s %s` "
+            "(a successful ping does not verify the receiver or its access policy)." %
+            (operation, peer, endpoint, type(error).__name__, reason, port, shlex.quote(peer)))
+
+
 def http_json(ip, port, method, path, body=None, host=None, timeout=15):
     c = http.client.HTTPConnection(ip, port, timeout=timeout)
     hdrs = {"Host": "%s:%d" % (host or ip, port)}
@@ -1193,9 +1209,19 @@ def http_json(ip, port, method, path, body=None, host=None, timeout=15):
     if body is not None:
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
         hdrs["Content-Type"] = "application/json"
-    c.request(method, path, body=data, headers=hdrs)
-    r = c.getresponse()
-    raw = r.read()
+    try:
+        c.request(method, path, body=data, headers=hdrs)
+        r = c.getresponse()
+        raw = r.read()
+    except (OSError, http.client.HTTPException) as e:
+        detail = transport_diagnostic(host or ip, ip, port, "%s %s" % (method, path), e)
+        if method == "POST" and path == "/msg":
+            detail += (" Delivery is unknown for message %s; the receiver may already have stored it. "
+                       "Check its inbox for this ID before sending again; a new send creates a new ID." %
+                       (body or {}).get("id", "(unknown)"))
+        raise TransportError(detail) from e
+    finally:
+        c.close()
     try:
         return r.status, json.loads(raw)
     except Exception:
@@ -1384,22 +1410,31 @@ def cmd_fetch(ctx, a):
             if not is_tailnet_ip(ip):
                 raise RuntimeError("resolved to non-tailnet ip %s" % ip)
             c = http.client.HTTPConnection(ip, u.port or 80, timeout=30)
-            c.request("GET", u.path, headers={"Host": u.netloc})
-            resp = c.getresponse()
-            if resp.status != 200:
-                raise RuntimeError("HTTP %d %s" % (resp.status, resp.read(200).decode("utf-8", "replace")))
-            h, n = hashlib.sha256(), 0
-            part = dst.with_name(dst.name + ".part")
-            with open(part, "wb") as w:
-                while True:
-                    chunk = resp.read(1 << 20)
-                    if not chunk:
-                        break
-                    n += len(chunk)
-                    if n > f["size"]:
-                        break
-                    h.update(chunk)
-                    w.write(chunk)
+            try:
+                try:
+                    c.request("GET", u.path, headers={"Host": u.netloc})
+                    resp = c.getresponse()
+                    if resp.status != 200:
+                        raise RuntimeError("HTTP %d %s" % (resp.status, resp.read(200).decode("utf-8", "replace")))
+                except (OSError, http.client.HTTPException) as e:
+                    raise TransportError(transport_diagnostic(sender, ip, u.port or 80, "file fetch", e)) from e
+                h, n = hashlib.sha256(), 0
+                part = dst.with_name(dst.name + ".part")
+                with open(part, "wb") as w:
+                    while True:
+                        try:
+                            chunk = resp.read(1 << 20)
+                        except (OSError, http.client.HTTPException) as e:
+                            raise TransportError(transport_diagnostic(sender, ip, u.port or 80, "file fetch", e)) from e
+                        if not chunk:
+                            break
+                        n += len(chunk)
+                        if n > f["size"]:
+                            break
+                        h.update(chunk)
+                        w.write(chunk)
+            finally:
+                c.close()
             if n != f["size"] or h.hexdigest() != f["sha256"]:
                 part.unlink()
                 raise RuntimeError("sha256/size mismatch - discarded")
@@ -1428,8 +1463,10 @@ def cmd_peers(ctx, a):
     def probe(n):
         ip = (n.get("TailscaleIPs") or ["?"])[0]
         try:
-            s, j = http_json(ip, port, "GET", "/health", timeout=3)
+            s, j = http_json(ip, port, "GET", "/health", host=(n.get("DNSName") or ip).rstrip("."), timeout=3)
             res[ip] = "yes (v%s)" % j.get("v") if s == 200 else "HTTP %d" % s
+        except TransportError as e:
+            res[ip] = "no response: %s" % e
         except Exception:
             res[ip] = "no"
     ths = [threading.Thread(target=probe, args=(n,)) for n in peers if n.get("Online")]
