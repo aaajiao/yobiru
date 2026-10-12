@@ -1320,6 +1320,37 @@ def systemd_quote(arg):
     return '"%s"' % arg.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%").replace("$", "$$")
 
 
+def service_python():
+    """Keep the interpreter entry point, including symlinks and virtual environments.
+
+    Homebrew can report an executable inside a versioned Cellar keg even when
+    launched through a stable symlink. In that case, use a matching stable path
+    from the same prefix only; never select an arbitrary Python from PATH.
+    """
+    executable = sys.executable
+    if sys.prefix != getattr(sys, "base_prefix", sys.prefix) or hasattr(sys, "real_prefix"):
+        return executable
+    path = Path(executable)
+    parts = path.parts
+    for i, part in enumerate(parts):
+        if (part != "Cellar" or len(parts) <= i + 3 or
+                not re.fullmatch(r"python(?:@3(?:\.\d+)*)?", parts[i + 1])):
+            continue
+        prefix = Path(*parts[:i])
+        formula = parts[i + 1]
+        opt = prefix / "opt" / formula
+        candidates = [prefix / "bin" / "python3", prefix / "bin" / path.name,
+                      opt.joinpath(*parts[i + 3:])]
+        for candidate in candidates:
+            try:
+                if candidate.is_file() and os.access(str(candidate), os.X_OK) and candidate.samefile(path):
+                    return str(candidate)
+            except OSError:
+                pass  # Broken/removed links must not make a read-only template fail.
+        break
+    return executable
+
+
 def cmd_service_template(home, home_source, argv):
     ap = argparse.ArgumentParser(allow_abbrev=False, prog=PRODUCT + " service-template",
                                  description="Print a receiver service definition to review and install yourself. "
@@ -1327,7 +1358,7 @@ def cmd_service_template(home, home_source, argv):
     ap.add_argument("kind", choices=("systemd", "systemd-user", "launchd", "windows"))
     ap.add_argument("--python", default=None, help="Python for the service (default: this one)")
     a = ap.parse_args(argv)
-    python = a.python or os.path.realpath(sys.executable)
+    python = a.python or service_python()
     runtime = home / "tailmsg.py"
     args = [python, str(runtime)]
     if home != Path(DEFAULT_HOME).expanduser().absolute():
@@ -2586,7 +2617,7 @@ def update_status(home, home_source, a):
 
 
 def reminder_template(home, a):
-    python = os.path.realpath(sys.executable)
+    python = service_python()
     retry = getattr(a, "retry_notices", False)
     args = [python, str(Path(__file__).resolve()), "--home", str(home), "update",
             "maintain" if retry else "check", "--apply" if retry else "--record",

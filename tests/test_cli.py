@@ -340,8 +340,9 @@ class RuntimeAndServiceTests(Base):
         self.assertEqual(0, r.returncode)
         plist = plistlib.loads(r.stdout.encode("utf-8"))
         self.assertEqual("dev.tailmsg", plist["Label"])
-        self.assertEqual([os.path.realpath(sys.executable), str(home / "tailmsg.py"), "--home", str(home), "serve"],
-                         plist["ProgramArguments"])
+        self.assertTrue(os.path.samefile(sys.executable, plist["ProgramArguments"][0]))
+        self.assertEqual([str(home / "tailmsg.py"), "--home", str(home), "serve"],
+                         plist["ProgramArguments"][1:])
         self.assertIn("install-runtime", r.stderr)
         self.assertIn("LaunchAgents", r.stderr)
 
