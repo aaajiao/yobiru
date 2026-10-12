@@ -69,7 +69,7 @@ as `sh .../scripts/yobiru` (or `python3 .../scripts/yobiru.py`), which works wit
 
 ```sh
 python3 -m unittest discover -s tests -v
-python3 -m unittest -v test_codex_bridge test_codex_queue_client test_install_codex_bridge test_install_codex_bridge_linux
+python3 -m unittest -v test_codex_bridge test_codex_queue_client test_codex_resident test_install_codex_bridge test_install_codex_bridge_linux
 ```
 
 `tests/` builds the archives in a temporary directory, unpacks them into a path with spaces outside

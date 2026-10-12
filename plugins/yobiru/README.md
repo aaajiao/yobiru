@@ -5,7 +5,7 @@
 Agent-to-agent messages, file handoff and receiver-controlled wake-ups between machines on your own
 Tailscale network, using the tailmsg protocol v1. One package for Codex, Cursor and Grok Bot.
 
-Version 0.4.1. Source: <https://github.com/chekusu/yobiru>. Not submitted to or reviewed by any
+Version 0.4.2. Source: <https://github.com/chekusu/yobiru>. Not submitted to or reviewed by any
 marketplace.
 
 ## Contents
