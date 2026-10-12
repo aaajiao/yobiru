@@ -1,7 +1,22 @@
 # What has been verified
 
-Yobiru 0.4.2. This page separates what has actually been run from what has not. It is not a
+Yobiru 0.4.3. This page separates what has actually been run from what has not. It is not a
 security guarantee: the tests show the behaviors listed below, nothing more.
+
+## Current-IP name resolution (0.4.3)
+
+- New sends read a fresh Tailscale snapshot. Short names match the DNS short name or reported
+  HostName, selecting the unique online match over old offline entries after a reinstall.
+- Multiple online matches, or multiple offline matches with none online, fail with an ambiguity
+  error. Full FQDNs and explicit IPs stay exact; no suffix stripping or fuzzy matching.
+- Sending, `agents --peer` and explicit upgrade notices share the selector. Replies, existing file
+  grants and queued notices retain their original recipient identities.
+- Nineteen regression tests cover changing IPs, stale offline nodes in either order, ambiguity,
+  exact addresses, missing IPs, actual send-path recipient/agent routing, discovery and notices.
+  The full plugin suite has 172 tests. These cases inject Tailscale snapshots and HTTP responses;
+  they do not claim that a real Grok Bot VM was rebuilt or exchanged messages after a live IP change.
+- A rebuild still needs a Tailscale login, its chosen stable hostname, and a running receiver.
+  Yobiru cannot rediscover a machine that lost both its name and its identity without a new target.
 
 ## Maintenance fixes (0.4.2)
 
