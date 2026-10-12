@@ -1,7 +1,31 @@
 # What has been verified
 
-Yobiru 0.4.3. This page separates what has actually been run from what has not. It is not a
+Yobiru 0.4.4. This page separates what has actually been run from what has not. It is not a
 security guarantee: the tests show the behaviors listed below, nothing more.
+
+## Service paths and transport diagnostics (0.4.4)
+
+The release tree passed 191 plugin tests and 132 bridge/resident/installer tests (323 total)
+on Python 3.12.3. Package consistency, archive checksums and integrity, exact bundled-source
+hashes, private-marker checks and Python 3.8 syntax parsing also passed. The syntax check
+does not establish execution on a Python 3.8 interpreter.
+
+- Receiver and update-reminder templates preserve stable Python entry points, virtual
+  environments and explicit receiver `--python` overrides. If Python reports a versioned
+  Homebrew Cellar executable, an executable same-file path within that Homebrew prefix is
+  selected when available. Existing installed definitions must be regenerated and reloaded.
+- Eleven regressions cover saved plist interpreter paths after a simulated Homebrew upgrade
+  and old-keg removal, candidate mismatches, and a real isolated virtual environment. These
+  run on Linux; native Homebrew/launchd upgrades were not exercised. The separate macOS
+  Codex bridge installer is outside this template fix.
+- Send/reply, file fetch, health and discovery failures include peer/endpoint context and
+  a bounded `tailscale ping` suggestion. Failed sends report their message ID and unknown
+  delivery; no automatic resend or network restart is performed.
+- Eight transport regressions include real loopback response loss after accepting one POST,
+  packaged-CLI connection refusal, health/doctor/discovery diagnostics, local file errors,
+  and bounded exception output that excludes malformed HTTP response contents.
+- These checks establish diagnostic behavior, not the cause or repair of a stale Tailscale
+  path. The reported cross-machine daemon-restart failure was not reproduced.
 
 ## Current-IP name resolution (0.4.3)
 
