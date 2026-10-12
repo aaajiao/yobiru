@@ -7,13 +7,15 @@ security guarantee: the tests show the behaviors listed below, nothing more.
 
 This release combines non-UTF-8 CLI output handling, minimum dispatcher sandbox permission
 guidance, and the Linux bridge's persistent connection to its existing dispatcher thread.
-The combined release tree passed 153 plugin tests, 131 bridge/resident/installer tests, and all
+The combined release tree passed 153 plugin tests, 132 bridge/resident/installer tests, and all
 59 real Tailscale single-host self-tests. Package consistency, deterministic archives and the
 private-marker hygiene scan also passed. The Tailscale self-test used temporary receivers on
 non-production ports, without accessing the production inbox.
 The CLI encoding tests use real cp1252/ASCII subprocess pipes on Linux; they are not native
 Windows tests. Resident lifecycle and reconnect tests use an isolated WebSocket fake server;
-separate real Codex app-server transport probes do not claim a completed model task.
+separate real Codex app-server probes verified resume, connection persistence, restart recovery
+and unchanged session permissions without running a model task. A subprocess regression also
+checks that tilde-prefixed state paths work for both the daemon and status command.
 
 Upgrading the plugin alone does not update the running receiver or bridge. Follow the
 [yobiru-upgrade skill](../plugins/yobiru/skills/yobiru-upgrade/SKILL.md), reinstalling the Linux
