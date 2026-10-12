@@ -510,6 +510,8 @@ def main(argv=None):
                                              "no preview, no model turn)")
     args = parser.parse_args(argv)
     bridge = None
+    resident = None
+    daemon_lock = None
     try:
         if args.command == "session-name":
             return session_name(load_config(args.config))
@@ -526,11 +528,24 @@ def main(argv=None):
         elif args.command == "scan":
             print(json.dumps({"scan": bridge.scan(), "dispatch": bridge.dispatch_due()}))
         else:
+            # Keep exactly one resident connection per bridge, including manual daemon starts.
+            fd = os.open(str(bridge.home / "daemon.lock"), os.O_CREAT | os.O_RDWR |
+                         getattr(os, "O_NOFOLLOW", 0), 0o600)
+            daemon_lock = os.fdopen(fd, "a")
+            try:
+                fcntl.flock(daemon_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print("codex_bridge: daemon_already_running", file=sys.stderr)
+                return 1
             stopping = [False]
             def stop(_signum, _frame):
                 stopping[0] = True
             signal.signal(signal.SIGTERM, stop)
             signal.signal(signal.SIGINT, stop)
+            if bridge.config.get("codex_remote"):
+                from codex_resident import ResidentDispatcher
+                resident = ResidentDispatcher(bridge.config)
+                resident.start()
             while not stopping[0]:
                 try:
                     bridge.scan()
@@ -549,6 +564,10 @@ def main(argv=None):
         print("codex_bridge: configuration_or_io_error", file=sys.stderr)
         return 1
     finally:
+        if resident is not None:
+            resident.close()
+        if daemon_lock is not None:
+            daemon_lock.close()
         if bridge is not None:
             bridge.close()
 

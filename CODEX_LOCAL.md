@@ -59,10 +59,21 @@ tailmsg inbox --pending --agent codex
 安装器和插件都不会启动 Codex。需要事先具备：
 
 - 已安装提供 `codex queue --remote` 的官方 Codex CLI（在 `PATH` 上，或用 `--codex-path` 指定）。
+- app-server 需要支持 Unix socket 上的 WebSocket、`initialize` 和 `thread/resume`（含 `excludeTurns`）；已核对 Codex CLI 0.162.1 的本地协议。若版本不支持，常驻状态会报告失败，不会改用其他会话。
 - 当前用户自己运行的本机 Codex app-server，监听一个 Unix socket（例如用 `codex app-server --listen unix://PATH` 启动的 `PATH`）。只接受 `unix:///绝对路径`；不支持 `ws://`/`wss://` 等网络端点，也不使用 CLI 的隐式默认 `unix://`。
 - 该 app-server 中一个已存在的入口会话 UUID。安装器不创建会话，不使用 `--last`，也不接受会话名称。
 - 可用的 user systemd 管理器（`systemctl --user` 可用；需要在登出后继续运行时启用 lingering）。非交互 shell 可能还需设置 `XDG_RUNTIME_DIR`。
 - 已用 `install-runtime` 安装到数据目录的 Tailmsg 接收端；接收端服务名按 `service-template systemd-user` 的约定为 `tailmsg.service`。
+
+### 固定会话必须保持加载
+
+仅有监听中的 socket 和 `codex queue` 的 `enqueued` 回执还不够：没有保持订阅的客户端时，app-server 可能卸载固定会话，入队内容因而一直等待。Linux 的桥接 `daemon` 现在会连接同一个 socket，完成 `initialize` → `initialized` → `thread/resume`，并持续保持连接。恢复只指定安装时保存的 UUID 和 `excludeTurns: true`，不传入权限、工作目录、模型或指令覆盖。通知只在内存中读取和丢弃，不记录会话正文；收到审批或交互请求也不会代答，需要用户在自己的 Codex 客户端处理。
+
+断线后按 1、2、4 秒递增退避重连，上限 60 秒；重新连接只恢复同一个 UUID，不重复入队、不确认原信、不新建模型回合。已入队的任务仍由 Codex 调度执行。空闲连接使用 ping/pong 和状态心跳；同一数据目录通过进程锁只运行一个 bridge daemon。`wake`、单次 `scan`、`status` 和会话名称查询均不会启动常驻连接，Linux 部署必须保持 daemon 服务运行。
+
+创建入口会话时，先以与 app-server 相同的 `CODEX_HOME` 启动一次 Codex 交互会话，或执行一次明确的初始化请求（例如 `codex exec "这是固定消息入口；等候后续消息，不执行其他任务。"`），记录其实际 UUID。选择用户认可的工作目录、权限和工作流；把该 UUID 交给安装器。已有持久会话可以直接使用，无需重建；不要把一次 `thread/start` 返回的空会话误认为已经持久化，也不要把会话标题当成 UUID。
+
+升级已有 Linux 桥接后，重新运行下方安装命令（同一个 UUID、socket 和账户），让服务加载新版适配器。此前安装的临时常驻辅助程序可在确认 `resident.state` 为 `connected` 后停用。重启 app-server 或桥接会暂时断开常驻连接，Codex 对运行中任务的处理仍遵循其原生行为。
 
 ### 快速开始
 
@@ -97,6 +108,8 @@ receiver 和 bridge 服务能收件、入队，不代表 Codex 入口能写入�
 ### 状态含义与 `uncertain` 排查
 
 `enqueued` 只表示官方 CLI 返回了该会话的入队回执，不表示模型已处理或任务完成；完成与否要看入口会话的记录、产物或回复。
+
+Linux 状态还单独显示 `resident.state`：`connected` 表示同一 UUID 已恢复且连接心跳新鲜；`connecting` / `reconnecting` 表示正在连接或退避；`stopped` 表示已停止；`unknown` / `stale` 表示没有有效的新鲜状态。`connected` 仍不证明任务完成。`resident.reason` 只包含固定错误码，例如 `resume_rejected`、`thread_mismatch`、`handshake_invalid`，不泄露服务端错误正文。socket 是 `listening` 但 resident 不是 `connected` 时，检查 user service、账户是否一致、UUID 是否持久存在以及 Codex 版本，而不是清空队列重发。
 
 `sh "$Y" codex-bridge status` 给出通道、socket 状态（`listening`、`socket_missing`、`socket_stale` 等）、队列各状态计数、`retry`/`uncertain` 的原因和处理建议，不输出消息正文。`retry` 表示确定没有发出，会自动重试（退避最长约一小时一次）。`uncertain` 表示 `codex queue` 已启动但超时、失败或回执无效：消息可能已进入会话，因此绝不自动重发。适配器会定期在固定入口会话（`codex_home` 对应的账户）中查找 `[TAILMSG:<id>]` 标记，找到即记为 `delivered`。长期找不到时，请在该会话中人工确认后用 `inbox --pending` 处理原信；不要删除队列或状态来强制重发。
 
@@ -144,7 +157,7 @@ sh "$Y" codex-bridge rollback <backup 路径>
 
 ## 验收
 
-离线：`python3 -m unittest -v test_codex_bridge test_codex_queue_client test_install_codex_bridge test_install_codex_bridge_linux`。Linux 测试使用临时 AF_UNIX socket、假的 `codex` 与 `systemctl` 可执行文件和隔离的 HOME，不连接真实 app-server、不调用真实 systemd。
+离线：`python3 -m unittest -v test_codex_bridge test_codex_queue_client test_codex_resident test_install_codex_bridge test_install_codex_bridge_linux`。Linux 测试使用临时 AF_UNIX socket、假的 `codex` 与 `systemctl` 可执行文件和隔离的 HOME，不连接真实 app-server、不调用真实 systemd。
 
 桌面会话继续遵守 Codex 原生权限策略。入口能够请求查找、转交和创建任务；如果原生工具要求审批，消息会保留在该入口等待用户处理，适配器不会代替用户批准。部署与真实验收结果见 [IMPLEMENTATION_REPORT.md](IMPLEMENTATION_REPORT.md)。
 
