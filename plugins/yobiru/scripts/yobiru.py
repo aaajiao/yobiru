@@ -95,6 +95,19 @@ Run `{p} <command> --help` for details.
 
 
 # ---------------------------------------------------------------- basics
+def configure_cli_output():
+    """Preserve stdout/stderr encoding and visibly escape unsupported characters.
+
+    Keep this entry-point-local so missing-core diagnostics still work and imports
+    do not change a caller's streams. Structured JSON output uses ensure_ascii=True
+    to preserve emoji as valid JSON surrogate pairs on non-UTF-8 pipes.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(errors="backslashreplace")
+
+
 def die(msg, code=1):
     print("%s: error: %s" % (PRODUCT, msg), file=sys.stderr)
     sys.exit(code)
@@ -404,7 +417,7 @@ def cmd_paths(home, home_source, argv):
         "python": sys.executable, "python_version": "%d.%d.%d" % sys.version_info[:3],
         "home": str(home), "home_source": home_source, "config": str(home / "config.json"),
         "config_exists": (home / "config.json").is_file(),
-    }, indent=2, ensure_ascii=False))
+    }, indent=2, ensure_ascii=True))
     return 0
 
 
@@ -563,7 +576,7 @@ def cmd_doctor(home, home_source, argv):
     warns = sum(c["status"] == "warn" for c in checks)
     if a.json:
         print(json.dumps({"ok": errors == 0, "errors": errors, "warnings": warns, "home": f["home"],
-                          "checks": checks, "changed": False}, indent=2, ensure_ascii=False))
+                          "checks": checks, "changed": False}, indent=2, ensure_ascii=True))
     else:
         print("%s doctor (read-only, nothing is changed)" % DISPLAY)
         for c in checks:
@@ -594,7 +607,7 @@ def cmd_status(home, home_source, argv):
     out["versions"] = {"plugin": f["plugin_version"], "runtime": f.get("runtime_version")}
     out["update"] = f.get("update")
     if a.json:
-        print(json.dumps(out, indent=2, ensure_ascii=False))
+        print(json.dumps(out, indent=2, ensure_ascii=True))
         return 0
     print("%s %s  home %s (%s)" % (DISPLAY, f["plugin_version"], f["home"], f["home_source"]))
     if not f["config_exists"]:
@@ -676,7 +689,7 @@ class Plan(object):
                   "written": written, "backup": backup, "changes": self.changes, "errors": self.errors,
                   "notes": self.notes}
         if as_json:
-            print(json.dumps(result, indent=2, ensure_ascii=False))
+            print(json.dumps(result, indent=2, ensure_ascii=True))
         else:
             head = "applied" if written else "refused, nothing written" if self.errors else \
                 "dry run, nothing written" if self.changes else "nothing to change"
@@ -779,7 +792,7 @@ def cmd_policy(home, home_source, argv):
         result = {"config": str(home / "config.json"), "config_exists": raw is not None,
                   "policy": policy, "legacy_allowlist": legacy, "changed": False}
         if a.json:
-            print(json.dumps(result, indent=2, ensure_ascii=False))
+            print(json.dumps(result, indent=2, ensure_ascii=True))
         else:
             print("%s access policy (read-only): %s%s" % (
                 PRODUCT, policy["access_policy"], " (new-install default; no config yet)" if raw is None else ""))
@@ -1514,7 +1527,7 @@ def bridge_status(home):
                          "[TAILMSG:<id>] marker. If it never appears, handle that message by hand "
                          "(`inbox --pending`); do not delete the queue to force a resend")
         out["hints"] = hints
-    print(json.dumps(out, indent=2, ensure_ascii=False))
+    print(json.dumps(out, indent=2, ensure_ascii=True))
     return 0
 
 
@@ -2078,7 +2091,7 @@ def cmd_agents(home, home_source, argv):
     if a.json:
         print(json.dumps({"ok": True, "this_machine": me, "machines": rows, "remembered": remembered,
                           "notes": ["session names carry their source; activity (busy/idle) is never claimed"]},
-                         indent=2, ensure_ascii=False))
+                         indent=2, ensure_ascii=True))
         return 0
     print("%s agents (read-only; names are labeled by source, busy/idle is not known)" % DISPLAY)
     print_rows(rows)
@@ -2157,7 +2170,7 @@ def cmd_session(home, home_source, argv):
             out.append({"agent": n, "default": n == cfg.get("default_agent"),
                         "session": validate_session_view(core().session_view(b, native)) if b else None})
         if a.json:
-            print(json.dumps({"agents": out, "problems": errors}, indent=2, ensure_ascii=False))
+            print(json.dumps({"agents": out, "problems": errors}, indent=2, ensure_ascii=True))
             return 0
         print("%s sessions on this machine (%s)" % (DISPLAY, home))
         for x in out:
@@ -2253,7 +2266,7 @@ def cmd_session(home, home_source, argv):
     res = {"command": "session " + a.action, "file": str(home / SESSIONS_FILE), "dry_run": not a.apply,
            "written": written, "backup": backup, "changes": changes, "errors": errors, "notes": notes}
     if a.json:
-        print(json.dumps(res, indent=2, ensure_ascii=False))
+        print(json.dumps(res, indent=2, ensure_ascii=True))
     else:
         head = "applied" if written else "refused, nothing written" if errors else \
             "dry run, nothing written" if changes else "nothing to change"
@@ -2489,7 +2502,7 @@ def update_check(home, home_source, a):
                 "checked_at", "channel", "status", "error", "latest", "latest_preview", "installed")})
             res["record"] = str(home / UPDATE_FILE)
     if a.json:
-        print(json.dumps(res, indent=2, ensure_ascii=False))
+        print(json.dumps(res, indent=2, ensure_ascii=True))
     else:
         print("%s update check (%s channel, source %s)" % (DISPLAY, a.channel, OFFICIAL_REPO_URL))
         print("  installed plugin   %s" % versions["plugin"])
@@ -2537,7 +2550,7 @@ def update_status(home, home_source, a):
            "installations_remembered": len(state["installations"])}
     if a.json:
         res["notice_entries"] = sorted(entries, key=lambda e: e.get("key") or "")
-        print(json.dumps(res, indent=2, ensure_ascii=False))
+        print(json.dumps(res, indent=2, ensure_ascii=True))
         return 0
     print("%s update status" % DISPLAY)
     print("  installed plugin   %s" % versions["plugin"])
@@ -2873,7 +2886,7 @@ def update_notify(home, home_source, a, fetch=None):
     for item in plan:
         item.pop("ip", None)
     if a.json:
-        print(json.dumps(res, indent=2, ensure_ascii=False))
+        print(json.dumps(res, indent=2, ensure_ascii=True))
     else:
         print("%s update notify %s (%s)" % (PRODUCT, target, "applied" if a.apply and not res.get("error")
                                             else "refused" if res.get("error") else "dry run, nothing sent or written"))
@@ -3113,7 +3126,7 @@ def update_maintain(home, home_source, a):
         res = {"command": "update maintain", "dry_run": not a.apply, "check": None,
                "plans": [], "results": [], "errors": [str(e)]}
     if a.json:
-        print(json.dumps(res, indent=2, ensure_ascii=False))
+        print(json.dumps(res, indent=2, ensure_ascii=True))
     else:
         print("%s update maintain (%s)" % (PRODUCT, "applied" if a.apply else "dry run; nothing written or sent"))
         if res["check"]:
@@ -3434,7 +3447,7 @@ def cmd_onboard(home, home_source, argv):
     nxt = next((s for s in steps if s["status"] in ("todo", "blocked")), None)
     if a.json:
         print(json.dumps({"platform": facts, "home": str(home), "steps": steps, "next": nxt and nxt["id"],
-                          "changed": False}, indent=2, ensure_ascii=False))
+                          "changed": False}, indent=2, ensure_ascii=True))
         return 0
     print("%s onboarding for %s (read-only; nothing was changed)" % (DISPLAY, facts["system"] or facts["platform"]))
     print("Installing the plugin ran nothing: there is no install hook. These steps make it work.")
@@ -3478,6 +3491,7 @@ PLUGIN_COMMANDS = {"paths": cmd_paths, "doctor": cmd_doctor, "status": cmd_statu
 
 
 def main(argv=None):
+    configure_cli_output()
     if sys.version_info[:2] < MIN_PYTHON:
         die("Python %d.%d+ is required (this is %s)" % (MIN_PYTHON + (sys.version.split()[0],)), 127)
     argv = list(sys.argv[1:] if argv is None else argv)

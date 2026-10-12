@@ -62,6 +62,17 @@ Also not tested:
   real machines, a native name read from a live Codex app-server, `update check` against the live
   GitHub API, and `update notify` to real peers.
 
+## Non-UTF-8 command output
+
+`python3 -m unittest discover -s tests -p test_stdio.py -v` exercises the standalone core and
+the unpacked plugin with actual cp1252, ASCII and UTF-8 subprocess pipes. Chinese and Japanese
+messages, accented text, emoji, agent names and paths no longer raise `UnicodeEncodeError`.
+The CLI preserves the selected output encoding and displays unsupported text as backslash escapes;
+use `PYTHONIOENCODING=utf-8` when the receiving terminal or program expects UTF-8 characters.
+Structured CLI JSON uses ASCII-safe JSON escapes, which decode to the original Unicode values,
+including emoji. Stored messages and network payloads remain UTF-8. Imports do not reconfigure
+the importing program's streams. These pipe tests run on Linux; they are not a Windows/Git Bash run.
+
 ## Reproducing the release archives
 
 `python3 tools/build_plugin.py release` writes `dist/yobiru-<version>-plugin.zip`,

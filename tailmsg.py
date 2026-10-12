@@ -53,6 +53,19 @@ FETCH_KEYS = {"name", "url", "sha256", "size", "mime", "expires"}
 
 
 # ---------------------------------------------------------------- helpers
+def configure_cli_output():
+    """Keep the selected encoding, but escape text it cannot represent.
+
+    Only called by main, so importing the core does not alter a host's streams.
+    JSON printed by the CLI uses ensure_ascii=True separately: backslashreplace
+    alone would produce invalid JSON escapes for emoji (\\U instead of \\u).
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(errors="backslashreplace")
+
+
 def now_utc():
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
 
@@ -1215,7 +1228,7 @@ def cmd_send(ctx, a, reply_to=None, peer=None, agent=None):
     out = {"status": status, "response": resp, "id": msg_id, "to": to_fqdn, "files": len(env.get("fetch", []))}
     if "agent" in env:
         out["agent"] = env["agent"]
-    print(json.dumps(out, ensure_ascii=False))
+    print(json.dumps(out, ensure_ascii=True))
     if status not in (200, 202):
         sys.exit(2)
 
@@ -1295,7 +1308,7 @@ def cmd_wake(ctx, a):
 
 def cmd_show(ctx, a):
     _, r = load_msg(ctx, a.id)
-    print(json.dumps(r, ensure_ascii=False, indent=2))
+    print(json.dumps(r, ensure_ascii=True, indent=2))
 
 
 def cmd_fetch(ctx, a):
@@ -1380,6 +1393,7 @@ def cmd_peers(ctx, a):
 
 
 def main():
+    configure_cli_output()
     ap = argparse.ArgumentParser(prog="tailmsg", description="minimal P2P messages over Tailscale")
     ap.add_argument("--home", default=os.environ.get("TAILMSG_HOME", "~/.tailmsg"))
     sp = ap.add_subparsers(dest="cmd", required=True)
