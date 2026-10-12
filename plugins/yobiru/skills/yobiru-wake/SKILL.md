@@ -82,6 +82,12 @@ existing Codex session with the official `codex queue`, using a durable queue wi
   reconciliation reads the same account. Prerequisites: the session exists, the app-server runs as
   this user, `systemctl --user` works, and `install-runtime` was applied. The plugin never starts Codex.
 
+For an existing `workspace-write` dispatcher, read
+`../../scripts/codex_bridge/CODEX_SANDBOX.md` relative to this skill and verify the session's effective
+permissions: absolute writable roots for inbox and handled, plus outbox only for attachment replies.
+Keep policy, runtime and queue files read-only, and preserve `allow_replies=false`. The bridge's
+`status` cannot prove that the dispatcher can write its records or acknowledge messages.
+
 Review the plan, then run it without `--dry-run` when the user asked for the bridge (`--no-start`
 writes files only). Use `--allow-replies` only with the user's explicit authorization. Check with
 `sh Y codex-bridge status`: `enqueued` means queued into the session, not done; `retry` will be

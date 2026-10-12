@@ -61,6 +61,8 @@ yobiru service-template systemd-user     # 或 systemd、launchd、windows（onb
 
 这是两件事。唤醒：Codex 桥接（`yobiru codex-bridge install --thread-id UUID ...`）或 `yobiru wake-config --agent NAME --exec PROGRAM | --webhook ...`；没有适配器时，消息留在 `inbox --pending`。会话：`yobiru session bind --agent NAME --session-id 准确ID [--display-name 别名] [--confirmed-title 标题]`，先预演再 `--apply`。名称本身绝不会选择或重命名会话；装有 Codex 桥接时，入口会话 UUID 会被自动报告，冲突的绑定会被拒绝。
 
+Codex 入口使用 `workspace-write` 时，还需配置[最小沙箱权限](CODEX_SANDBOX.md)：用实际绝对路径开放 inbox 和 handled 的写入；仅带附件回复需要 outbox 写权限。先在可信安装环境准备这些目录，保持策略、运行代码和队列只读，不能把整个数据目录设为可写。只有已授权的回复／附件下载需要网络，网络权限不会覆盖 `allow_replies=false`。
+
 ## 5. 验证
 
 ```sh

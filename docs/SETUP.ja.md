@@ -61,6 +61,8 @@ yobiru service-template systemd-user     # または systemd、launchd、windows
 
 この二つは別物です。起動：Codex ブリッジ（`yobiru codex-bridge install --thread-id UUID ...`）または `yobiru wake-config --agent NAME --exec PROGRAM | --webhook ...`。アダプターがなければメッセージは `inbox --pending` で待ちます。セッション：`yobiru session bind --agent NAME --session-id 正確なID [--display-name 別名] [--confirmed-title タイトル]`、予行の後に `--apply`。名前だけでセッションを選んだり改名したりはしません。Codex ブリッジがある場合は窓口セッションの UUID が自動的に表示され、矛盾する紐付けは拒否されます。
 
+Codex の窓口で `workspace-write` を使う場合は、[最小限のサンドボックス権限](CODEX_SANDBOX.md)も設定します。実際の絶対パスで inbox と handled の書き込みを許可し、添付ファイル付き返信の場合だけ outbox も許可します。これらのディレクトリは信頼できるセットアップ環境で先に作成し、ポリシー・実行コード・キューは読み取り専用に保ちます。データディレクトリ全体を書き込み可能にしないでください。ネットワークは許可された返信や添付ファイルの取得に必要ですが、`allow_replies=false` を上書きする権限ではありません。
+
 ## 5. 確認
 
 ```sh
