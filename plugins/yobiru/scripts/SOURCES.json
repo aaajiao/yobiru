@@ -20,7 +20,7 @@
     },
     "scripts/codex_bridge/codex_resident.py": {
       "source": "codex_resident.py",
-      "sha256": "2e0c0c0fb5c797cbbda9f40bcb066318ce2dc31a7632e71dae966a5aee1c8d0d"
+      "sha256": "bfb08b2fa7cf88fbdceb82889d5d21c74c8828a2f0b8f2e321df21a24708d416"
     },
     "scripts/codex_bridge/CODEX_SANDBOX.md": {
       "source": "docs/CODEX_SANDBOX.md",

@@ -1478,7 +1478,7 @@ def bridge_status(home):
             cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
             out["dispatcher_thread_id"] = cfg.get("dispatcher_thread_id")
             out["allow_replies"] = bool(cfg.get("allow_replies"))
-            db = Path(cfg.get("bridge_home") or str(home / "codex-bridge")) / "bridge.sqlite3"
+            db = Path(cfg.get("bridge_home") or str(home / "codex-bridge")).expanduser().resolve() / "bridge.sqlite3"
         except (OSError, ValueError, AttributeError) as e:
             out["error"] = "cannot read bridge config: %s" % e
         if isinstance(cfg, dict) and cfg.get("excluded_kinds"):
