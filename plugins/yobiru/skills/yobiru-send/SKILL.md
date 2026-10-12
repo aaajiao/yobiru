@@ -37,6 +37,17 @@ To see which machines and agents are online and which session handles each, run 
 - Receivers older than agent addressing reject named agents (HTTP 400). Resend without the agent only
   if the user agrees.
 
+Prefer a stable short hostname for new messages instead of copying an IP from an earlier message.
+Each send reads the current `tailscale status --json`: a short name matches the DNS short name or
+reported HostName, and a unique online match wins over old offline entries after a reinstall.
+Multiple online matches (or multiple offline matches with none online) are ambiguous: use
+`agents --json` and the intended exact MagicDNS name; never pick by list order or strip numeric suffixes.
+Full MagicDNS names and explicit IPs stay exact. A session display alias is not a machine address.
+If the rebuilt host lost its name too, it must restore its chosen Tailscale hostname or be selected
+explicitly. Name resolution cannot reinstall Tailscale, sign in, or start the receiver.
+Replies, old attachment grants and queued upgrade notices remain bound to their original identities;
+do not silently redirect them through a similar name.
+
 ## Commands
 
     sh Y send dev-server/codex "Nightly build failed on main; log attached" --file ./build.log --wake now

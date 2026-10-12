@@ -1860,7 +1860,7 @@ def probe_info(ip, port, timeout=3.0, expect_node=None, host=None):
 
 
 def tailnet_nodes(cmd, timeout=10):
-    """-> ([{node, host, ip, online, self, os}], error). Read-only `tailscale status --json`."""
+    """-> ([{node, host, hostname, ip, ips, online, self, os}], error). Fresh Tailscale snapshot."""
     out, err = run_tailscale(cmd, ["status", "--json"], timeout)
     if err:
         return None, err
@@ -1882,7 +1882,8 @@ def tailnet_nodes(cmd, timeout=10):
         if not fq or not ips:
             continue
         v4 = [i for i in ips if ":" not in i]
-        nodes.append({"node": fq, "host": fq.split(".")[0], "ip": (v4 or ips)[0],
+        nodes.append({"node": fq, "host": fq.split(".")[0], "ip": (v4 or ips)[0], "ips": ips,
+                      "hostname": clean(n.get("HostName"), 253) or "",
                       "online": running if kind == "self" else n.get("Online") is True,
                       "self": kind == "self", "os": clean(n.get("OS"), 16)})
     return nodes, None
@@ -1917,10 +1918,10 @@ def parse_peer_spec(spec, default_port):
 
 
 def match_node(nodes, host):
-    for n in nodes:
-        if host in (n["node"], n["host"], n["ip"]):
-            return n
-    return None
+    try:
+        return core().select_peer(nodes, host)
+    except ValueError as e:
+        die(str(e), 2)
 
 
 def run_parallel(fn, items, limit=32):
@@ -1983,14 +1984,20 @@ def discovery_rows(home, f, nodes, wanted, port, timeout, include_self):
     cfg = f.get("cfg")
     me = (f["tailscale"].get("node") or "")
     jobs = []
+    selected = None
+    if wanted is not None:
+        selected = {}
+        for host, peer_port in wanted:
+            node = match_node(nodes, host)
+            if node is not None:
+                selected.setdefault(node["node"], peer_port)
     for n in nodes:
         if n["self"] and not include_self:
             continue
-        if wanted is not None:
-            spec = [w for w in wanted if w[0] in (n["node"], n["host"], n["ip"])]
-            if not spec:
+        if selected is not None:
+            if n["node"] not in selected:
                 continue
-            p = spec[0][1]
+            p = selected[n["node"]]
         else:
             p = port
         jobs.append((n, p))

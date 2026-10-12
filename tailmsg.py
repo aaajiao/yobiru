@@ -97,6 +97,41 @@ def is_tailnet_ip(ip):
         a = a.ipv4_mapped
     return any(a in n for n in TAILNET_NETS)
 
+def select_peer(nodes, peer):
+    """Resolve a name from a fresh normalized Tailscale snapshot, never by list order.
+
+    Short names can follow a stable HostName across a reinstall. Explicit FQDNs and
+    IPs stay exact: replies, file grants and saved notices must not change recipients.
+    """
+    p = peer.lower().rstrip(".")
+    try:
+        address = ipaddress.ip_address(p)
+    except ValueError:
+        address = None
+    matches = []
+    for n in nodes:
+        if not n.get("node") or not n.get("ip"):
+            continue
+        if address is not None:
+            ips = n.get("ips") or [n["ip"]]
+            hit = any(str(address) == str(ipaddress.ip_address(ip)) for ip in ips)
+        elif "." in p:
+            hit = p == n["node"].lower().rstrip(".")
+        else:
+            hit = p in (n["node"].split(".")[0].lower(),
+                        (n.get("hostname") or "").lower().rstrip("."))
+        if hit:
+            matches.append(n)
+    if not matches:
+        return None
+    # A precise address is never resolved through another node's HostName.
+    candidates = matches if address is not None or "." in p else \
+        [n for n in matches if n.get("online") is True] or matches
+    if len(candidates) != 1:
+        names = ", ".join(sorted(n["node"] for n in candidates))
+        raise ValueError("ambiguous peer %r: %s; use an exact MagicDNS name or IP" % (peer, names))
+    return candidates[0]
+
 def safe_name(name):
     name = Path(str(name).replace("\\", "/")).name
     name = re.sub(r'[\x00-\x1f<>:"/\\|?*]', "_", name).lstrip(".").strip()
@@ -311,15 +346,31 @@ class Ctx:
 
     def resolve(self, peer):
         """'ubuntu' | 'ubuntu.tailXXXX.ts.net' | '100.x.y.z' -> (fqdn, ipv4)"""
-        p = peer.lower().rstrip(".")
         st = self.status()
-        nodes = [st["Self"]] + list((st.get("Peer") or {}).values())
-        for n in nodes:
+        nodes = []
+        entries = [(True, st.get("Self"))] + [(False, n) for n in (st.get("Peer") or {}).values()]
+        for is_self, n in entries:
+            if not isinstance(n, dict):
+                continue
             fq = (n.get("DNSName") or "").rstrip(".").lower()
-            ips = n.get("TailscaleIPs") or []
-            if p in (fq, fq.split(".")[0], (n.get("HostName") or "").lower()) or p in ips:
-                v4 = [i for i in ips if ":" not in i]
-                return fq, (v4 or ips)[0]
+            ips = []
+            for ip in n.get("TailscaleIPs") or []:
+                try:
+                    ips.append(str(ipaddress.ip_address(ip)))
+                except (ValueError, TypeError):
+                    continue
+            if not fq or not ips:
+                continue
+            v4 = [i for i in ips if ":" not in i]
+            nodes.append({"node": fq, "hostname": n.get("HostName") or "", "ip": (v4 or ips)[0],
+                          "ips": ips, "online": st.get("BackendState") == "Running" if is_self else
+                          n.get("Online") is True})
+        try:
+            node = select_peer(nodes, peer)
+        except ValueError as e:
+            raise RuntimeError(str(e)) from e
+        if node is not None:
+            return node["node"], node["ip"]
         raise RuntimeError("peer %r not found in `tailscale status`" % peer)
 
     @staticmethod
