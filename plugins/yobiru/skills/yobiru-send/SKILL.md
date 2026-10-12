@@ -76,7 +76,14 @@ do not silently redirect them through a similar name.
 | 403 | The receiver's access policy denied this machine, or the identity did not match. Check deny rules and any active allowlist; do not widen access without the owner's authorization. |
 | 400 | A field was rejected (for example a named agent or wake on an older receiver) or the address was wrong. |
 | 413 | Too large; send the content as a file. |
-| connection error | No receiver reachable: not running, wrong port, ACL or shields-up blocking. |
+| connection error | No complete response: receiver or network path may be unavailable. Delivery is unknown; the receiver may already have stored the message. |
+
+For a timeout or connection failure, report the named peer, resolved IP:port, and message ID from
+the diagnostic. Check that the receiver is running, then use the suggested bounded, read-only
+`tailscale ping --c 3 --timeout 3s HOST` to inspect the network path. A successful ping does not prove
+the Yobiru port or access policy allows the request. Do not restart Tailscale automatically. Check
+the recipient's inbox for the message ID before another send: running `send` again creates a new ID
+and can duplicate an already delivered message.
 
 Report the status and the message id to the user as they are. Do not say the other agent read or did
 anything: that is only known when it replies (a message whose `reply_to` is this id, see yobiru-inbox).

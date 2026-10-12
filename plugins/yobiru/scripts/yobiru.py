@@ -227,15 +227,19 @@ def run_tailscale(cmd, args, timeout=10):
     return p.stdout, None
 
 
-def probe_health(host, port, timeout=2.0):
+def probe_health(host, port, timeout=2.0, peer=None):
+    c = None
     try:
         c = http.client.HTTPConnection(host, int(port), timeout=timeout)
         c.request("GET", "/health")
         r = c.getresponse()
         body = r.read(4096)
-        c.close()
     except (OSError, http.client.HTTPException, ValueError) as e:
-        return {"url": "http://%s:%s/health" % (host, port), "reachable": False, "error": type(e).__name__}
+        return {"url": "http://%s:%s/health" % (host, port), "reachable": False, "error": type(e).__name__,
+                "detail": core().transport_diagnostic(peer or host, host, port, "GET /health", e)}
+    finally:
+        if c is not None:
+            c.close()
     out = {"url": "http://%s:%s/health" % (host, port), "reachable": True, "http_status": r.status}
     try:
         j = json.loads(body.decode("utf-8"))
@@ -383,7 +387,7 @@ def gather(home, home_source, probe=True):
     f["tailscale"] = ts
     if probe and cfg is not None:
         host = cfg.get("bind") or next((i for i in ts.get("ips") or [] if ":" not in i), None)
-        f["receiver"] = probe_health(host, f["port"]) if host else {"reachable": False,
+        f["receiver"] = probe_health(host, f["port"], peer=ts.get("node")) if host else {"reachable": False,
                                                                      "error": "no Tailscale IPv4 address"}
     runtime = home / "tailmsg.py"
     f["runtime"] = {"path": str(runtime), "present": runtime.is_file()}
@@ -512,7 +516,8 @@ def doctor_checks(f):
         elif r.get("reachable"):
             add("warn", "receiver", "something answered %s with HTTP %s" % (r["url"], r.get("http_status")))
         else:
-            add("warn", "receiver", "no receiver at %s (%s)" % (r.get("url", "-"), r.get("error")),
+            add("warn", "receiver", r.get("detail") or "receiver probe failed at %s (%s)" %
+                (r.get("url", "-"), r.get("error")),
                 "to receive messages run the receiver as a service: `%s install-runtime`, then install "
                 "the definition printed by `%s service-template ...`" % (PRODUCT, PRODUCT))
     rt = f["runtime"]
@@ -1829,11 +1834,13 @@ def probe_info(ip, port, timeout=3.0, expect_node=None, host=None):
     deadline = time.monotonic() + timeout          # one budget for /info and the /health fallback
     try:
         status, body = http_request(ip, port, "GET", "/info", host=host, timeout=timeout)
-    except socket.timeout:
+    except socket.timeout as e:
         res["error"] = "timeout"
+        res["detail"] = core().transport_diagnostic(expect_node or host or ip, ip, port, "GET /info", e)
         return res
     except (OSError, http.client.HTTPException, ValueError) as e:
         res["error"] = type(e).__name__
+        res["detail"] = core().transport_diagnostic(expect_node or host or ip, ip, port, "GET /info", e)
         return res
     res["http_status"] = status
     if status == 200:
@@ -2030,7 +2037,7 @@ def discovery_rows(home, f, nodes, wanted, port, timeout, include_self):
             row.update(send_permission="blocked", detail="the receiver answered 403: its access policy rejected "
                                                          "this machine (allowlist or deny rule; not a network failure)")
         elif pr["kind"] == "unreachable":
-            row["detail"] = "no receiver answered on port %d in time (%s): not running, slow, another port, " \
+            row["detail"] = pr.get("detail") or "no receiver answered on port %d in time (%s): not running, slow, another port, " \
                             "ACL or shields-up; this does not mean the machine is offline or Yobiru is not " \
                             "installed" % (p, pr["error"])
         else:
