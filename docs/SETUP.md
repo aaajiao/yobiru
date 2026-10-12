@@ -99,6 +99,12 @@ These are separate. Delivery: the Codex bridge (`yobiru codex-bridge install --t
 or renames a session; with the Codex bridge the dispatcher UUID is reported automatically and a
 conflicting binding is refused.
 
+For a Codex dispatcher using `workspace-write`, also follow [minimum sandbox access](CODEX_SANDBOX.md):
+use absolute writable roots for the configured inbox and handled directory, plus outbox only for
+attachment replies. Prepare these directories before starting the restricted session. Keep policy,
+runtime and queue files read-only; never make the entire data home writable. Network access is only
+needed for authorized replies/downloads, and does not override `allow_replies=false`.
+
 ## 5. Verify
 
 ```sh

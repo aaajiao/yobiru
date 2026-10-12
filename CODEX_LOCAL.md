@@ -86,6 +86,14 @@ sh "$Y" codex-bridge status
 - `allow_replies` 首次安装为 false；升级时保留已授权的设置，`--no-allow-replies` 可显式关闭，`--allow-replies` 仅在用户明确授权后使用。
 - 既有顶层 exec/webhook adapter、其他 agent 及未知字段原样保留；只设置 `agents.codex.wake_adapter`。已有不同的 codex adapter、不同的入口 UUID、混合 UUID 的队列、或已被另一数据目录占用的 user unit 时，安装在写入任何文件之前拒绝。
 
+### 入口会话的沙箱写权限
+
+receiver 和 bridge 服务能收件、入队，不代表 Codex 入口能写入工作区之外的消息目录。使用 `sandbox_mode="workspace-write"` 时，入口至少需要 `<tailmsg_home>/inbox`（ack 的临时文件和原子替换）及 `<bridge_home>/handled`（去重、派发和回复记录）的额外写权限。纯文本回复不写 outbox；带附件的回复才需要 `<tailmsg_home>/outbox`。回复、下载附件需要网络；ack 和 handled 记录不需要。`allow_replies=false` 始终禁止自动回复，网络权限不会改变这项授权。
+
+先在可信本机安装环境中准备好配置、inbox、outbox 和 handled 目录，使用配置实际记录的绝对路径。不能把整个数据目录或 bridge 状态目录设为可写，也不能把它们的父目录当作可写工作区，否则入口能修改访问策略、`allow_replies`、运行代码或队列。`approval_policy="never"` 不会额外授予权限。修改 app-server 的默认值后仍需核对既有入口会话实际生效的权限。
+
+完整路径表、最小权限启动示例和验收步骤见 [Codex sandbox setup](docs/CODEX_SANDBOX.md)；插件内同一文档位于 `scripts/codex_bridge/CODEX_SANDBOX.md`。写入失败时停止并保留待办，不能把 handled 记录改存到其他工作区，或绕过沙箱。适配器不会自动调整这些权限。
+
 ### 状态含义与 `uncertain` 排查
 
 `enqueued` 只表示官方 CLI 返回了该会话的入队回执，不表示模型已处理或任务完成；完成与否要看入口会话的记录、产物或回复。
