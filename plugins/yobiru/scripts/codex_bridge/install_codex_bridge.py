@@ -19,7 +19,7 @@ from codex_bridge import validate_config  # noqa: E402  (sibling module, after t
 
 SOURCE = Path(__file__).resolve().parent
 LABEL = "dev.tailmsg.codex-bridge"
-FILES = ("codex_bridge.py", "codex_queue_client.py", "CODEX_DISPATCHER.md")
+FILES = ("codex_bridge.py", "codex_queue_client.py", "codex_resident.py", "CODEX_DISPATCHER.md")
 DEFAULT_CODEX = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
 TUNING = {"poll_seconds": 2, "batch_delay_seconds": 30, "retry_seconds": 15}
 

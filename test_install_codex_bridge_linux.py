@@ -331,7 +331,7 @@ class LinuxInstallerTests(unittest.TestCase):
         shutil.copytree(str(INSTALLER.parent), str(source),
                         ignore=lambda d, names: [n for n in names if n not in (
                             "install_codex_bridge_linux.py", "install_codex_bridge.py", "codex_bridge.py",
-                            "codex_queue_client.py", "CODEX_DISPATCHER.md")])
+                            "codex_queue_client.py", "codex_resident.py", "CODEX_DISPATCHER.md")])
         with open(str(source / "codex_bridge.py"), "a") as f:
             f.write("# version two\n")
         self.clear_calls()
@@ -413,6 +413,19 @@ class LinuxInstallerTests(unittest.TestCase):
         self.refused(self.run_installer("--rollback", upgrade["backup"], "--dry-run"), "unexpected target")
         self.assertEqual([], self.calls())
 
+    def test_rollback_accepts_pre_resident_manifest_layout(self):
+        first = self.ok(self.install("--no-start"))
+        manifest_path = Path(first["backup"]) / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["targets"] = [entry for entry in manifest["targets"]
+                               if not entry["path"].endswith("/codex_resident.py")]
+        manifest_path.write_text(json.dumps(manifest))
+        self.ok(self.run_installer("--rollback", first["backup"], "--dry-run"))
+        self.ok(self.run_installer("--rollback", first["backup"], "--no-start"))
+        self.assertEqual(self.original, json.loads((self.home / "config.json").read_text()))
+        self.assertFalse(self.unit.exists())
+        self.assertEqual([], self.calls())
+
     # ------------------------------------------------------------ pinned settings on upgrade
     def test_upgrade_from_another_ambient_account_keeps_pinned_settings(self):
         self.ok(self.install("--no-start", "--allow-replies"))
@@ -445,7 +458,7 @@ class LinuxInstallerTests(unittest.TestCase):
         source = self.root / "source v2"
         source.mkdir()
         for name in ("install_codex_bridge_linux.py", "install_codex_bridge.py", "codex_bridge.py",
-                     "codex_queue_client.py", "CODEX_DISPATCHER.md"):
+                     "codex_queue_client.py", "codex_resident.py", "CODEX_DISPATCHER.md"):
             shutil.copy2(str(INSTALLER.parent / name), str(source / name))
         with open(str(source / "CODEX_DISPATCHER.md"), "a") as f:
             f.write("\nnew template paragraph\n")

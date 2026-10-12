@@ -3,8 +3,9 @@
 CodexAppClient(config).call_tool('send_message_to_thread', arguments) uses the
 official `codex queue` command. The Codex desktop app (macOS) or an existing
 local app-server reached through `--remote unix:///absolute/socket` (Linux) owns
-and executes the real session; this client never creates/resumes a model
-session, never selects `--last`, and never changes permissions.
+and executes the real session; this queue client never creates/resumes a model
+session, never selects `--last`, and never changes permissions. The Linux daemon
+separately keeps the fixed thread loaded through codex_resident.py.
 `read_thread` uses a short-lived official app-server for a read-only thread/read
 request, returning only Tailmsg markers from user messages for reconciliation.
 `read_thread_name()` is a separate metadata-only thread/read (includeTurns false)

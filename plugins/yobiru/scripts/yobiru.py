@@ -1492,6 +1492,18 @@ def bridge_status(home):
                 hints.append(BRIDGE_HINTS.get(problem[0], problem[1]))
             if not out["codex_path_ok"]:
                 hints.append(BRIDGE_HINTS["runtime_unavailable"])
+            try:
+                resident_path = BRIDGE / "codex_resident.py"
+                spec = importlib.util.spec_from_file_location("yobiru_codex_resident", str(resident_path))
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                out["resident"] = module.resident_status(db.parent, cfg.get("dispatcher_thread_id"))
+            except Exception:
+                out["resident"] = {"state": "unknown"}
+            if out["resident"]["state"] != "connected":
+                hints.append("the fixed dispatcher is not confirmed resident; start/restart "
+                             "tailmsg-codex-bridge.service and inspect its journal. A listening socket or "
+                             "an enqueued receipt alone does not mean a turn can run")
         if db is not None and db.is_file():
             try:
                 con = sqlite3.connect(db.as_uri() + "?mode=ro", uri=True, timeout=2)

@@ -359,10 +359,14 @@ def load_backup(args):
         raise InstallError("the backup was not made by the Linux installer for %s" % home)
     targets = manifest.get("targets")
     expected = {name: str(path) for name, path in layout(home).items()}
-    if not isinstance(targets, list) or len(targets) != len(BACKUP_NAMES):
+    # Releases before the resident helper had one fewer source file. Preserve their
+    # rollback manifests while still validating every path against the exact layout.
+    legacy_names = tuple(name for name in BACKUP_NAMES if name != "codex-local/codex_resident.py")
+    names = legacy_names if isinstance(targets, list) and len(targets) == len(legacy_names) else BACKUP_NAMES
+    if not isinstance(targets, list) or len(targets) != len(names):
         raise InstallError("the backup manifest is incomplete")
     checked = []
-    for name, entry in zip(BACKUP_NAMES, targets):
+    for name, entry in zip(names, targets):
         if not isinstance(entry, dict):
             raise InstallError("the backup manifest is malformed")
         path = Path(str(entry.get("path")))

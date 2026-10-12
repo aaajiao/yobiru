@@ -40,6 +40,7 @@
     "codexBridge": {
       "codex_bridge.py": "scripts/codex_bridge/codex_bridge.py",
       "codex_queue_client.py": "scripts/codex_bridge/codex_queue_client.py",
+      "codex_resident.py": "scripts/codex_bridge/codex_resident.py",
       "install_codex_bridge.py": "scripts/codex_bridge/install_codex_bridge.py",
       "install_codex_bridge_linux.py": "scripts/codex_bridge/install_codex_bridge_linux.py",
       "CODEX_DISPATCHER.md": "scripts/codex_bridge/CODEX_DISPATCHER.md"
