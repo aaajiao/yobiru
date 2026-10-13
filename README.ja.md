@@ -23,6 +23,7 @@ Yobiru は **Tailscale** を使い、複数のコンピューターやクラウ�
 Yobiru は、エージェントが共有できる軽量な通信手段を提供します。
 
 - **マシンを越えて会話：** `host/agent` で宛先を指定し、受信したメッセージに返信できます。
+- **依頼の状態を追跡：** 受領通知、進捗、最終結果を確認し、期限とタイムアウト状態を照会できます。通常の通知には返信不要です。
 - **必要な情報を共有：** テキスト、JSON、レポート、ログ、その他のファイルを送れます。
 - **起動は受信側のルールで：** 誰がどのエージェントを起動できるかを受信側で決め、通知を控える時間帯や頻度を設定できます。
 - **今のツールを使い続ける：** 一つのプラグインに六つのスキルと Python CLI を収録し、Codex と Cursor のマニフェスト、Grok Bot の導入経路を用意しています。
@@ -193,9 +194,9 @@ macOS では `systemd-user` の代わりに `launchd`、Windows では `windows`
 `agent-laptop` から、許可した相手に共有する予定の内容を送信します。
 
 ```sh
-sh "$Y" send research-node/grok "Hello from Codex. Please send back a short status."
-sh "$Y" send research-node/grok '{"type":"research-request","topic":"agent tools"}' --kind request
-sh "$Y" send research-node/grok "Please review this brief." --file ./brief.md --wake batch
+sh "$Y" send research-node/grok "The brief is available." --kind notice
+sh "$Y" request send research-node/grok '{"topic":"agent tools","ask":"Report your findings."}' --timeout-seconds 900 --wake now
+sh "$Y" request send research-node/grok "Please review this brief." --file ./brief.md --timeout-seconds 900
 ```
 
 先に `brief.md` を作成するか、共有したい既存ファイルに置き換えてください。JSON はメッセージ本文であり、実行する指示ではありません。メッセージエンベロープの標準上限は 256 KiB です。大きいデータは添付ファイルにしてください。`--file` を繰り返すと複数のファイルを添付できます。
@@ -208,11 +209,34 @@ sh "$Y" send research-node/grok "Please review this brief." --file ./brief.md --
 sh "$Y" inbox --pending --agent grok
 sh "$Y" show MESSAGE_ID
 sh "$Y" fetch MESSAGE_ID
-sh "$Y" reply MESSAGE_ID "Reviewed. Here is my summary."
+sh "$Y" request respond MESSAGE_ID "Started reviewing." --state running
+sh "$Y" request respond MESSAGE_ID "Reviewed. Here is my summary." --state completed
 sh "$Y" ack MESSAGE_ID
 ```
 
-`fetch` は添付ファイルを取得して検証します。`reply` は元の送信エージェントに返信し、`reply_to` を設定します。`ack` は**このマシン上だけで**処理済みにします。起動アダプターがない場合、エージェントへの依頼時、またはエージェント自身のスケジュール機能が動くときに受信箱を確認します。
+`fetch` は添付ファイルを取得して検証します。追跡対象の依頼では、許可された作業の開始前に `running` を送り、最後に `completed`、`failed`、`rejected` または `blocked` を保存してから `ack` します。`reply ID TEXT` も追跡対象では最終結果 `completed` を保存します。進捗には `request respond --state running` を使ってください。結果ファイルは `request respond ID TEXT --state completed --file PATH` または `reply ID TEXT --file PATH` で添付でき、元の認証済み送信先への返信経路が維持されます。`ack` は**このマシン上だけで**処理済みにし、追跡対象の依頼には永続保存された最終応答が必要です。起動アダプターがない場合、エージェントへの依頼時、またはエージェント自身のスケジュール機能が動くときに受信箱を確認します。
+
+## 依頼の受領通知と最終結果
+
+0.5 では `request send` と `send --kind request` が既定で追跡対象の依頼を作成します。相手の `/info` に `request-lifecycle-v1` が必要なため、旧版の相手は先に更新してください。受領・結果の追跡保証がない通常の依頼でよいと明示的に判断した場合だけ、`send --kind request --legacy-request` を使います。既存の v1 メッセージは引き続き受信できます。
+
+受信側は依頼を永続保存した後、最小限の `received` 応答を自動記録します。エージェントは進捗と最終結果を報告し、権限や環境が不足する場合は成功ではなく `blocked` を返します。通知（`--kind notice`、更新通知も含む）には返信不要です。受領通知と応答は `wake: none` を使い、さらなる返信を発生させません。
+
+返事がない理由を推測する代わりに、状態を照会できます。
+
+```sh
+sh "$Y" request status REQUEST_ID --json
+sh "$Y" request status REQUEST_ID --refresh --json
+sh "$Y" request list --json
+```
+
+`--refresh` なしではローカル台帳を読み、付けると元の受信先に認証付きで照会します。`received` は保存済み、`running` はエージェントが開始を報告した状態です。`completed`、`failed`、`rejected`、`blocked` は最終結果です。期限（既定 900 秒）までに最終結果が届かなければ `timed_out` となり、**実際の実行結果は不明**です。作業の取消や、安全に再実行できることを意味しません。遅れて届いた最終応答は結果を更新し、`late` と表示されます。再依頼の前に状態と実際の処理を確認してください。
+
+追跡対象の応答は認証済みの依頼台帳に保存され、通常の受信箱には入らず、エージェントも起動しません。結果や添付ファイルを確認するには、`request status REQUEST_ID --json` の `response.id` を使い、`show RESPONSE_ID` または `fetch RESPONSE_ID` を実行します。取得したファイルはサイズと SHA-256 の検証後、`<home>/inbox/RESPONSE_ID/files/` に保存されます。プロトコル応答を新しいタスクとして返信・ack しないでください。
+
+受領通知と結果は永続キューに保存され、稼働中の受信サービスが同じ応答 ID で再送します。`request maintain` で保守処理を一度だけ実行することもできます。自動照合には両側のデータ保持と受信サービスの稼働が必要です。オフラインの端末や、動かないエージェントに完了を強制することはできません。追跡するのは報告された結果なので、重要な作業では根拠も確認してください。
+
+Codex の業務上の返信には引き続きローカルの許可が必要です。`allow_replies=false` なら、ブリッジはモデルを起動せず最小限の `blocked` 結果を記録し、返信設定を自動変更しません。明示的な `--allow-replies` は、所有者の既存の許可範囲での返信を認めるだけで、相手から届く任意の指示を実行する権限にはなりません。独自の窓口指示には、更新時に「最終応答を保存してから ack」の手順を取り込んでください。
 
 ## 起動と配信状態
 
@@ -241,7 +265,7 @@ sh "$Y" codex-bridge status
 | `ack` | 受信側がローカルで処理済みにしたこと。送信側には通知されません。 |
 | 結果を記した返信 | エージェントによる結果報告。完了の確認が必要な場合は、示された根拠を確認してください。 |
 
-Yobiru はタスクの厳密な一回実行や、メッセージの自動再配信を保証しません。起動の試行には回数制限付きの再試行があります。メッセージ ID、ローカルの確認記録、タスク完了はそれぞれ別の概念です。
+Yobiru はタスクの厳密な一回実行や、通常メッセージの自動再配信を保証しません。追跡対象の応答には永続的な再送キューがあり、起動の試行には回数制限付きの再試行があります。メッセージ ID、ローカルの確認記録、報告された結果、検証済みの成功はそれぞれ別の概念です。
 
 ## どのエージェントがオンラインで、どのセッションが担当しているか
 
@@ -290,7 +314,7 @@ sh "$Y" update status                    # インストール済みプラグイ�
 sh "$Y" update notify --channel preview  # 予行。確認後に --apply
 ```
 
-`notify` は、このマシンのプラグイン、ランタイム、稼働中の受信プロセスがすべて公開済みの公式リリースになった後にだけ、バージョン付きの通知を既知のインストール（発見された受信側、`--peer`、`agents --remember` で記憶したもの、未完了の通知）に送ります。マシンとエージェントごとに永続的な状態を持ちます：`notified`（202 かつメッセージ ID の受領確認あり。アップグレード済みの証明ではない）、`verified`（後の発見でそのバージョンの稼働を確認。ソフトウェアのみ）、`pending`（オフライン。次回再試行）、`blocked`（403。相手の `/info` でアクセス回復が確認できた場合か `--retry-blocked` 指定時のみ再送）、`rejected`、`uncertain`（自動再送しない。`--reconcile-uncertain` は同一のメッセージ ID で再送）。通知は `wake: now` を要求しますが、最終的には各受信側の起動ポリシーが決めます。受け取った通知はエージェントと所有者への情報であり、命令ではありません。任意のリマインダー：`update reminder-template systemd-user|launchd|cron` が毎週 `update check --record` を実行する定義を表示します。
+`notify` は、このマシンのプラグイン、ランタイム、稼働中の受信プロセスがすべて公開済みの公式リリースになった後にだけ、バージョン付きの通知を既知のインストール（発見された受信側、`--peer`、`agents --remember` で記憶したもの、未完了の通知）に送ります。マシンとエージェントごとに永続的な状態を持ちます：`notified`（202 かつメッセージ ID の受領確認あり。アップグレード済みの証明ではない）、`verified`（後の発見でそのバージョンの稼働を確認。ソフトウェアのみ）、`pending`（オフライン。次回再試行）、`blocked`（403。相手の `/info` でアクセス回復が確認できた場合か `--retry-blocked` 指定時のみ再送）、`rejected`、`uncertain`（自動再送しない。`--reconcile-uncertain` は同一のメッセージ ID で再送）。通知は `wake: now` を要求しますが、最終的には各受信側の起動ポリシーが決めます。受け取った通知はエージェントと所有者への情報であり、命令ではありません。通知への返信は不要です。更新の結果が必要なら、別途許可された追跡対象の依頼を送ってください。任意のリマインダー：`update reminder-template systemd-user|launchd|cron` が毎週 `update check --record` を実行する定義を表示します。
 
 オフラインのインストールには、先に `update notify --peer HOST/AGENT --apply` で通知を許可します。受信側に届くまで pending として保持します。`update maintain --apply` は更新確認を記録し、**すでにキューにあるアップグレード通知だけ**を再試行・検証します。取得済みの公式リリース情報は 6 時間キャッシュします。新しい宛先の追加、ソフトウェアのインストール、遠隔ポリシー変更は行いません。15 分ごとと起動後に実行するには、任意の定期ジョブを生成・インストールします：
 

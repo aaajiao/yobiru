@@ -1,6 +1,6 @@
 ---
 name: yobiru-send
-description: Send a Yobiru (tailmsg) message, structured data or files to an agent on another machine in the user's Tailscale network, ask for a wake-up, or reply to a received message. Use when the user asks to message, notify, hand a file to, or answer another machine's agent, for example "send this report to the codex agent on my dev server".
+description: Send Yobiru messages, data and files to another machine's agent; make tracked requests with receipts, deadlines and final results; query their status; or reply. Use for cross-agent collaboration, requests, notifications and checking why a requested result has not arrived.
 ---
 
 # Yobiru: send, reply, data and files
@@ -50,7 +50,10 @@ do not silently redirect them through a similar name.
 
 ## Commands
 
-    sh Y send dev-server/codex "Nightly build failed on main; log attached" --file ./build.log --wake now
+    sh Y send dev-server/codex "Nightly build failed on main; log attached" --kind notice --file ./build.log --wake now
+    sh Y request send dev-server/codex "Investigate the build and report the result." --timeout-seconds 900 --wake now
+    sh Y request status REQUEST_ID --refresh --json
+    sh Y request list
     sh Y send bot-box "{\"type\":\"status\",\"job\":\"backup\",\"ok\":true}" --kind status
     sh Y reply MESSAGE_ID "Done. Summary attached." --file ./summary.md
 
@@ -62,8 +65,48 @@ do not silently redirect them through a similar name.
   as `--file`.
 - `--wake now|batch|none` is only a request; the receiver's policy decides and may lower it. Leave it
   out for receivers that predate the wake field (they reject it).
-- `reply ID TEXT` sets reply_to and goes back to the agent that sent the original message.
-- `--as NAME` sends as another local agent name; the default is the configured self_agent.
+- `reply ID TEXT` sets reply_to and goes back to the sending agent. For a tracked request it also
+  saves a final `completed` response; use `request respond --state running` for progress and
+  `--state failed|rejected|blocked` for other final outcomes (choose one state, not the literal pipe list).
+- `--as NAME` chooses the local agent on a new message; the default is configured self_agent.
+  Tracked replies preserve the original authenticated route and reject `--agent`, `--as` and `--port`
+  overrides. Both `reply` and `request respond` accept `--file PATH` and optional `--ttl-hours N`.
+
+## Requests require an outcome; notifications need no reply
+
+Use `request send PEER TEXT --timeout-seconds 900` whenever you need the other agent to answer or
+perform work and report the result. `send --kind request` also creates a tracked request by default.
+Both require the peer to advertise `request-lifecycle-v1` in authenticated `/info`; a legacy or
+unreachable peer must not silently get an untracked fallback. Only use `send --kind request
+--legacy-request` when the user accepts legacy delivery without tracked receipts or final outcomes.
+
+For information that needs no response, use `send --kind notice`. Upgrade notices also need no reply;
+when upgrade verification is required, send a separate authorized tracked request. Do not reply to
+receipts or responses, and do not turn a notification into a request simply to get an acknowledgment.
+
+The receiver durably records a minimal `received` receipt automatically, without an agent turn.
+The agent reports `running`, then a final `completed`, `failed`, `rejected` or `blocked` outcome.
+A required result can be a refusal or missing-permission status: requests do not grant execution or
+business-reply permission. Receipt/response delivery uses a durable retry outbox and stable IDs;
+there is no guarantee that an offline agent executes or that a task executes exactly once.
+
+Use `request status ID --json` for locally saved state and `--refresh` to reconcile with the original
+receiver. `request list` lists saved requests. After the deadline, an unanswered request is
+`timed_out`: the execution outcome is unknown, not cancelled or necessarily failed. A late final
+response may update it and is marked late. Before retrying work, reconcile the same request and its
+actual effects; another `request send` creates a different ID and can duplicate work.
+
+## Read a tracked result or its attachments
+
+Tracked responses are stored in the authenticated request ledger, not the ordinary inbox; they never
+wake an agent. Get `response.id` from `request status REQUEST_ID --json` (refresh first if needed):
+
+    sh Y show RESPONSE_ID
+    sh Y fetch RESPONSE_ID
+
+These commands can read the authenticated response from the ledger. `fetch` checks the original
+sender, size and SHA-256 and saves files under `<home>/inbox/RESPONSE_ID/files/`. Do not reply, ack or
+manually wake the protocol response. A response ID is different from its original request ID.
 
 ## What the result means
 
@@ -85,5 +128,7 @@ the Yobiru port or access policy allows the request. Do not restart Tailscale au
 the recipient's inbox for the message ID before another send: running `send` again creates a new ID
 and can duplicate an already delivered message.
 
-Report the status and the message id to the user as they are. Do not say the other agent read or did
-anything: that is only known when it replies (a message whose `reply_to` is this id, see yobiru-inbox).
+Report the message ID and exact state. For a tracked request, save the ID and check `request status`
+instead of waiting without a way to inspect it. A receipt does not prove the agent read or did
+anything; a final response reports its outcome, and its evidence still needs checking. Legacy replies
+are ordinary messages whose `reply_to` matches the original ID (see yobiru-inbox).

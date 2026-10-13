@@ -45,7 +45,7 @@ HERE = Path(__file__).resolve().parent
 PLUGIN_ROOT = HERE.parent
 CORE = HERE / "tailmsg.py"
 BRIDGE = HERE / "codex_bridge"
-CORE_COMMANDS = ("serve", "send", "reply", "inbox", "show", "fetch", "ack", "wake")
+CORE_COMMANDS = ("serve", "send", "reply", "request", "inbox", "show", "fetch", "ack", "wake")
 LEVELS = ("none", "batch", "now")
 SERVICE_LABEL = "dev.tailmsg"    # receiver service names stay tailmsg's, matching existing installs
 PEER_RULE_RE = re.compile(
@@ -86,6 +86,9 @@ Check and set up (read-only unless --apply):
   version
 
 Messaging (passed unchanged to the bundled tailmsg.py):
+  request send PEER[/AGENT] TEXT [--timeout-seconds 900] [--wake now|batch|none]
+  request status ID [--refresh] [--json]     request list [--json]
+  request respond ID TEXT --state running|completed|failed|rejected|blocked
   send PEER[/AGENT] TEXT [--file F]... [--wake now|batch|none] [--agent A] [--kind K]
   reply ID TEXT [--file F]...      inbox [--pending] [--agent A]      show ID      fetch ID
   ack ID [ID...]                   wake ID                            serve
@@ -1280,9 +1283,12 @@ def cmd_install_runtime(home, home_source, argv):
     target = home / "tailmsg.py"
     if not home.is_dir():
         die("no data home at %s; run `%s setup` first" % (home, PRODUCT), 2)
+    request_dir = home / "requests"
+    if request_dir.is_symlink() or (request_dir.exists() and not request_dir.is_dir()):
+        die("request state path must be a real directory: %s" % request_dir, 2)
     new_hash = sha256_file(CORE)
     res = {"command": "install-runtime", "target": str(target), "bundled_sha256": new_hash, "dry_run": not a.apply,
-           "written": False, "backup": None}
+           "written": False, "backup": None, "request_state_dir": str(request_dir)}
     if target.is_file():
         old_hash = sha256_file(target)
         res["existing_sha256"] = old_hash
@@ -1308,6 +1314,8 @@ def cmd_install_runtime(home, home_source, argv):
         os.replace(str(tmp), str(target))
         res["written"] = True
         res["next"] = "restart the receiver service if one is running (%s never restarts services)" % PRODUCT
+    if a.apply and res["action"] != "refused":
+        request_dir.mkdir(mode=0o700, exist_ok=True)
     if a.json:
         print(json.dumps(res, indent=2))
     else:

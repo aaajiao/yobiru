@@ -23,6 +23,7 @@ Yobiru 基于 **Tailscale**，连接你不同电脑和云端工作空间里的 p
 Yobiru 为这些 agents 提供了一套轻量、共通的通信方式：
 
 - **跨机器聊天：** 用 `host/agent` 指定收件 agent，并回复它的消息。
+- **跟踪请求：** 接收回执、进度和最终结果，随时查询期限及超时状态；普通通知无需回复。
 - **交换有用的上下文：** 发送文字、JSON、报告、日志和其他文件。
 - **按你的规则唤醒：** 收件方决定哪些发送方可以唤醒哪个 agent，并设置静默时间和频率限制。
 - **继续使用自己的工具：** 同一个插件包包含六个 skills 和 Python CLI，提供 Codex、Cursor 插件清单，以及 Grok Bot 的安装路径。
@@ -193,9 +194,9 @@ macOS 将 `systemd-user` 换为 `launchd`，Windows 换为 `windows`。按照生
 在 `agent-laptop` 上，向你授权的收件方发送打算分享的内容：
 
 ```sh
-sh "$Y" send research-node/grok "Hello from Codex. Please send back a short status."
-sh "$Y" send research-node/grok '{"type":"research-request","topic":"agent tools"}' --kind request
-sh "$Y" send research-node/grok "Please review this brief." --file ./brief.md --wake batch
+sh "$Y" send research-node/grok "The brief is available." --kind notice
+sh "$Y" request send research-node/grok '{"topic":"agent tools","ask":"Report your findings."}' --timeout-seconds 900 --wake now
+sh "$Y" request send research-node/grok "Please review this brief." --file ./brief.md --timeout-seconds 900
 ```
 
 请先创建 `brief.md`，或换成你确实想分享的已有文件。JSON 是消息内容，不是可执行指令。默认消息信封上限为 256 KiB，更大的数据请作为附件发送。重复使用 `--file` 可以附带多个文件。
@@ -208,11 +209,34 @@ sh "$Y" send research-node/grok "Please review this brief." --file ./brief.md --
 sh "$Y" inbox --pending --agent grok
 sh "$Y" show MESSAGE_ID
 sh "$Y" fetch MESSAGE_ID
-sh "$Y" reply MESSAGE_ID "Reviewed. Here is my summary."
+sh "$Y" request respond MESSAGE_ID "Started reviewing." --state running
+sh "$Y" request respond MESSAGE_ID "Reviewed. Here is my summary." --state completed
 sh "$Y" ack MESSAGE_ID
 ```
 
-`fetch` 下载并校验附件。`reply` 会回复原发送方的 agent，并设置 `reply_to`。`ack` **只在本机**将消息标记为已处理。没有唤醒适配器时，需要你让 agent 检查收件箱，或由 agent 自己的调度机制定时检查。
+`fetch` 下载并校验附件。跟踪请求在开始已获授权的工作前发送 `running`，结束后先保存 `completed`、`failed`、`rejected` 或 `blocked` 最终响应，再 `ack`。`reply ID TEXT` 对跟踪请求也会保存 `completed`；进度使用 `request respond --state running`。结果文件可用 `request respond ID TEXT --state completed --file PATH` 或 `reply ID TEXT --file PATH` 附上，始终沿原认证发件方路由回复。`ack` **只在本机**将消息标记为已处理，跟踪请求须先有持久保存的最终响应。没有唤醒适配器时，需要你让 agent 检查收件箱，或由 agent 自己的调度机制定时检查。
+
+## 请求的回执与最终结果
+
+0.5 中，`request send` 和 `send --kind request` 默认创建跟踪请求。对端的 `/info` 必须声明 `request-lifecycle-v1`；旧端需要先升级。只有明确接受普通请求没有跟踪回执和最终结果保证时，才使用 `send --kind request --legacy-request`。已有 v1 消息仍可兼容接收。
+
+接收端持久保存请求后自动记录最小 `received` 回执。Agent 报告进度和最终结果；缺少权限或环境条件时应返回 `blocked`，不能报成功。通知（`--kind notice`，也包括升级通知）无需回复。回执和响应使用 `wake: none`，不会再触发回信。
+
+不用再猜“没有回信”意味着什么，可以直接查询：
+
+```sh
+sh "$Y" request status REQUEST_ID --json
+sh "$Y" request status REQUEST_ID --refresh --json
+sh "$Y" request list --json
+```
+
+不加 `--refresh` 读取本机账本；加上它则向原接收端进行认证核对。`received` 表示已保存，`running` 表示 agent 报告已开始处理。`completed`、`failed`、`rejected`、`blocked` 为最终结果。超过期限（默认 900 秒）还没有最终结果时，`timed_out` 表示**实际执行结果未知**，不会取消工作，也不说明重复执行安全。晚到的最终响应会更新结果并标记 `late`；再次请求前应先核对。
+
+跟踪响应保存在经过认证的请求账本中，不进入普通收件箱，也不会唤醒 agent。要阅读结果或下载结果附件，从 `request status REQUEST_ID --json` 获取 `response.id`，再运行 `show RESPONSE_ID` 或 `fetch RESPONSE_ID`。文件通过大小与 SHA-256 校验后，保存在 `<home>/inbox/RESPONSE_ID/files/`。不要把协议响应当新任务回复或 ack。
+
+回执和结果进入持久队列，由运行中的接收服务使用固定响应 ID 重试；`request maintain` 可手动运行一次维护。自动核对要求两端保留数据并运行接收服务。离线机器或从未运行的 agent 无法被强制完成工作。这里跟踪的是 agent 报告的状态，重要结果仍需检查证据。
+
+Codex 业务回复仍需本地授权。`allow_replies=false` 时，桥接只记录最小 `blocked` 结果，不运行模型，也不会偷偷开启回复。明确启用 `--allow-replies` 只允许在主人既有范围内回复，不会授权执行对端发来的任意指令。升级时，自定义入口指令需要纳入“最终响应先于 ack”的新流程。
 
 ## 唤醒与投递状态
 
@@ -241,7 +265,7 @@ sh "$Y" codex-bridge status
 | `ack` | 收件方在本地标记为已处理，不会通知发送方。 |
 | 描述结果的回复 | Agent 报告了工作结果。需要确认完成情况时，应检查附带的证据。 |
 
-Yobiru 不提供任务的恰好一次执行保证，也不会自动重新投递消息。唤醒适配器具有有限次数的重试。消息 ID、本地确认和任务完成是不同的概念。
+Yobiru 不提供任务的恰好一次执行保证，普通消息也不会自动重新投递。跟踪请求的响应使用持久重试队列，唤醒适配器具有有限次数的重试。消息 ID、本地确认、报告的结果和经验证的任务成功是不同的概念。
 
 ## 哪些 agents 在线，由哪个会话处理
 
@@ -290,7 +314,7 @@ sh "$Y" update status                    # 已安装插件、常驻运行时、�
 sh "$Y" update notify --channel preview  # 预演；确认后加 --apply
 ```
 
-只有当本机插件、运行时和运行中的接收端都已是一个已发布的官方版本时，`notify` 才会发送带版本号的通知，并且只发给已知的安装（发现到的接收端、`--peer`、用 `agents --remember` 记住的安装、此前未完成的通知）。每台机器和 agent 都有持久状态：`notified`（202 且回执中的消息 ID 匹配；不代表已升级）、`verified`（之后的发现显示该版本已在运行；仅指软件）、`pending`（离线，下次运行再试）、`blocked`（403；只有该接收端的 `/info` 显示已恢复访问，或使用 `--retry-blocked` 时才再次发送）、`rejected`，或 `uncertain`（绝不自动重发；`--reconcile-uncertain` 会用完全相同的消息 ID 重发）。通知会请求 `wake: now`，最终仍由各接收端的唤醒策略决定。收到的通知是给 agent 及其主人的信息，而不是命令。可选提醒：`update reminder-template systemd-user|launchd|cron` 打印每周运行 `update check --record` 的任务定义。
+只有当本机插件、运行时和运行中的接收端都已是一个已发布的官方版本时，`notify` 才会发送带版本号的通知，并且只发给已知的安装（发现到的接收端、`--peer`、用 `agents --remember` 记住的安装、此前未完成的通知）。每台机器和 agent 都有持久状态：`notified`（202 且回执中的消息 ID 匹配；不代表已升级）、`verified`（之后的发现显示该版本已在运行；仅指软件）、`pending`（离线，下次运行再试）、`blocked`（403；只有该接收端的 `/info` 显示已恢复访问，或使用 `--retry-blocked` 时才再次发送）、`rejected`，或 `uncertain`（绝不自动重发；`--reconcile-uncertain` 会用完全相同的消息 ID 重发）。通知会请求 `wake: now`，最终仍由各接收端的唤醒策略决定。收到的通知是给 agent 及其主人的信息，而不是命令。通知无需回复；需要升级验收结果时，另发一个已获授权的跟踪请求。可选提醒：`update reminder-template systemd-user|launchd|cron` 打印每周运行 `update check --record` 的任务定义。
 
 对于离线安装，先用 `update notify --peer HOST/AGENT --apply` 授权发送通知；接收端恢复可达前，通知保持 pending。`update maintain --apply` 记录更新检查，且仅重试或核验**此前已排队的升级通知**。成功获取的官方 release 元数据缓存六小时。它不会添加新收件方、安装软件或修改远端策略。要每 15 分钟及开机后运行，生成并安装可选的定时任务：
 

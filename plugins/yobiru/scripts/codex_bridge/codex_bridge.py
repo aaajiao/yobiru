@@ -264,6 +264,9 @@ class Bridge:
         if wake == "none" or acked or excluded:
             reason = "acked" if acked else "wake_none" if wake == "none" else "excluded_kind"
             return {"id": mid, "status": "skipped", "reason": reason}
+        reason = self._request_gate(path, mid)
+        if reason:
+            return {"id": mid, "status": "skipped", "reason": reason}
         now = self.clock()
         due = now if wake == "now" else max(now, received_at + self.batch_delay_seconds)
         cursor = self.db.execute("""INSERT OR IGNORE INTO messages
@@ -272,6 +275,30 @@ class Bridge:
             (mid, str(path), wake, due, received_at, now, now, self.thread_id, self.host_id))
         self.db.commit()
         return {"id": mid, "status": "queued" if cursor.rowcount else "duplicate"}
+
+    def _request_gate(self, path, mid):
+        """Respect current reply consent and never start an expired or finished tracked request.
+
+        The receiver owns the authenticated request ledger and delivery of minimal protocol status.
+        No model, network call, task execution or user-supplied text is used here.
+        """
+        envelope = _read_json(path).get("envelope", {})
+        if "request" not in envelope:
+            return None
+        snapshot = _POLICY_CORE.request_snapshot(self.tailmsg_home, mid, direction="incoming")
+        if snapshot is None:
+            raise Rejected("missing_request_state")
+        if snapshot.get("state") in ("completed", "failed", "rejected", "blocked", "timed_out"):
+            return "request_" + snapshot["state"]
+        if snapshot.get("overdue"):
+            return "request_expired"
+        path = Path(self.config_path)
+        current = _read_json(path)
+        if current.get("allow_replies") is not True:
+            _POLICY_CORE.request_record_response(
+                self.tailmsg_home, mid, "blocked", "Automatic agent replies are disabled on this receiver.")
+            return "request_replies_disabled"
+        return None
 
     def handler_budget(self):
         """Seconds the handler may run: the configured limit, but always ending RECEIVER_MARGIN before the
@@ -341,7 +368,7 @@ class Bridge:
 
     def _prompt(self, row):
         # Both values are validated local metadata; no sender-controlled text.
-        return ("%s\nA Tailmsg request is available in the authenticated local inbox.\n"
+        prompt = ("%s\nA Tailmsg request is available in the authenticated local inbox.\n"
                 "Message ID: %s\nInbox JSON path: %s\n"
                 "Tailmsg home: %s\nBridge state directory: %s\nBridge configuration path: %s\n"
                 "Local dispatcher instructions: %s\n"
@@ -353,6 +380,21 @@ class Bridge:
                     json.dumps(str(self.tailmsg_home), ensure_ascii=False),
                     json.dumps(str(self.home), ensure_ascii=False), json.dumps(self.config_path, ensure_ascii=False),
                     json.dumps(self.instructions, ensure_ascii=False))
+        envelope = _read_json(row["path"]).get("envelope", {})
+        if "request" in envelope:
+            prompt += ("\nThis is a tracked Yobiru request. Before acting, use the installed tailmsg.py "
+                       "with explicit --home and `request status ID --direction incoming --json`. "
+                       "Do not start expired, blocked or finished work, and never repeat an existing task. "
+                       "Within existing owner authorization, report running only when work actually starts, "
+                       "using the installed tailmsg.py with explicit --home and `request respond ID TEXT "
+                       "--state running`. Report the verified final result with --state completed, failed, "
+                       "rejected or blocked before ack. A handoff is not a final result: track it to completion. "
+                       "Requests without execution authorization must receive a minimal blocked result, "
+                       "not silent success. Keep results scoped to this request and preserve local reply consent.")
+        elif envelope.get("kind") in ("notice", "notification", "status", "yobiru-upgrade-notice") or \
+                "response" in envelope:
+            prompt += "\nThis is a notification or status receipt. Do not send an automatic reply."
+        return prompt
 
     def _set(self, mid, state, error=None, next_attempt=None):
         now = self.clock()
@@ -422,6 +464,12 @@ class Bridge:
                         self._set(row["id"], "skipped", "no_longer_pending")
                         counts["skipped"] += 1
                         continue
+                    if row["state"] != "uncertain":
+                        reason = self._request_gate(row["path"], mid)
+                        if reason:
+                            self._set(row["id"], "skipped", reason)
+                            counts["skipped"] += 1
+                            continue
                 except (OSError, ValueError):
                     self._set(row["id"], "skipped", "record_no_longer_eligible")
                     counts["skipped"] += 1

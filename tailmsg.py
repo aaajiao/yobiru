@@ -8,13 +8,13 @@ them itself and verifies sha256. Auth = Tailscale identity (`tailscale whois`) +
 per-machine access policy. Python 3.8+ stdlib only. See SPEC.md.
 """
 import argparse, datetime as dt, hashlib, http.client, ipaddress, json, mimetypes, os
-import re, secrets, shlex, shutil, ssl, stat, subprocess, sys, threading, time, unicodedata, urllib.parse
+import re, secrets, shlex, shutil, sqlite3, ssl, stat, subprocess, sys, threading, time, unicodedata, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 VERSION = 1                     # wire protocol version (unchanged)
 PRODUCT = "yobiru"
-PRODUCT_VERSION = "0.4.4"       # Yobiru release of this file; tools/build_plugin.py check keeps it in sync
+PRODUCT_VERSION = "0.5.0"       # Yobiru release of this file; tools/build_plugin.py check keeps it in sync
 DEFAULTS = {
     "port": 7766,
     "access_policy": "tailnet",    # authenticated Tailscale peers; use "allowlist" for opt-in restriction
@@ -47,7 +47,7 @@ TAILNET_NETS = [ipaddress.ip_network("100.64.0.0/10"), ipaddress.ip_network("fd7
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}\Z")      # \Z, not $: "$" would also accept a trailing newline
 MSG_REF_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}\Z")  # a message id or a unique prefix of one (CLI input)
 TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{32,64}\Z")
-ENV_KEYS = {"v", "id", "from", "to", "ts", "kind", "text", "reply_to", "fetch", "wake", "agent", "from_agent"}
+ENV_KEYS = {"v", "id", "from", "to", "ts", "kind", "text", "reply_to", "fetch", "wake", "agent", "from_agent", "request", "response"}
 AGENT_MAX = 64
 FETCH_KEYS = {"name", "url", "sha256", "size", "mime", "expires"}
 
@@ -293,6 +293,7 @@ class Ctx:
         self._whois_cache = {}
         self._now_hits = {}          # (sender node, agent) -> [epoch seconds of effective `now`]
         self._wake_lock = threading.Lock()
+        self._inbox_lock = threading.Lock()
         self._name_cache = {}        # session id -> (expires epoch, native name lookup result)
         self._name_guard = threading.Lock()
         self._name_lookup = threading.Lock()   # one lookup subprocess at a time
@@ -500,6 +501,29 @@ def validate_env(env):
     rt = env.get("reply_to")
     if rt is not None and (not isinstance(rt, str) or not ID_RE.match(rt)):
         return "bad reply_to"
+    if any(not isinstance(env[k], str) or not env[k] for k in ("from", "to")):
+        return "bad from/to"
+    req, response = env.get("request"), env.get("response")
+    if "request" in env:
+        if (not isinstance(req, dict) or set(req) != {"timeout_seconds", "reply_port"} or
+                type(req.get("timeout_seconds")) is not int or not 1 <= req["timeout_seconds"] <= 604800 or
+                type(req.get("reply_port")) is not int or not 1 <= req["reply_port"] <= 65535 or
+                env.get("kind") != "request" or "response" in env or env.get("reply_to")):
+            return "bad request (timeout_seconds 1..604800 and reply_port 1..65535 required)"
+        try:
+            parse_iso(env["ts"]) + dt.timedelta(seconds=req["timeout_seconds"])
+        except (ValueError, OverflowError):
+            return "request deadline outside supported timestamp range"
+    if "response" in env:
+        if (not isinstance(response, dict) or set(response) != {"state", "seq"} or
+                response.get("state") not in REQUEST_STATES or type(response.get("seq")) is not int or
+                not 1 <= response["seq"] <= 9223372036854775807 or not env.get("reply_to") or env.get("wake") != "none"):
+            return "bad response"
+        expected = "request-result" if response["state"] in REQUEST_FINAL + ("timed_out",) else "request-receipt"
+        if env.get("kind") != expected:
+            return "response kind does not match state"
+    if env.get("kind") in ("request-receipt", "request-result") and response is None:
+        return "response metadata required"
     fl = env.get("fetch", [])
     if not isinstance(fl, list) or len(fl) > 100:
         return "bad fetch list"
@@ -512,6 +536,279 @@ def validate_env(env):
         if u.scheme != "http" or (u.hostname or "").lower() != str(env["from"]).lower():
             return "fetch url must be http:// on the sender's own tailnet name"
     return None
+
+
+# ---------------------------------------------------------------- durable request lifecycle (optional protocol v1 extension)
+REQUEST_CAPABILITY = "request-lifecycle-v1"
+REQUEST_STATES = ("received", "running", "completed", "failed", "rejected", "blocked", "timed_out")
+REQUEST_FINAL = ("completed", "failed", "rejected", "blocked")
+
+
+class RequestConnection(sqlite3.Connection):
+    def __exit__(self, *args):
+        try:
+            return super().__exit__(*args)
+        finally:
+            self.close()
+
+
+def request_db(ctx):
+    directory = ctx.home / "requests"
+    directory.mkdir(mode=0o700, exist_ok=True)
+    db = sqlite3.connect(str(directory / "ledger.sqlite3"), timeout=15, factory=RequestConnection)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA synchronous=FULL")
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS requests (
+            direction TEXT NOT NULL, id TEXT NOT NULL, peer TEXT NOT NULL, port INTEGER NOT NULL,
+            envelope TEXT NOT NULL, record TEXT, deadline TEXT NOT NULL, state TEXT NOT NULL,
+            seq INTEGER NOT NULL DEFAULT 0, latest TEXT, submission TEXT, timed_out_at TEXT,
+            PRIMARY KEY (direction,id));
+        CREATE TABLE IF NOT EXISTS response_outbox (
+            id TEXT PRIMARY KEY, request_id TEXT NOT NULL, peer TEXT NOT NULL, port INTEGER NOT NULL,
+            envelope TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt REAL NOT NULL DEFAULT 0, delivered_at TEXT, last_error TEXT);
+        CREATE TABLE IF NOT EXISTS response_events (
+            id TEXT PRIMARY KEY, request_id TEXT NOT NULL, envelope TEXT NOT NULL, received_at TEXT NOT NULL);
+    """)
+    return db
+
+
+def json_canonical(value):
+    return json.dumps(value, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+
+
+def request_snapshot(home, mid, direction="incoming"):
+    """Read-only bridge lookup, without creating a database or touching the network."""
+    path = Path(home) / "requests" / "ledger.sqlite3"
+    if not path.is_file():
+        return None
+    db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    db.row_factory = sqlite3.Row
+    try:
+        row = request_row(db, direction, mid)
+        return request_view(row) if row else None
+    finally:
+        db.close()
+
+
+def request_snapshots(home):
+    path = Path(home) / "requests" / "ledger.sqlite3"
+    if not path.is_file():
+        return []
+    db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    db.row_factory = sqlite3.Row
+    try:
+        return [request_view(row) for row in db.execute("SELECT * FROM requests ORDER BY rowid DESC").fetchall()]
+    finally:
+        db.close()
+
+
+def request_record_response(home, mid, state, text):
+    """Bridge-only local persistence; no network, no configuration or execution permission changes."""
+    class LocalContext:
+        pass
+    ctx = LocalContext()
+    ctx.home = Path(home)
+    return respond_request(ctx, mid, state, text)
+
+
+def request_row(db, direction, mid):
+    return db.execute("SELECT * FROM requests WHERE direction=? AND id=?", (direction, mid)).fetchone()
+
+
+def queue_response(db, row, state, text, fetch=None, max_bytes=256 * 1024):
+    """Caller holds an IMMEDIATE transaction. Persist result and retry envelope together."""
+    original = json.loads(row["envelope"])
+    seq = row["seq"] + 1
+    local_node = json.loads(row["record"])["received"].get("node", original["to"])
+    env = {"v": VERSION, "id": secrets.token_hex(8), "from": local_node, "to": row["peer"],
+           "ts": iso(now_utc()), "kind": "request-result" if state in REQUEST_FINAL + ("timed_out",) else "request-receipt",
+           "text": text, "reply_to": original["id"], "wake": "none", "response": {"state": state, "seq": seq}}
+    if original.get("agent") is not None:
+        env["from_agent"] = original["agent"]
+    if original.get("from_agent") is not None:
+        env["agent"] = original["from_agent"]
+    if fetch:
+        env["fetch"] = fetch
+    error = validate_env(env)
+    packed = json_canonical(env)
+    if error or len(packed.encode("utf-8")) > max_bytes:
+        raise ValueError(error or "response exceeds max_msg_bytes; send large content as a file")
+    db.execute("UPDATE requests SET state=?,seq=?,latest=?,timed_out_at=COALESCE(timed_out_at,?) "
+               "WHERE direction='incoming' AND id=?", (state, seq, packed,
+                iso(now_utc()) if state == "timed_out" else None, row["id"]))
+    db.execute("INSERT INTO response_outbox(id,request_id,peer,port,envelope) VALUES(?,?,?,?,?)",
+               (env["id"], row["id"], row["peer"], row["port"], packed))
+    return env
+
+
+def save_outgoing_request(ctx, env, peer, port):
+    deadline = iso(parse_iso(env["ts"]) + dt.timedelta(seconds=env["request"]["timeout_seconds"]))
+    with request_db(ctx) as db:
+        db.execute("INSERT INTO requests(direction,id,peer,port,envelope,deadline,state,submission) "
+                   "VALUES('outgoing',?,?,?,?,?,'pending','prepared')",
+                   (env["id"], peer, port, json_canonical(env), deadline))
+
+
+def accept_request(ctx, rec):
+    """Durable receipt precedes HTTP 202. Duplicate ID must have the identical authenticated owner and envelope."""
+    env, peer = rec["envelope"], rec["received"]["peer"]["node"]
+    packed = json_canonical(env)
+    with request_db(ctx) as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = request_row(db, "incoming", env["id"])
+        if row:
+            if row["peer"] != peer or row["envelope"] != packed:
+                raise ValueError("request ID already belongs to a different sender or envelope")
+            return False
+        deadline = iso(parse_iso(env["ts"]) + dt.timedelta(seconds=env["request"]["timeout_seconds"]))
+        db.execute("INSERT INTO requests(direction,id,peer,port,envelope,record,deadline,state) "
+                   "VALUES('incoming',?,?,?,?,?,?,'pending')",
+                   (env["id"], peer, env["request"]["reply_port"], packed, json_canonical(rec), deadline))
+        queue_response(db, request_row(db, "incoming", env["id"]), "received", "Request durably received; execution has not been confirmed.")
+        if rec["received"].get("agent_status") == "unknown":
+            queue_response(db, request_row(db, "incoming", env["id"]), "rejected", "The addressed agent does not exist on this receiver.")
+        elif parse_iso(deadline) <= now_utc():
+            queue_response(db, request_row(db, "incoming", env["id"]), "timed_out", "Request deadline already passed on arrival; no execution was started.")
+    return True
+
+
+def accept_response(ctx, env, peer):
+    err = validate_env(env)
+    if err or "response" not in env:
+        raise ValueError(err or "missing response")
+    packed = json_canonical(env)
+    with request_db(ctx) as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = request_row(db, "outgoing", env["reply_to"])
+        if not row:
+            raise ValueError("response does not match an outgoing request")
+        original = json.loads(row["envelope"])
+        if (peer != row["peer"] or env["from"].lower().rstrip(".") != peer or
+                env["to"].lower().rstrip(".") != original["from"].lower().rstrip(".") or
+                env.get("from_agent") != original.get("agent") or env.get("agent") != original.get("from_agent")):
+            raise ValueError("response sender or agent does not match the original request")
+        previous = db.execute("SELECT envelope FROM response_events WHERE id=?", (env["id"],)).fetchone()
+        if previous:
+            if previous["envelope"] != packed:
+                raise ValueError("response ID conflicts with an earlier response")
+            return False
+        db.execute("INSERT INTO response_events VALUES(?,?,?,?)", (env["id"], env["reply_to"], packed, iso(now_utc())))
+        state, seq = env["response"]["state"], env["response"]["seq"]
+        # A delayed receipt must never replace a result. timed_out remains explicitly unknown and can
+        # be replaced by a later, real result. Real terminal results are immutable.
+        if row["state"] not in REQUEST_FINAL and seq > row["seq"] and not (
+                row["state"] == "timed_out" and state not in REQUEST_FINAL):
+            db.execute("UPDATE requests SET state=?,seq=?,latest=?,submission='accepted',"
+                       "timed_out_at=COALESCE(timed_out_at,?) WHERE direction='outgoing' AND id=?",
+                       (state, seq, packed, iso(now_utc()) if state == "timed_out" else None, row["id"]))
+    return True
+
+
+def respond_request(ctx, mid, state, text, fetch=None):
+    if state not in ("running",) + REQUEST_FINAL:
+        raise ValueError("invalid response state")
+    with request_db(ctx) as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = request_row(db, "incoming", mid)
+        if not row:
+            raise ValueError("no tracked incoming request with this ID")
+        if row["state"] in REQUEST_FINAL:
+            previous = json.loads(row["latest"])
+            if row["state"] == state and previous["text"] == text and previous.get("fetch", []) == (fetch or []):
+                return previous
+            raise ValueError("request already has a durable final result")
+        expired = parse_iso(row["deadline"]) <= now_utc()
+        if (row["state"] == "timed_out" or expired) and state == "running":
+            raise ValueError("request deadline passed; report an actual final outcome")
+        if expired and row["state"] != "timed_out":
+            queue_response(db, row, "timed_out", "Response deadline exceeded. Execution outcome is unknown; do not automatically repeat the task.")
+            row = request_row(db, "incoming", mid)
+        return queue_response(db, row, state, text, fetch, getattr(ctx, "cfg", {}).get("max_msg_bytes", 256 * 1024))
+
+
+def expire_requests(ctx):
+    with request_db(ctx) as db:
+        db.execute("BEGIN IMMEDIATE")
+        rows = db.execute("SELECT * FROM requests WHERE direction='incoming' AND state IN ('received','running') AND deadline<=?",
+                          (iso(now_utc()),)).fetchall()
+        for row in rows:
+            queue_response(db, row, "timed_out", "Response deadline exceeded. Execution outcome is unknown; do not automatically repeat the task.")
+        db.execute("UPDATE requests SET timed_out_at=COALESCE(timed_out_at,?) WHERE direction='outgoing' "
+                   "AND state NOT IN ('completed','failed','rejected','blocked') AND deadline<=?",
+                   (iso(now_utc()), iso(now_utc())))
+
+
+def request_view(row):
+    env = json.loads(row["envelope"])
+    latest = json.loads(row["latest"]) if row["latest"] else None
+    known = row["state"] in REQUEST_FINAL
+    overdue = not known and parse_iso(row["deadline"]) <= now_utc()
+    return {"id": row["id"], "direction": row["direction"], "peer": row["peer"],
+            "agent": env.get("agent"), "from_agent": env.get("from_agent"), "port": row["port"],
+            "state": row["state"] if known or not overdue else "timed_out", "last_state": row["state"],
+            "deadline": row["deadline"], "overdue": overdue, "outcome_known": known,
+            "timed_out_at": row["timed_out_at"],
+            "late": bool(known and (row["timed_out_at"] or (latest and latest["ts"] > row["deadline"]))),
+            "seq": row["seq"], "submission": row["submission"], "response": latest}
+
+
+def incoming_request_status(ctx, mid, peer):
+    snapshot = request_snapshot(ctx.home, mid)
+    return snapshot if snapshot and snapshot["peer"] == peer else None
+
+
+def recover_request_inbox(ctx):
+    """Recover inbox files lost between SQLite commit and materialization; never replay agent execution."""
+    with request_db(ctx) as db:
+        rows = db.execute("SELECT id,record FROM requests WHERE direction='incoming'").fetchall()
+    for row in rows:
+        path = ctx.inbox / (row["id"] + ".json")
+        if not path.exists():
+            # Never overwrite an ack/wake update if another process materialized the inbox meanwhile.
+            temporary = path.with_name(path.name + ".recover-" + secrets.token_hex(4))
+            try:
+                temporary.write_bytes(row["record"].encode("utf-8"))
+                try:
+                    os.link(str(temporary), str(path))
+                except FileExistsError:
+                    pass
+            finally:
+                if temporary.exists():
+                    temporary.unlink()
+
+
+def flush_responses(ctx, limit=20):
+    """Retry only immutable protocol responses. Unknown HTTP outcomes reuse the same response ID."""
+    with request_db(ctx) as db:
+        pending = db.execute("SELECT * FROM response_outbox WHERE delivered_at IS NULL AND next_attempt<=? ORDER BY rowid LIMIT ?",
+                             (time.time(), limit)).fetchall()
+    for row in pending:
+        error = None
+        try:
+            peer, ip = ctx.resolve(row["peer"])
+            if peer != row["peer"]:
+                raise RuntimeError("response destination identity changed")
+            ident = ctx.whois(ip)
+            if not ident or ident.get("node") != row["peer"] or not ctx.access_decision(ident)[0]:
+                raise RuntimeError("response destination denied by local access policy")
+            status, body = http_json(ip, row["port"], "POST", "/msg", json.loads(row["envelope"]), host=peer, timeout=3)
+            if status not in (200, 202) or not isinstance(body, dict) or body.get("ok") is not True or body.get("id") != row["id"]:
+                raise RuntimeError("response delivery not confirmed (HTTP %s)" % status)
+        except Exception as exc:
+            error = type(exc).__name__  # avoid storing URLs, message contents or arbitrary remote error bodies
+        with request_db(ctx) as db:
+            db.execute("UPDATE response_outbox SET attempts=attempts+1,next_attempt=?,delivered_at=?,last_error=? WHERE id=? AND delivered_at IS NULL",
+                       (time.time() + min(60, 2 ** min(row["attempts"] + 1, 6)),
+                        iso(now_utc()) if error is None else None, error, row["id"]))
+
+
+def request_maintenance(ctx):
+    recover_request_inbox(ctx)
+    expire_requests(ctx)
+    flush_responses(ctx)
 
 
 # ---------------------------------------------------------------- server
@@ -573,6 +870,13 @@ def make_handler(ctx, me):
                     log("info failed:", type(e).__name__)
                     return self.reply(500, {"ok": False, "error": "info unavailable"})
                 return self.reply(200, body)
+            if path.startswith("/requests/"):
+                ident = self.identify()
+                if not ident or not self.authorize(ident):
+                    return
+                mid = path[len("/requests/"):]
+                state = incoming_request_status(ctx, mid, ident["node"]) if ID_RE.fullmatch(mid) else None
+                return self.reply(200, {"ok": True, "request": state}) if state else self.reply(404, {"ok": False, "error": "request not found"})
             m = re.match(r"^/f/([^/]+)/([^/]+)$", path)
             if not m:
                 return self.reply(404, {"ok": False, "error": "not found"})
@@ -632,24 +936,42 @@ def make_handler(ctx, me):
                 return self.reply(403, {"ok": False, "error": "'from' does not match tailscale identity %s" % ident["node"]})
             if env["to"].lower().rstrip(".") not in (me, me.split(".")[0]):
                 return self.reply(400, {"ok": False, "error": "misdirected: I am %s" % me})
-            path = ctx.inbox / (env["id"] + ".json")
-            if path.exists():
-                return self.reply(200, {"ok": True, "id": env["id"], "duplicate": True})
-            requested = env.get("wake", WAKE_DEFAULT)
-            agent, astatus = ctx.resolve_agent(env.get("agent"))
-            eff, why = ctx.wake_decision(requested, ident, agent=agent, agent_status=astatus)
-            rec = {"envelope": env, "received": {"at": iso(now_utc()), "peer": ident,
-                   "agent": agent, "agent_status": astatus,
-                   "wake": {"requested": requested, "effective": eff, "reason": why}}}
-            atomic_write(path, json.dumps(rec, ensure_ascii=False, indent=2).encode("utf-8"))
-            log("message", env["id"], "from", ident["node"] + ("/" + env["from_agent"] if env.get("from_agent") else ""),
-                "to @%s (%s)" % (agent, astatus), "files=%d" % len(env.get("fetch", [])),
-                "wake=%s->%s (%s)" % (requested, eff, why))
-            if astatus == "unknown":
-                log("WARNING: message", env["id"], "addressed to unknown agent %r: stored, nobody woken" % agent)
-            if eff == "now":
-                run_hook(ctx, path)
-            return self.reply(202, {"ok": True, "id": env["id"]})
+            with ctx._inbox_lock:
+                path = ctx.inbox / (env["id"] + ".json")
+                if "response" in env:
+                    try:
+                        fresh = accept_response(ctx, env, ident["node"])
+                    except ValueError as exc:
+                        return self.reply(409, {"ok": False, "error": str(exc)})
+                    return self.reply(202 if fresh else 200, {"ok": True, "id": env["id"], "duplicate": not fresh})
+                if path.exists():
+                    previous = json.loads(path.read_text(encoding="utf-8"))
+                    if previous.get("received", {}).get("peer", {}).get("node") != ident["node"] or previous.get("envelope") != env:
+                        return self.reply(409, {"ok": False, "error": "message ID conflicts with existing message"})
+                    return self.reply(200, {"ok": True, "id": env["id"], "duplicate": True})
+                requested = env.get("wake", WAKE_DEFAULT)
+                agent, astatus = ctx.resolve_agent(env.get("agent"))
+                eff, why = ctx.wake_decision(requested, ident, agent=agent, agent_status=astatus)
+                rec = {"envelope": env, "received": {"at": iso(now_utc()), "peer": ident, "node": me,
+                       "agent": agent, "agent_status": astatus,
+                       "wake": {"requested": requested, "effective": eff, "reason": why}}}
+                if "request" in env:
+                    try:
+                        fresh = accept_request(ctx, rec)
+                    except ValueError as exc:
+                        return self.reply(409, {"ok": False, "error": str(exc)})
+                    if not fresh:
+                        recover_request_inbox(ctx)
+                        return self.reply(200, {"ok": True, "id": env["id"], "duplicate": True})
+                atomic_write(path, json.dumps(rec, ensure_ascii=False, indent=2).encode("utf-8"))
+                log("message", env["id"], "from", ident["node"] + ("/" + env["from_agent"] if env.get("from_agent") else ""),
+                    "to @%s (%s)" % (agent, astatus), "files=%d" % len(env.get("fetch", [])),
+                    "wake=%s->%s (%s)" % (requested, eff, why))
+                if astatus == "unknown":
+                    log("WARNING: message", env["id"], "addressed to unknown agent %r: stored, nobody woken" % agent)
+                if eff == "now" and ("request" not in env or request_snapshot(ctx.home, env["id"])["state"] not in REQUEST_FINAL + ("timed_out",)):
+                    run_hook(ctx, path)
+                return self.reply(202, {"ok": True, "id": env["id"]})
 
     return H
 
@@ -931,7 +1253,7 @@ def info_payload(home, cfg, agents, me, native_name):
         out.append({"agent": name, "default": name == cfg.get("default_agent"),
                     "session": session_view(b, native_name(b)) if b else None})
     return {"ok": True, "v": VERSION, "product": PRODUCT, "version": PRODUCT_VERSION, "node": me,
-            "agents": out, "agents_total": total, "agents_truncated": total > len(names),
+            "capabilities": [REQUEST_CAPABILITY], "agents": out, "agents_total": total, "agents_truncated": total > len(names),
             "generated_at": iso(now_utc())}
 
 
@@ -1111,6 +1433,16 @@ def deliver_wake(ctx, path):
     for n in range(1, attempts + 1):
         try:
             rec = json.loads(Path(path).read_text(encoding="utf-8"))
+            if "response" in rec.get("envelope", {}):
+                err = "protocol receipts/results must not wake an agent"
+                log("wake", mid, "stopped:", err)
+                break
+            if "request" in rec.get("envelope", {}):
+                snapshot = request_snapshot(ctx.home, mid)
+                if not snapshot or snapshot["state"] in REQUEST_FINAL + ("timed_out",):
+                    err = "tracked request expired, finalized, or missing durable state; execution was not restarted"
+                    log("wake", mid, "stopped:", err)
+                    break
             allowed, reason = wake_access_decision(ctx, rec)
             if not allowed:
                 err = "access policy: " + reason
@@ -1178,6 +1510,14 @@ def cmd_serve(ctx, a):
             sweep_outbox(ctx)
             time.sleep(300)
     threading.Thread(target=sweeper, daemon=True).start()
+    def request_sweeper():
+        while True:
+            try:
+                request_maintenance(ctx)
+            except Exception as exc:
+                log("request maintenance failed:", type(exc).__name__)
+            time.sleep(1)
+    threading.Thread(target=request_sweeper, daemon=True).start()
     log("tailmsg v%d serving %s on %s:%d  home=%s" % (VERSION, me["node"], bind, port, ctx.home))
     try:
         srv.serve_forever()
@@ -1243,33 +1583,8 @@ def split_peer(peer, default_port):
     return peer, default_port
 
 
-def cmd_send(ctx, a, reply_to=None, peer=None, agent=None):
-    addr, addr_agent = split_addr(peer or a.peer)
-    opt_agent = getattr(a, "agent", None)
-    if addr_agent and opt_agent and norm_agent(addr_agent) != norm_agent(opt_agent):
-        die("conflicting agent: %r in address vs --agent %r" % (addr_agent, opt_agent))
-    agent = opt_agent or addr_agent or agent
-    from_agent = getattr(a, "as_agent", None)
-    implicit_from = from_agent is None
-    if implicit_from:
-        from_agent = ctx.cfg.get("self_agent")
-    for k, v in (("agent", agent), ("from_agent", from_agent)):
-        if v is not None and agent_name_error(v):
-            die("bad %s %r: %s" % (k, v, agent_name_error(v)))
-    me = ctx.self_node()["node"]
-    host, port = split_peer(addr, int(ctx.cfg["port"]))
-    to_fqdn, to_ip = ctx.resolve(host)
-    msg_id = secrets.token_hex(8)  # hex: never starts with "-"
-    env = {"v": VERSION, "id": msg_id, "from": me, "to": to_fqdn, "ts": iso(now_utc()),
-           "kind": a.kind, "text": a.text}
-    if reply_to or a.reply_to:
-        env["reply_to"] = reply_to or a.reply_to
-    if a.wake:  # omitted unless given, so receivers older than the wake field still accept it
-        env["wake"] = a.wake
-    if agent is not None:  # omitted unless addressed: older receivers reject unknown fields
-        env["agent"] = norm_agent(agent)
-    if from_agent is not None:
-        env["from_agent"] = norm_agent(from_agent)
+def prepare_attachments(ctx, a, env, to_fqdn):
+    me, msg_id = env["from"], env["id"]
     if a.file:
         ttl = a.ttl_hours if a.ttl_hours is not None else ctx.cfg["outbox_ttl_hours"]
         expires = iso(now_utc() + dt.timedelta(seconds=int(ttl * 3600)))
@@ -1295,8 +1610,65 @@ def cmd_send(ctx, a, reply_to=None, peer=None, agent=None):
             items.append(item)
         atomic_write(d / "meta.json", json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8"))
         env["fetch"] = items
-    status, resp = http_json(to_ip, port, "POST", "/msg", env, host=to_fqdn)
-    if status == 400 and implicit_from and "from_agent" in env and "from_agent" in str(resp.get("error", "")):
+
+
+def cmd_send(ctx, a, reply_to=None, peer=None, agent=None):
+    addr, addr_agent = split_addr(peer or a.peer)
+    opt_agent = getattr(a, "agent", None)
+    if addr_agent and opt_agent and norm_agent(addr_agent) != norm_agent(opt_agent):
+        die("conflicting agent: %r in address vs --agent %r" % (addr_agent, opt_agent))
+    agent = opt_agent or addr_agent or agent
+    from_agent = getattr(a, "as_agent", None)
+    implicit_from = from_agent is None
+    if implicit_from:
+        from_agent = ctx.cfg.get("self_agent")
+    for k, v in (("agent", agent), ("from_agent", from_agent)):
+        if v is not None and agent_name_error(v):
+            die("bad %s %r: %s" % (k, v, agent_name_error(v)))
+    me = ctx.self_node()["node"]
+    host, port = split_peer(addr, int(ctx.cfg["port"]))
+    to_fqdn, to_ip = ctx.resolve(host)
+    tracked = a.kind == "request" and not getattr(a, "legacy_request", False)
+    if tracked:
+        status, info = http_json(to_ip, port, "GET", "/info", host=to_fqdn, timeout=5)
+        if (status != 200 or not isinstance(info, dict) or info.get("node") != to_fqdn or
+                not isinstance(info.get("capabilities"), list) or REQUEST_CAPABILITY not in info["capabilities"]):
+            die("peer does not advertise request-lifecycle-v1; upgrade it or explicitly use --legacy-request (no receipt/result guarantee)")
+        timeout_seconds = getattr(a, "timeout_seconds", 900)
+        if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 604800:
+            die("--timeout-seconds must be 1..604800")
+    msg_id = secrets.token_hex(8)  # hex: never starts with "-"
+    env = {"v": VERSION, "id": msg_id, "from": me, "to": to_fqdn, "ts": iso(now_utc()),
+           "kind": a.kind, "text": a.text}
+    if tracked:
+        env["request"] = {"timeout_seconds": timeout_seconds, "reply_port": int(ctx.cfg["port"])}
+    if reply_to or a.reply_to:
+        env["reply_to"] = reply_to or a.reply_to
+    if a.wake:  # omitted unless given, so receivers older than the wake field still accept it
+        env["wake"] = a.wake
+    if agent is not None:  # omitted unless addressed: older receivers reject unknown fields
+        env["agent"] = norm_agent(agent)
+    if from_agent is not None:
+        env["from_agent"] = norm_agent(from_agent)
+    prepare_attachments(ctx, a, env, to_fqdn)
+    error = validate_env(env)
+    if error:
+        die(error)
+    if tracked:
+        save_outgoing_request(ctx, env, to_fqdn, port)
+    try:
+        status, resp = http_json(to_ip, port, "POST", "/msg", env, host=to_fqdn)
+    except (RuntimeError, OSError):
+        if tracked:
+            with request_db(ctx) as db:
+                db.execute("UPDATE requests SET submission='unknown' WHERE direction='outgoing' AND id=?", (msg_id,))
+        raise
+    if tracked:
+        with request_db(ctx) as db:
+            db.execute("UPDATE requests SET submission=? WHERE direction='outgoing' AND id=?",
+                       ("accepted" if status in (200, 202) and isinstance(resp, dict) and resp.get("ok") is True and resp.get("id") == msg_id
+                        else "unknown" if status in (200, 202) else "rejected", msg_id))
+    if status == 400 and not tracked and implicit_from and "from_agent" in env and "from_agent" in str(resp.get("error", "")):
         # receiver predates @agent: from_agent only came from config, so drop it and resend (same id;
         # the rejected attempt was not stored). An explicit --agent / --as is never dropped silently.
         print("note: %s does not understand from_agent (old tailmsg); resent without it" % to_fqdn, file=sys.stderr)
@@ -1305,8 +1677,10 @@ def cmd_send(ctx, a, reply_to=None, peer=None, agent=None):
     out = {"status": status, "response": resp, "id": msg_id, "to": to_fqdn, "files": len(env.get("fetch", []))}
     if "agent" in env:
         out["agent"] = env["agent"]
+    if tracked:
+        out["submission"] = request_snapshot(ctx.home, msg_id, "outgoing")["submission"]
     print(json.dumps(out, ensure_ascii=True))
-    if status not in (200, 202):
+    if status not in (200, 202) or (tracked and out["submission"] != "accepted"):
         sys.exit(2)
 
 
@@ -1318,6 +1692,19 @@ def load_msg(ctx, mid):
     if not p.is_file():
         hits = [x for x in ctx.inbox.glob(mid + "*.json")]
         if len(hits) != 1:
+            ledger = ctx.home / "requests" / "ledger.sqlite3"
+            if ledger.is_file():
+                db = sqlite3.connect(ledger.resolve().as_uri() + "?mode=ro", uri=True)
+                db.row_factory = sqlite3.Row
+                try:
+                    rows = db.execute("SELECT e.* FROM response_events e WHERE substr(e.id,1,?)=?", (len(mid), mid)).fetchall()
+                finally:
+                    db.close()
+                if len(rows) == 1:
+                    env = json.loads(rows[0]["envelope"])
+                    return p, {"envelope": env, "received": {"at": rows[0]["received_at"],
+                        "peer": {"node": env["from"]}, "agent": env.get("agent"),
+                        "wake": {"requested": "none", "effective": "none", "reason": "protocol response"}}}
             die("no unique message matching %r" % mid)
         p = hits[0]
     return p, json.loads(p.read_text(encoding="utf-8"))
@@ -1366,6 +1753,12 @@ def cmd_inbox(ctx, a):
 def cmd_ack(ctx, a):
     for mid in a.id:
         p, r = load_msg(ctx, mid)
+        if "response" in r["envelope"]:
+            die("protocol receipts/results are already recorded; ack is not applicable")
+        if "request" in r["envelope"]:
+            state = request_snapshot(ctx.home, r["envelope"]["id"])
+            if not state or state["last_state"] not in REQUEST_FINAL + ("timed_out",):
+                die("tracked request needs a durable final result before ack; use request respond or reply")
         if not r.get("acked_at"):
             r["acked_at"] = iso(now_utc())
             atomic_write(p, json.dumps(r, ensure_ascii=False, indent=2).encode("utf-8"))
@@ -1375,6 +1768,8 @@ def cmd_ack(ctx, a):
 def cmd_wake(ctx, a):
     """re-run the wake adapter for a stored message (manual retry / adapter test), in the foreground."""
     p, r = load_msg(ctx, a.id)
+    if "response" in r["envelope"]:
+        die("protocol receipts/results must not wake an agent")
     agent = rec_agent(r, ctx.cfg.get("default_agent"))
     if not ctx.agent_adapter(agent):
         die("no wake adapter configured for @%s" % agent if agent is not None else "no wake_adapter configured")
@@ -1447,11 +1842,86 @@ def cmd_fetch(ctx, a):
         sys.exit(2)
 
 
+def respond_with_files(ctx, rec, a, state):
+    original = rec["envelope"]
+    snapshot = request_snapshot(ctx.home, original["id"])
+    if not snapshot:
+        raise ValueError("no tracked incoming request with this ID")
+    envelope = {"id": original["id"], "from": snapshot["response"]["from"]}
+    prepare_attachments(ctx, a, envelope, rec["received"]["peer"]["node"])
+    return respond_request(ctx, original["id"], state, a.text, envelope.get("fetch"))
+
+
 def cmd_reply(ctx, a):
     _, r = load_msg(ctx, a.id)
+    if "response" in r["envelope"]:
+        die("protocol receipts/results do not accept replies; send a new request if needed")
+    if "request" in r["envelope"]:
+        if getattr(a, "agent", None) or getattr(a, "as_agent", None) or a.port:
+            die("tracked reply uses original authenticated sender and agent routing; route overrides are not allowed")
+        result = respond_with_files(ctx, r, a, "completed")
+        print(json.dumps({"id": r["envelope"]["id"], "response_id": result["id"], "state": "completed", "queued": True}))
+        return
     # route back to the sender's agent (from_agent) unless --agent overrides
     cmd_send(ctx, a, reply_to=r["envelope"]["id"], peer=r["received"]["peer"]["node"] +
              (":%d" % a.port if a.port else ""), agent=r["envelope"].get("from_agent"))
+
+
+def cmd_request(ctx, a):
+    if a.request_cmd == "send":
+        a.kind, a.reply_to = "request", None
+        return cmd_send(ctx, a)
+    if a.request_cmd == "respond":
+        _, rec = load_msg(ctx, a.id)
+        mid = rec["envelope"]["id"]
+        result = respond_with_files(ctx, rec, a, a.state)
+        print(json.dumps({"id": mid, "response_id": result["id"], "state": a.state, "queued": True}))
+        return
+    if a.request_cmd == "maintain":
+        request_maintenance(ctx)
+        print(json.dumps({"ok": True}))
+        return
+    if a.request_cmd == "list":
+        output = request_snapshots(ctx.home)
+    else:
+        output = request_snapshot(ctx.home, a.id, a.direction)
+        if not output:
+            die("no tracked %s request with this ID" % a.direction)
+    if a.request_cmd == "status" and a.refresh:
+        if a.direction != "outgoing":
+            die("--refresh is only for outgoing requests")
+        try:
+            peer, ip = ctx.resolve(output["peer"])
+            if peer != output["peer"]:
+                raise RuntimeError("request destination identity changed")
+            identity = ctx.whois(ip)
+            if not identity or identity.get("node") != peer or not ctx.access_decision(identity)[0]:
+                raise RuntimeError("request destination denied by local identity/access policy")
+            status, body = http_json(ip, output["port"], "GET", "/requests/" + a.id, host=peer, timeout=5)
+            if status != 200 or not isinstance(body, dict):
+                raise RuntimeError("receiver status unavailable (HTTP %s); outcome remains unknown" % status)
+            remote_request = body.get("request")
+            result = remote_request.get("response") if isinstance(remote_request, dict) else None
+            if not isinstance(result, dict) or result.get("reply_to") != a.id:
+                raise RuntimeError("receiver returned no matching request response")
+            accept_response(ctx, result, peer)
+            with request_db(ctx) as db:
+                output = request_view(request_row(db, "outgoing", a.id))
+            output["refresh"] = "ok"
+        except (RuntimeError, OSError, ValueError) as exc:
+            output["refresh"] = "unavailable"
+            output["refresh_error"] = str(exc)
+    if a.json:
+        print(json.dumps(output, ensure_ascii=True, indent=2))
+    else:
+        for item in output if isinstance(output, list) else [output]:
+            print("%s %s %s state=%s deadline=%s outcome=%s%s" %
+                  (item["id"], item["direction"], item["peer"], item["state"], item["deadline"],
+                   "known" if item["outcome_known"] else "unknown", " (late result)" if item["late"] else ""))
+            if item.get("response"):
+                print(item["response"]["text"])
+            if item.get("refresh_error"):
+                print(item["refresh_error"])
 
 
 def cmd_peers(ctx, a):
@@ -1505,6 +1975,33 @@ def main():
                        help="my agent name, sent as from_agent (default: config self_agent; omitted if unset)")
         if name == "send":
             p.add_argument("--reply-to")
+            p.add_argument("--timeout-seconds", type=int, default=900)
+            p.add_argument("--legacy-request", action="store_true", help="opt out of request lifecycle for an old peer")
+    pr = sp.add_parser("request", help="tracked requests, receipts, results and timeout status")
+    rs = pr.add_subparsers(dest="request_cmd", required=True)
+    rq = rs.add_parser("send")
+    rq.add_argument("peer")
+    rq.add_argument("text")
+    rq.add_argument("--timeout-seconds", type=int, default=900)
+    rq.add_argument("--legacy-request", action="store_true")
+    rq.add_argument("--file", action="append", default=[])
+    rq.add_argument("--ttl-hours", type=float)
+    rq.add_argument("--wake", choices=WAKE_LEVELS)
+    rq.add_argument("--agent")
+    rq.add_argument("--as", dest="as_agent")
+    rq = rs.add_parser("status")
+    rq.add_argument("id")
+    rq.add_argument("--direction", choices=("incoming", "outgoing"), default="outgoing")
+    rq.add_argument("--refresh", action="store_true")
+    rq.add_argument("--json", action="store_true")
+    rs.add_parser("list").add_argument("--json", action="store_true")
+    rq = rs.add_parser("respond")
+    rq.add_argument("id")
+    rq.add_argument("text")
+    rq.add_argument("--state", choices=("running",) + REQUEST_FINAL, default="completed")
+    rq.add_argument("--file", action="append", default=[])
+    rq.add_argument("--ttl-hours", type=float)
+    rs.add_parser("maintain", help="retry queued responses and persist expired request status")
     pi = sp.add_parser("inbox", help="list received messages")
     pi.add_argument("--pending", action="store_true", help="only un-acked messages with effective wake now/batch")
     pi.add_argument("--agent", help="only messages for this agent (no `agent` in message = default_agent)")
@@ -1517,10 +2014,14 @@ def main():
     if a.cmd == "reply":
         a.reply_to = None
     try:
-        ctx = Ctx(a.home)
+        if a.cmd == "request" and a.request_cmd in ("status", "list") and not getattr(a, "refresh", False):
+            ctx = object.__new__(Ctx)
+            ctx.home = Path(a.home).expanduser()
+        else:
+            ctx = Ctx(a.home)
         {"serve": cmd_serve, "send": cmd_send, "reply": cmd_reply, "inbox": cmd_inbox, "show": cmd_show,
-         "fetch": cmd_fetch, "peers": cmd_peers, "ack": cmd_ack, "wake": cmd_wake}[a.cmd](ctx, a)
-    except (RuntimeError, OSError, AdapterError) as e:
+         "fetch": cmd_fetch, "peers": cmd_peers, "ack": cmd_ack, "wake": cmd_wake, "request": cmd_request}[a.cmd](ctx, a)
+    except (RuntimeError, OSError, AdapterError, ValueError) as e:
         die(str(e))
 
 

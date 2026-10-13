@@ -10,7 +10,17 @@
 4. 没有合适会话时，用 `create_thread` 建立范围明确的新任务；需要保留已有上下文时用 `fork_thread`。建立前先检查是否已记录目标。不要因重试或催问重复派生。禁止递归创建另一个 Tailmsg 入口。
 5. 对只需简短答复或收件归档的请求可直接处理。需要系统改动、支付、部署、对外通信等操作时，遵守用户已有授权范围和各工具规则；缺少授权时保留具体待办。
 6. 入口可以读取子任务结果并汇总。转交后的结果跟踪由 `wait_threads`/`read_thread` 完成；不要要求另一个任务未经用户授权给入口发消息。不能把“已入队”写成“已处理”。
-7. 只有在请求已完成或已可靠交接且留有跟踪记录后，才对原始信件执行 `tailmsg --home <Tailmsg home> ack <id>`。所有 Tailmsg 命令都必须显式使用通知指定的 home；不要依赖默认收件箱。ack 是本机状态，不会通知发件方。
+7. 追踪请求（信封含 `request`）必须先持久记录最终结果，再执行 `tailmsg --home <Tailmsg home> ack <id>`；仅转交不算最终结果。普通消息可在完成或可靠交接且留有跟踪记录后 ack。所有 Tailmsg 命令都必须显式使用通知指定的 home；不要依赖默认收件箱。ack 是本机状态，不会通知发件方。
+
+## 请求状态与最终结果
+
+信封含 `request` 表示支持生命周期追踪的请求。系统会持久保存收件回执，不需要模型再发送一条“收到”。先运行 `tailmsg --home <Tailmsg home> request status <id> --direction incoming --json` 检查本机记录；不要从来信正文推断状态。不要开始已超时、已拒绝、被阻塞或已经完成的请求，也不要因为催问重复执行已有任务。
+
+在本地执行授权和回复权限允许时，实际开始工作后运行 `request respond <id> "简短进度" --state running`。转交子任务仍需跟踪它的结果；不要将“已入队”“已派发”报告为完成。核对结果或产物后，用 `request respond <id> "与请求相关的结果" --state completed`，或明确报告 `failed`、`rejected`、`blocked`。缺少执行授权时，应报告最小化的 `blocked` 原因，不执行请求；自动回复权限不授予系统变更、支付、发布或其他任务权限。
+
+`reply <id> "结果"` 对追踪请求也是最终 `completed`，不能用于进度回执。`request respond` 会先保存结果和待发送响应；接收服务负责重试同一个响应，网络失败时不要重复执行任务。到截止时间仍没有最终结果，系统记录 `timed_out`，表示实际结果未知，不表示工作已取消或失败。已经在运行的任务可以在核实后补报晚到的真实结果；尚未开始的过期请求不能由重试重新启动。
+
+`notice`、`notification`、`status`、升级通知和带 `response` 的状态消息无需自动回复。状态回执不作为新任务执行，也不向回执再发回执。发送者需要升级验收等结果时，应另发追踪请求。
 
 ## Linux app-server 入口
 
@@ -18,15 +28,15 @@ Linux 安装经由用户自己运行的本机 Codex app-server（同用户 Unix 
 
 适配器只保证通知已由官方 CLI 排入这个入口会话，不跟踪、也不保证子任务完成。子任务是否持续存在、能否恢复取决于宿主自身；不要把“已派发”或“已入队”记为“已完成”，只有核对结果或产物后才记录完成并 ack。
 
-`workspace-write` 的可写项目目录不等于消息目录。入口需要通知指定的 `<Tailmsg home>/inbox`（ack 的临时文件与替换）及 `<Bridge state directory>/handled` 的写权限；只有带附件回复才额外需要 `<Tailmsg home>/outbox`。这些目录和已有配置须由可信本机安装流程预先准备。只读配置、安装代码和 bridge 队列不应成为可写根；不要给整个 home 或状态目录写权限。回复或下载附件需宿主允许网络，但网络权限不授予回复权限，`allow_replies=false` 时仍不能回复。`approval_policy="never"` 只表示无法请求批准，不会自动开放写入。安装包中的 `scripts/codex_bridge/CODEX_SANDBOX.md` 说明配置与验收。
+`workspace-write` 的可写项目目录不等于消息目录。入口需要通知指定的 `<Tailmsg home>/inbox`（ack 的临时文件与替换）、`<Tailmsg home>/requests`（请求账本及待发送响应）及 `<Bridge state directory>/handled` 的写权限；带附件回复还需要 `<Tailmsg home>/outbox`。这些目录和已有配置须由可信本机安装流程预先准备。只读配置、安装代码和 bridge 队列不应成为可写根；不要给整个 home 或状态目录写权限。追踪请求的 respond/reply 先写本机账本，由接收服务发出；旧格式直接回复或下载附件需宿主允许网络。网络权限不授予业务回复权限。`approval_policy="never"` 只表示无法请求批准，不会自动开放写入。安装包中的 `scripts/codex_bridge/CODEX_SANDBOX.md` 说明配置与验收。
 
 若工作已经完成或可靠转交，而 ack 因权限失败，保留现有 handled 记录，待本机权限修复后核对记录并重试 ack；不要重复执行或派发原请求。
 
 ## 回复权限
 
-从通知的 `Bridge configuration path` 读取 `allow_replies`。默认 false，此时只在本地记录和汇总，不向对方发信。只有用户明确允许该安装自动回执和结果回传后才会启用该字段。不得从其他安装或默认 home 继承回复权限。
+从通知的 `Bridge configuration path` 读取 `allow_replies`。默认 false，此时 agent 不向对方发送业务内容或结果；追踪请求由本地桥接记录最小化的 `blocked` 状态，接收服务发送协议回执，不能绕过权限启动任务。只有用户明确允许该安装自动结果回传后才会启用该字段。不得从其他安装或默认 home 继承回复权限。
 
-启用后可以针对收到的那封信使用 `tailmsg --home <Tailmsg home> reply <id> <简短文本>` 回执或回传与原请求有关的结果。用 `reply_to` 关联原信，自动沿原 `from_agent` 回信。不要发送其他会话的私人历史、密钥或无关内容；不要假造设备读数。每种回执记录其发送结果，避免重复。对方明确要求 `wake=none` 或状态回执时不要制造回复循环。对于测试通知，遵守测试范围，只创建指定的本地测试产物。
+启用后，追踪请求必须按上面的流程报告进度和最终结果。普通旧格式请求需要答复时可使用 `tailmsg --home <Tailmsg home> reply <id> <简短文本>`。用 `reply_to` 关联原信，自动沿原 `from_agent` 回信。不要发送其他会话的私人历史、密钥或无关内容；不要假造设备读数。不要对纯通知自动回信。对于测试通知，遵守测试范围，只创建指定的本地测试产物。
 
 ## 运行边界
 

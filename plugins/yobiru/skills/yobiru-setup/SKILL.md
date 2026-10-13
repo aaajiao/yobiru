@@ -100,7 +100,10 @@ not survive between commands in many hosts). On Windows use `py -3 "<plugin>\scr
 8. **Verify**: `sh Y doctor`, `sh Y agents --online`, then a test message to a peer the user chose.
    For delivery, send with `--wake now` from a peer whose wake policy allows `now` and check
    `show ID` for `wake_delivery`. Report what was proven: 202 = stored, `wake_delivery.ok` = adapter
-   accepted the wake, a reply = the other agent acted.
+   accepted the wake, a final response = the agent reported its outcome. On 0.5-capable peers use
+   `request send PEER TEXT --timeout-seconds 900` and `request status ID --refresh --json` to verify
+   receipt and final outcome separately; never claim that a transport receipt proves task completion.
+   A notification (`send --kind notice`) requires no reply.
 
 ## Existing installations
 

@@ -2,7 +2,7 @@
 
 > 一句话：每台机器跑一个小收信端；谁都可以按同一条规则给任何一台机器发一封 JSON 小信；
 > 信里**不放文件本体**，只写“去我这儿哪个内网地址拉、拉到后怎么校验”；收件方自己去拉。
-> 没有中心服务器，不调度任务，不跟踪做完没做完，只负责通信。
+> 没有中心服务器，不调度任务；0.5 起可跟踪请求的回执、进度、最终结果和超时。
 > 一台机器上可以有多个 agent，用 `机器/agent` 点名，只叫醒被点名的那一个（§5.9）。
 
 ## 1. 前提
@@ -80,6 +80,8 @@ Yobiru 0.3.0 起另有 `GET /info`（发现接口，见 §9）。旧版接收端
 | `wake` | 否 | 发件方**希望**的提醒级别：`now` / `batch` / `none`，缺省等于 `batch`，其他值 400。见 §5.6 |
 | `agent` | 否 | 收件机器上**点名哪个 agent**，例如 `codex`、`grok`、`私信联系人`。不写 = 收件方的 `default_agent`。见 §5.9 |
 | `from_agent` | 否 | 发件方自己是哪个 agent，用于回信时自动点名回来。见 §5.9 |
+| `request` | 否 | 0.5 请求生命周期元数据；仅供已协商 `request-lifecycle-v1` 的请求使用，见 §10。 |
+| `response` | 否 | 0.5 请求状态或结果元数据；与原请求关联，见 §10。 |
 
 agent 名字规则：1–64 个字符，可以用中文等任意 Unicode；不能含 `/`、控制字符（含换行），首尾不能有空白。比较前做 NFC 规范化，区分大小写。
 
@@ -122,7 +124,7 @@ agent 名字规则：1–64 个字符，可以用中文等任意 Unicode；不�
    另外两条和 agent 有关（§5.9）：`agents.<名字>.wake_max` 再设一道上限；点名了不存在的 agent，`now` 降为 `batch`，谁都不叫醒。
 
    收件方把结果记在 `received.wake` 里：`{"requested": "now", "effective": "batch", "reason": "quiet hours"}`。只有 `effective == "now"` 才调用唤醒适配器；`batch` / `none` 只存储。
-7. **待处理与确认**：`tailmsg inbox --pending` 列出实际级别为 `now` / `batch` 且尚未确认的信；处理完用 `tailmsg ack <id> [...]` 标记，记录里会多一个顶层字段 `acked_at`。这只是本机记账，**不会通知发件方**；要回执就回一封 `reply_to` 的信。
+7. **待处理与确认**：`tailmsg inbox --pending` 列出实际级别为 `now` / `batch` 且尚未确认的信；处理完用 `tailmsg ack <id> [...]` 标记，记录里会多一个顶层字段 `acked_at`。这只是本机记账，**不会通知发件方**。0.5 跟踪请求必须先持久保存最终响应才能 ack，状态响应由单独的持久发件队列送回；普通通知不要求回复。见 §10。
 
 8. **唤醒接口（wake adapter）**
 
@@ -163,7 +165,7 @@ agent 名字规则：1–64 个字符，可以用中文等任意 Unicode；不�
 
    **各家 agent 的适配思路**：内置的是通用 `exec` / `webhook` 传输；Grok Bot 端到端尚未验证。可选 Codex 适配器（macOS 桌面 / Linux app-server）见 [CODEX_LOCAL.md](CODEX_LOCAL.md)。
 
-   - **Grok**：`webhook` 类型，URL 是一个由 webhook 触发的 Grok routine，密钥放在 routine 要求的请求头里。Grok 被叫醒后在自己的 box 上运行 `tailmsg inbox --pending` / `show` / `fetch` 处理信件，处理完 `ack`。
+   - **Grok**：`webhook` 类型，URL 是一个由 webhook 触发的 Grok routine，密钥放在 routine 要求的请求头里。Grok 被叫醒后在自己的 box 上运行 `tailmsg inbox --pending` / `show` / `fetch` 处理信件；跟踪请求先发 `running`，结束时用 `request respond` 保存最终结果，再 `ack`；通知处理后只需本地 ack。
    - **Codex**（服务器）：`exec` 类型，一个小脚本读取 `TAILMSG_MSG_ID`，通过 Codex app-server 用 `thread/queue/add` 把“有一封 tailmsg 新信 `<id>`，请用 `tailmsg show <id>` 查看”排进既定线程，再 `thread/queue/start`；不要用 `turn/start`，不自动批准命令，按 `id` 去重保证幂等。
    - **Claude Code**（家里电脑）：`exec` 类型，脚本把同样一句通知推进 Claude Code 的 channel；或者跑 `claude -p --resume <session> "有一封 tailmsg 新信 <id>…"`。权限按 Claude Code 自己的设置，不要在脚本里放宽。
 
@@ -181,7 +183,7 @@ agent 名字规则：1–64 个字符，可以用中文等任意 Unicode；不�
      | 写了，但本机没有这个 agent | 该名字 | `unknown` | **谁都不叫醒**（`now` 降为 `batch`），照常 202 存下并写日志 |
 
    - **选适配器**：用 `agents.<名字>.wake_adapter`；没配的话，**只有默认 agent** 回退到顶层 `wake_adapter` / `on_message`（兼容单 agent 的旧配置），其他 agent 没有适配器就不叫醒，信留在 `inbox --pending`。`exec` 适配器多一个环境变量 `TAILMSG_AGENT`。
-   - **回信**：发件方配了 `self_agent`（或用 `--as 名字`）时，信封带上 `from_agent`。收件方 `tailmsg reply <id>` 会自动把回信的 `agent` 设成原信的 `from_agent`，于是只叫醒当初发信的那个 agent。
+   - **回信**：发件方配了 `self_agent`（或用 `--as 名字`）时，信封带上 `from_agent`。收件方 `tailmsg reply <id>` 会自动把回信的 `agent` 设成原信的 `from_agent`，普通回复的唤醒目标因此是当初发信的 agent；0.5 跟踪响应始终 `wake: none`，只更新请求账本，不唤醒。
    - **收件箱**：仍然是一个目录。`tailmsg inbox --agent <名字>`（可加 `--pending`）只看点名给它的信；没写 `agent` 的信算默认 agent 的。点名了未知 agent 的信显示为 `@名字?`。
    - 点名只决定叫醒谁，**不是权限边界**：谁能发信仍然由本机访问策略决定，信依然只是请求，不是批准。
 
@@ -262,7 +264,8 @@ agent 名字规则：1–64 个字符，可以用中文等任意 Unicode；不�
 鉴权顺序与 `/msg` 相同，并且在读取任何元数据、查询任何会话名称**之前**完成：来源必须是 tailnet 地址，`tailscale whois` 查出的身份必须符合本机访问策略（本机诊断保留本机身份例外），否则 403；拒绝规则优先。
 
 ```json
-{"ok": true, "v": 1, "product": "yobiru", "version": "0.4.0", "node": "dev-server.example.ts.net",
+{"ok": true, "v": 1, "product": "yobiru", "version": "0.5.0", "node": "dev-server.example.ts.net",
+ "capabilities": ["request-lifecycle-v1"],
  "agents_total": 2, "agents_truncated": false, "generated_at": "2026-10-11T00:00:00Z",
  "agents": [
   {"agent": "codex", "default": true, "session": {
@@ -288,6 +291,121 @@ agent 名字规则：1–64 个字符，可以用中文等任意 Unicode；不�
 
 `update reminder-template systemd-user|launchd|cron --retry-notices` 打印每 15 分钟及启动后运行 `update maintain --apply` 的可选任务定义（systemd 包含 `Persistent=true`），由用户或已获授权的 agent 安装。插件升级后路径可能变化，应重新生成。没启动接收端、仍然离线或策略阻挡的旧机器不能被远端强制升级。恢复仅覆盖升级通知，普通消息没有离线自动重投承诺。
 
+## 10. 请求生命周期（Yobiru 0.5.0 起，可选）
+
+请求和通知有不同的约定：**请求必须留下回执和最终响应；通知不要求回复。**
+最终响应可以是完成、失败、拒绝或权限/环境阻塞，不等于必须执行请求里的任务。
+消息和附件仍不是授权；处理者只使用已有权限。接收端断电、agent 从未运行或网络不可达时，
+协议不能制造实际结果，发送方会看到尚未返回结果或超时，而不是虚假的完成。
+
+### 能力协商与兼容
+
+`GET /info` 的 `capabilities` 包含 `request-lifecycle-v1` 才表示支持此机制。
+`yobiru request send PEER TEXT --timeout-seconds 900` 和 `send --kind request` 默认创建跟踪请求，
+在发送前验证对端能力；旧端或无法确认能力时不悄悄退化成普通请求。
+明确接受没有回执、状态查询和最终结果约束时，才使用 `send --kind request --legacy-request`。
+旧 v1 信封仍可接收，历史 `kind=request` 本身没有生命周期保证；判断依据是 `request` 元数据。
+普通 `text`、`notice`、`yobiru-upgrade-notice` 不带请求元数据，也不自动产生状态响应。
+
+### 信封扩展与状态接口
+
+请求信封使用 `kind: "request"`，并增加：
+
+```json
+{"request": {"timeout_seconds": 900, "reply_port": 7766}}
+```
+
+`timeout_seconds` 为 1–604800 的整数；`reply_port` 为 1–65535 的整数，指定发件机器接收响应的端口。
+请求不能同时带 `response` 或 `reply_to`。接收端仍只向经过认证的原发件机器回复，
+不会把端口参数解释为其他主机或 URL。
+
+响应是一个独立、具有固定 `id` 的信封，使用 `reply_to` 指向原请求，并增加：
+
+```json
+{"kind": "request-result", "reply_to": "9f2c4e1ab07d33c5", "wake": "none",
+ "response": {"state": "completed", "seq": 3}, "text": "结果及证据……"}
+```
+
+`seq` 为从 1 开始递增的整数。`received` / `running` 使用 `kind: "request-receipt"`；
+`completed` / `failed` / `rejected` / `blocked` / `timed_out` 使用 `kind: "request-result"`。
+响应必须有 `wake: "none"`，状态、关联 ID 和认证对端都必须匹配，旧响应不能覆盖更新的结果。
+这两个保留 kind 不接受缺少 `response` 元数据的信封。
+
+`GET /requests/ID` 对有效请求返回 `{"ok": true, "request": {...}}`，
+先验证 Tailscale 身份及访问策略，再确认调用者就是原请求的认证发送机器；
+其他已认证机器或不存在的 ID 返回 404。返回状态包含 `state`、`last_state`、`deadline`、
+`overdue`、`outcome_known`、`timed_out_at`、`late`、`seq`、`submission` 和最近的 `response`。
+它不提供任意机器读取整个请求账本的接口。
+
+发送方验证响应与原请求的认证身份、agent 和 ID 匹配后，将响应保存在本机账本的
+`response_events` 中，正常接收流程不创建普通 inbox JSON，也不调用唤醒适配器。
+从 `request status REQUEST_ID --json` 取得 `response.id` 后，可用 `show RESPONSE_ID`
+查看完整响应、用 `fetch RESPONSE_ID` 获取其附件；两者可以从已认证账本读取该响应，
+无需先将它放入普通收件箱。下载文件保存到 `<home>/inbox/RESPONSE_ID/files/`，
+仍检查原认证发送方、大小及 SHA-256。不要给响应再回复、ack 或手动唤醒它。
+
+### 收到、处理中、最终响应
+
+1. 接收端通过正常 Tailscale 身份和访问策略验证，持久保存请求后，自动记录最小 `received` 回执。
+   回执不复制消息正文，不表示 agent 已阅读、接手或有权执行。自动协议响应使用 `wake: none`，
+   不再触发回复，避免循环。
+2. Agent 读取并核对授权，开始处理前执行：
+
+   ```sh
+   yobiru request respond REQUEST_ID "已接手，正在检查。" --state running
+   ```
+
+3. 处理结束必须持久保存一个最终响应，包含实际结果或明确原因：
+
+   ```sh
+   yobiru request respond REQUEST_ID "检查完成：结果及证据……" --state completed
+   # 或 --state failed / rejected / blocked
+   yobiru ack REQUEST_ID
+   ```
+
+   `completed` 是处理者报告完成；`failed` 是执行失败；`rejected` 是决定不处理；
+   `blocked` 是当前缺少权限或必要条件。`blocked` 结束这次请求的等待，并不授予缺少的权限。
+   `reply REQUEST_ID TEXT` 对跟踪请求默认按 `completed` 保存最终响应；进度必须用 `running`，
+   不能把“已经入队”当完成。`request respond` 和 `reply` 都支持 `--file PATH` 附加结果文件，
+   可配 `--ttl-hours`；跟踪回复始终沿原认证身份路由，不允许 `--agent` / `--as` / `--port` 改投。`ack` 在最终响应或明确表示结果未知的 `timed_out` 未持久保存时拒绝执行；
+   超时绝不能记为完成。
+4. 回执和响应进入接收端的持久响应发件队列，重试复用同一个响应 ID；重启后可继续发送。
+   已持久保存不等于已送达。发送方或接收端离线期间不能保证即时回执；恢复后可重投响应，
+   或由发送方主动查询。
+
+### 超时与状态查询
+
+```sh
+yobiru request status REQUEST_ID --json            # 本机保存的状态
+yobiru request status REQUEST_ID --refresh --json  # 向原接收端核对
+yobiru request list --json
+yobiru request status REQUEST_ID --direction incoming --json  # 收件端本机状态
+yobiru request maintain                                      # 单次维护和响应重试
+```
+
+请求、状态和响应队列持久保存在数据目录下 `requests/ledger.sqlite3`。
+运行中的 `serve` 自动维护期限并重试待发响应；`request maintain` 可手动运行一次。
+本地 `status` / `list` 只读并显示计算得到的超时状态；只有 outgoing 查询支持 `--refresh`，
+后者会联系原接收端并保存核对得到的响应。
+发送方在投递之前保存请求 ID 和期限，发送过程超时仍可按该 ID 核对。
+超过期限还没有最终响应时，状态显示 `timed_out`：**实际执行结果未知**，不是失败、取消、
+或允许安全重做。不要直接再发一份新请求；先刷新状态、核对接收端和实际业务效果。
+晚到的有效最终响应可以更新结果，并标明迟到。状态、响应必须与原请求及其认证对端匹配；
+其他设备不能替它报告完成。
+
+### 权限、通知和边界
+
+- `allow_replies` 控制 Codex 入口发送业务回复；升级不自动开启，也不能由对端正文改变。
+  `false` 时不得自动发送模型生成的结果或敏感内容，不得改设置来完成请求。
+  Codex 桥接记录固定的最小 `blocked` 结果并跳过模型执行。
+  接收服务的最小协议回执不包含用户内容，也不代表自动业务回复已获授权。
+- 通知处理后本地 ack 即可，不给通知或回执再发“收到”。需要升级验收结果时，
+  在升级通知之外另发一个经授权的跟踪请求；升级通知本身不要求回复。
+- 这是持久的通信状态与结果约定，不是任务调度器，也不提供任务恰好执行一次、
+  业务副作用的自动回滚，或离线设备必定完成任务的保证。接收回执也不是已读回执。
+
 ## 8. 刻意不做的事
 
-不做中心服务器，不做任务队列，不做已读回执（`ack` 只是本机记账），不做“完成”状态，不做普通消息的自动重投（唤醒适配器会有限重试；升级通知可通过上述维护任务恢复待发送状态），也不做内容加密：WireGuard 已经加密了，身份由 Tailscale 保证。需要回执的话，就回一封 `reply_to` 的信。
+不做中心服务器、共享任务调度器、已读检测或任务恰好一次执行；不替接收 agent 授权。
+普通消息没有自动重投保证（唤醒适配器有限重试，升级通知有维护恢复，0.5 请求响应有持久重试）。
+内容传输加密与机器身份由 Tailscale 提供；Yobiru 不另加静态存储加密。

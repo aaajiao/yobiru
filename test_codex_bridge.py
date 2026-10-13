@@ -12,7 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from codex_bridge import Bridge, Rejected, load_config
 
@@ -93,6 +93,88 @@ class BridgeTests(unittest.TestCase):
 
     def state(self):
         return self.bridge.status()[0]["state"]
+
+    def request_fixture(self, state="received", overdue=False):
+        path = self.message()
+        self.rewrite(path, lambda r: r["envelope"].update(
+            kind="request", request={"timeout_seconds": 900, "reply_port": 7766}))
+        ledger = Mock()
+        ledger.request_snapshot.return_value = {"state": state, "overdue": overdue}
+        self.addCleanup(patch.stopall)
+        patch("codex_bridge._POLICY_CORE", ledger).start()
+        patch("codex_bridge._access_decision", return_value=(True, "tailnet")).start()
+        self.set_reply_consent(False)
+        return path, ledger
+
+    def set_reply_consent(self, value):
+        self.bridge.config["allow_replies"] = value
+        Path(self.bridge.config_path).write_text(json.dumps({"allow_replies": value}))
+
+    def test_tracked_request_without_reply_consent_is_blocked_without_model(self):
+        path, ledger = self.request_fixture()
+        self.assertEqual("request_replies_disabled", self.bridge.ingest(path)["reason"])
+        ledger.request_record_response.assert_called_once_with(
+            self.tailmsg, "message_0001", "blocked", "Automatic agent replies are disabled on this receiver.")
+        self.assertEqual([], self.bridge.status())
+        self.assertEqual(0, self.bridge.dispatch_due()["enqueued"])
+        self.assertEqual([], self.client.calls)
+
+    def test_tracked_request_requires_final_result_in_session_prompt(self):
+        path, ledger = self.request_fixture()
+        self.set_reply_consent(True)
+        self.assertEqual("queued", self.bridge.ingest(path)["status"])
+        self.assertEqual(1, self.bridge.dispatch_due()["enqueued"])
+        prompt = self.client.calls[0][1]["prompt"]
+        self.assertIn("tracked Yobiru request", prompt)
+        self.assertIn("request status ID --direction incoming --json", prompt)
+        self.assertIn("verified final result", prompt)
+        self.assertIn("A handoff is not a final result", prompt)
+        self.assertNotIn("PRIVATE", prompt)
+        ledger.request_record_response.assert_not_called()
+
+    def test_request_permission_revoked_between_ingest_and_dispatch(self):
+        path, ledger = self.request_fixture()
+        self.set_reply_consent(True)
+        self.bridge.ingest(path)
+        Path(self.bridge.config_path).write_text(json.dumps({"allow_replies": False}))
+        self.assertEqual(1, self.bridge.dispatch_due()["skipped"])
+        self.assertEqual([], self.client.calls)
+        ledger.request_record_response.assert_called_once()
+
+    def test_missing_request_permission_config_never_reuses_old_consent(self):
+        path, ledger = self.request_fixture()
+        self.set_reply_consent(True)
+        self.bridge.ingest(path)
+        Path(self.bridge.config_path).unlink()
+        self.assertEqual(1, self.bridge.dispatch_due()["skipped"])
+        self.assertEqual([], self.client.calls)
+        ledger.request_record_response.assert_not_called()
+
+    def test_finished_and_expired_requests_never_start_a_new_turn(self):
+        path, ledger = self.request_fixture()
+        self.set_reply_consent(True)
+        for state in ("completed", "failed", "blocked", "rejected", "timed_out"):
+            ledger.request_snapshot.return_value = {"state": state, "overdue": False}
+            self.assertEqual("skipped", self.bridge.ingest(path)["status"])
+        ledger.request_snapshot.return_value = {"state": "received", "overdue": True}
+        self.assertEqual("request_expired", self.bridge.ingest(path)["reason"])
+        ledger.request_record_response.assert_not_called()
+        self.assertEqual([], self.bridge.status())
+
+    def test_request_expiring_after_enqueue_is_not_executed(self):
+        path, ledger = self.request_fixture()
+        self.set_reply_consent(True)
+        self.bridge.ingest(path)
+        ledger.request_snapshot.return_value = {"state": "timed_out", "overdue": True}
+        self.assertEqual(1, self.bridge.dispatch_due()["skipped"])
+        self.assertEqual([], self.client.calls)
+
+    def test_notification_prompt_does_not_request_a_reply(self):
+        path = self.message()
+        self.rewrite(path, lambda r: r["envelope"].update(kind="notice"))
+        self.bridge.ingest(path)
+        self.bridge.dispatch_due()
+        self.assertIn("Do not send an automatic reply", self.client.calls[0][1]["prompt"])
 
     def test_deduplication_and_metadata_only_notification(self):
         path = self.message()

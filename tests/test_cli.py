@@ -94,6 +94,18 @@ class LocateTests(Base):
 
 
 class ReadOnlyTests(Base):
+    def test_packaged_request_queries_need_no_network_and_create_no_ledger(self):
+        self.write_config({})
+        plugin_before, user_before = snapshot(PKG.plugin), snapshot(self.user)
+        r = self.yobiru("request", "list", "--json")
+        self.assertEqual(0, r.returncode, r.stderr)
+        self.assertEqual([], json.loads(r.stdout))
+        r = self.yobiru("request", "status", "0011223344556677", "--json")
+        self.assertNotEqual(0, r.returncode)
+        self.assertIn("no tracked outgoing request", r.stderr)
+        self.assertEqual(user_before, snapshot(self.user))
+        self.assertEqual(plugin_before, snapshot(PKG.plugin))
+
     def test_install_and_read_only_commands_create_nothing(self):
         plugin_before, user_before = snapshot(PKG.plugin), snapshot(self.user)
         state = PKG.fake_state("ro", calls=str(PKG.root / "ro-calls.log"))

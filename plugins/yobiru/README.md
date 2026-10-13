@@ -5,7 +5,7 @@
 Agent-to-agent messages, file handoff and receiver-controlled wake-ups between machines on your own
 Tailscale network, using the tailmsg protocol v1. One package for Codex, Cursor and Grok Bot.
 
-Version 0.4.2. Source: <https://github.com/chekusu/yobiru>. Not submitted to or reviewed by any
+Version 0.5.0. Source: <https://github.com/chekusu/yobiru>. Not submitted to or reviewed by any
 marketplace.
 
 ## Contents
@@ -18,8 +18,8 @@ marketplace.
 | `skills/yobiru-setup` | Guided onboarding (also without Tailscale yet), setup and repair of this machine. |
 | `skills/yobiru-sessions` | Which machines and agents are online, and which session (name + exact id) handles each. |
 | `skills/yobiru-upgrade` | Update checks, safe upgrades and versioned notices to your other installations. |
-| `skills/yobiru-send` | Send messages, structured data and files; reply. |
-| `skills/yobiru-inbox` | Read, fetch, process and acknowledge received messages. |
+| `skills/yobiru-send` | Send messages, data and files; track requests with receipts, deadlines and final outcomes. |
+| `skills/yobiru-inbox` | Read, fetch, process and report outcomes; acknowledge locally. Notifications need no reply. |
 | `skills/yobiru-wake` | Who may wake which agent, and how (program, Grok Bot routine webhook, Codex bridge). |
 | `scripts/yobiru`, `scripts/yobiru.py` | The `yobiru` command: setup, doctor and status, plus the messaging commands. |
 | `scripts/tailmsg.py` | The bundled tailmsg CLI and receiver (stdlib only). |
@@ -48,6 +48,8 @@ sh "$Y" setup --agent codex --self-agent codex --default-agent codex --apply
 sh "$Y" install-runtime --apply                          # stable tailmsg.py in the data home
 sh "$Y" service-template systemd-user                    # print a service definition to install
 sh "$Y" send laptop/codex "hello" --file ./notes.md      # 202 = delivered (not done)
+sh "$Y" request send laptop/codex "Review the notes and report your result." --timeout-seconds 900 --wake now
+sh "$Y" request status REQUEST_ID --refresh --json
 sh "$Y" inbox --pending --agent codex
 sh "$Y" agents --online                                  # versions, agents, session names + ids
 sh "$Y" update check                                     # official releases only
@@ -56,6 +58,32 @@ sh "$Y" update check                                     # official releases onl
 Data home: `--home DIR` (before the command), else `$TAILMSG_HOME`, else `~/.tailmsg`. Existing
 tailmsg homes are used as they are; `setup` and `wake-config` only add what you name, need
 `--replace` to change existing values, and back up `config.json` on every write.
+
+## Request lifecycle
+
+`request send` and `send --kind request` require a peer that advertises `request-lifecycle-v1` in
+`/info`. The receiver records a minimal `received` receipt, then the agent reports `running` and
+one final `completed`, `failed`, `rejected` or `blocked` outcome. The result is durably saved before
+local `ack` and retried with a stable response ID. A timeout is queryable as `timed_out`, meaning
+actual execution is unknown; it does not cancel the task. Late final results can reconcile it.
+
+Use `request status ID --refresh --json` to ask the original receiver, or omit `--refresh` for local
+state. Receivers use `request status ID --direction incoming --json`. `request list --json` lists
+both directions. A running receiver maintains the ledger and response queue automatically;
+`request maintain` runs one pass manually. No exactly-once execution or offline completion is promised.
+
+Tracked responses stay in the authenticated request ledger, not the ordinary inbox, and never wake
+an agent. Get `response.id` from `request status ID --json`, then use `show RESPONSE_ID` to inspect
+the result or `fetch RESPONSE_ID` to retrieve verified attachments into `<home>/inbox/RESPONSE_ID/files/`.
+Do not process protocol responses as new tasks or send replies to them.
+
+Notifications (`--kind notice`, including upgrade notices) need no reply. Send a separate tracked
+request if you need a result. Old peers need upgrading; `send --kind request --legacy-request` is an
+explicit opt-out without lifecycle guarantees. Protocol replies do not wake agents or cause loops.
+
+Codex business replies stay under local `allow_replies` authorization. If disabled, the bridge
+records a minimal `blocked` result without running the model. Enabling replies does not grant new
+task execution authority. Preserve local scope restrictions when updating dispatcher instructions.
 
 ## Commands
 
@@ -69,7 +97,9 @@ tailmsg homes are used as they are; `setup` and `wake-config` only add what you 
 | `setup`, `wake-config`, `install-runtime` | only with `--apply` |
 | `service-template KIND` | never (prints a definition) |
 | `codex-bridge status` | never; `install` / `rollback` (macOS or Linux) support `--dry-run` (no writes) and `--no-start` (files only) |
-| `send`, `reply`, `inbox`, `show`, `fetch`, `ack`, `wake`, `serve` | tailmsg commands, passed through unchanged |
+| `request send`, `request respond`, `request maintain` | save request/response state; maintain may retry responses over the network |
+| `request status`, `request list` | read-only; status `--refresh` contacts the original receiver and saves the reconciled response |
+| `send`, `reply`, `inbox`, `show`, `fetch`, `ack`, `wake`, `serve` | tailmsg commands; tracked requests require a durable outcome before ack |
 
 ## Safety
 

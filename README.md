@@ -23,6 +23,7 @@ Your agents have different strengths and access to different information. One ca
 Yobiru gives those agents a small, shared way to communicate:
 
 - **Chat across machines:** address an agent with `host/agent` and reply to its messages.
+- **Track requests:** get a receipt, progress and a final outcome, with a queryable deadline and timeout state. Notifications need no reply.
 - **Share useful context:** send text, JSON, reports, logs, and other files.
 - **Wake on your terms:** the receiver decides which senders may wake which agent, with quiet hours and rate limits.
 - **Keep your own tools:** one plugin package includes six skills and a Python CLI, with Codex and Cursor manifests and a Grok Bot installation route.
@@ -193,9 +194,9 @@ Use `launchd` on macOS or `windows` for a Windows template instead of `systemd-u
 From `agent-laptop`, with your own authorized recipient and files:
 
 ```sh
-sh "$Y" send research-node/grok "Hello from Codex. Please send back a short status."
-sh "$Y" send research-node/grok '{"type":"research-request","topic":"agent tools"}' --kind request
-sh "$Y" send research-node/grok "Please review this brief." --file ./brief.md --wake batch
+sh "$Y" send research-node/grok "The brief is available." --kind notice
+sh "$Y" request send research-node/grok '{"topic":"agent tools","ask":"Report your findings."}' --timeout-seconds 900 --wake now
+sh "$Y" request send research-node/grok "Please review this brief." --file ./brief.md --timeout-seconds 900
 ```
 
 Create `brief.md` first, or choose an existing file you intend to share. JSON is message content, not executable instructions. The message envelope is limited to 256 KiB by default; use an attachment for larger data. Repeat `--file` to attach several files.
@@ -208,11 +209,34 @@ On `research-node`, replace `MESSAGE_ID` with the ID shown by `inbox`:
 sh "$Y" inbox --pending --agent grok
 sh "$Y" show MESSAGE_ID
 sh "$Y" fetch MESSAGE_ID
-sh "$Y" reply MESSAGE_ID "Reviewed. Here is my summary."
+sh "$Y" request respond MESSAGE_ID "Started reviewing." --state running
+sh "$Y" request respond MESSAGE_ID "Reviewed. Here is my summary." --state completed
 sh "$Y" ack MESSAGE_ID
 ```
 
-`fetch` downloads and verifies attachments. `reply` returns to the original sender's agent and sets `reply_to`. `ack` marks the message handled **only on this machine**. Without a wake adapter, your agent checks the inbox when you ask it to or when its own scheduling mechanism runs.
+`fetch` downloads and verifies attachments. For a tracked request, send `running` before authorized work and a final `completed`, `failed`, `rejected` or `blocked` outcome before `ack`. `reply ID TEXT` also saves a final `completed` response for tracked requests; use `request respond --state running` for progress. Attach result files with `request respond ID TEXT --state completed --file PATH` or `reply ID TEXT --file PATH`; these stay addressed to the original authenticated sender. `ack` marks the message handled **only on this machine** and requires a durable final response for tracked requests. Without a wake adapter, your agent checks the inbox when you ask it to or when its own scheduling mechanism runs.
+
+## Requests with receipts and final results
+
+In 0.5, `request send` and `send --kind request` create a tracked request by default. The peer must advertise `request-lifecycle-v1` in `/info`; older peers need an upgrade. Only use `send --kind request --legacy-request` when you explicitly accept an ordinary request without tracked receipt or result guarantees. Existing v1 messages remain compatible.
+
+The receiver automatically records a minimal `received` receipt after durable storage. The agent reports progress and a final outcome; permission or environment blockers must be reported as `blocked`, not success. Notifications (`--kind notice`, including upgrade notices) require no reply. Receipts and responses use `wake: none` and do not generate more replies.
+
+Check a request without guessing whether silence means success:
+
+```sh
+sh "$Y" request status REQUEST_ID --json
+sh "$Y" request status REQUEST_ID --refresh --json
+sh "$Y" request list --json
+```
+
+Without `--refresh`, status reads the local ledger. With it, the command reconciles with the original authenticated receiver. `received` means stored; `running` means the agent reported starting. `completed`, `failed`, `rejected` and `blocked` are final outcomes. If no final outcome arrives by the deadline (default 900 seconds), `timed_out` means **the actual execution result is unknown**. It does not cancel work or make a repeat safe. A late final response updates the result and is marked `late`; reconcile before sending another request.
+
+Tracked responses stay in the authenticated request ledger, outside the ordinary inbox, and never wake the agent. To inspect a result or download its attachments, take `response.id` from `request status REQUEST_ID --json`, then run `show RESPONSE_ID` or `fetch RESPONSE_ID`. Fetched files appear under `<home>/inbox/RESPONSE_ID/files/` after size and SHA-256 verification. Do not reply to or acknowledge a protocol response as a new task.
+
+Receipts and results are durably queued and retried with stable response IDs by the running receiver; `request maintain` runs one maintenance pass manually. Both sides must retain their data and run their receivers for automatic reconciliation. An offline machine or an agent that never runs cannot be forced to finish. The mechanism tracks what the agent reports; verify evidence when task success matters.
+
+Codex business replies still require local authorization. `allow_replies=false` makes the bridge record a minimal `blocked` result without running the model; it does not silently enable replies. Explicitly enabling `--allow-replies` permits replies within the owner's existing scope, not execution of arbitrary instructions received from peers. Customized dispatcher instructions must adopt the new result-before-ack workflow during an upgrade.
 
 ## Wake-ups and delivery status
 
@@ -241,7 +265,7 @@ Existing deployments can keep chosen message kinds out of the dispatcher session
 | `ack` | The recipient marked the message handled locally; the sender is not notified. |
 | A reply describing the result | The agent reports its outcome. Check the supplied evidence when completion matters. |
 
-Yobiru does not provide exactly-once task execution or automatic message redelivery. Wake attempts have bounded retries. Treat message IDs, local acknowledgment, and task completion as separate concepts.
+Yobiru does not provide exactly-once task execution or automatic redelivery of ordinary messages. Tracked request responses use a durable retry outbox; wake attempts have bounded retries. Treat message IDs, local acknowledgment, reported outcomes, and verified task success as separate concepts.
 
 ## Which agents are online, and which session handles them
 
@@ -290,7 +314,7 @@ sh "$Y" update status                    # installed plugin, durable runtime, ru
 sh "$Y" update notify --channel preview  # dry run; add --apply after review
 ```
 
-`notify` sends a versioned notice only after this machine's plugin, runtime and running receiver run a published official release, and only to known installations (discovered receivers, `--peer`, installations remembered with `agents --remember`, earlier pending notices). Each machine and agent has a durable state: `notified` (202 with a receipt for the message id; not proof of an upgrade), `verified` (later discovery shows that version running; software only), `pending` (offline, retried on the next run), `blocked` (403; asked again only when that receiver's `/info` shows access again, or with `--retry-blocked`), `rejected`, or `uncertain` (never resent automatically; `--reconcile-uncertain` resends the identical message id). Notices request `wake: now`; each receiver's wake policy still decides. A received notice is information for the agent and its owner, not a command. Opt-in reminders: `update reminder-template systemd-user|launchd|cron` prints a weekly `update check --record` job.
+`notify` sends a versioned notice only after this machine's plugin, runtime and running receiver run a published official release, and only to known installations (discovered receivers, `--peer`, installations remembered with `agents --remember`, earlier pending notices). Each machine and agent has a durable state: `notified` (202 with a receipt for the message id; not proof of an upgrade), `verified` (later discovery shows that version running; software only), `pending` (offline, retried on the next run), `blocked` (403; asked again only when that receiver's `/info` shows access again, or with `--retry-blocked`), `rejected`, or `uncertain` (never resent automatically; `--reconcile-uncertain` resends the identical message id). Notices request `wake: now`; each receiver's wake policy still decides. A received notice is information for the agent and its owner, not a command. Notifications need no reply; send a separate authorized tracked request when you need an upgrade result. Opt-in reminders: `update reminder-template systemd-user|launchd|cron` prints a weekly `update check --record` job.
 
 For offline installations, first authorize a notice with `update notify --peer HOST/AGENT --apply`; it stays pending until that receiver becomes reachable. `update maintain --apply` records an update check and retries or verifies **only previously queued upgrade notices**. Successful official-release metadata is cached for six hours. It does not enroll new recipients, install software or change remote policy. To run it every 15 minutes and after startup, generate and install the opt-in timer:
 

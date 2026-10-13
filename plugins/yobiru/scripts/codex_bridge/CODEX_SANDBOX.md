@@ -17,15 +17,20 @@ included in each trusted bridge notification). `bridge_home` can be outside the 
 |---|---|---|
 | `ack ID` | `<tailmsg_home>/inbox` | No |
 | Dispatcher deduplication and handoff records | `<bridge_home>/handled` | No |
-| Text-only `reply ID TEXT` | None beyond the handled records used to track the reply | Yes |
-| `reply ID TEXT --file PATH` | `<tailmsg_home>/outbox` | Yes |
+| Tracked `request respond ID TEXT` / `reply ID TEXT` | `<tailmsg_home>/requests` | No; the receiver sends the durable response |
+| Tracked `reply ID TEXT --file PATH` | `<tailmsg_home>/requests`, `<tailmsg_home>/outbox` | No; the receiver serves the files |
+| Legacy text-only `reply ID TEXT` | None beyond the handled records used to track the reply | Yes |
+| Legacy `reply ID TEXT --file PATH` | `<tailmsg_home>/outbox` | Yes |
 | `fetch ID` | `<tailmsg_home>/inbox` | Yes |
 
 `ack` writes a temporary file beside `inbox/<id>.json` and atomically replaces that JSON, so giving
 write access to only the existing file is insufficient. Attachment replies snapshot files under
 `outbox/<token>/files/` and write `meta.json`. Fetches use `inbox/<id>/files/`, including temporary
 `.part` files. Ordinary text replies do not persist an outbox entry; the dispatcher must record the
-send result in its handled record to avoid repeated replies.
+send result in its handled record to avoid repeated replies. Tracked responses instead persist the
+result and an immutable retry envelope in `requests/ledger.sqlite3`. SQLite needs write access to
+the containing directory for its journal. Local `request status` reads this ledger; `--refresh`
+also needs network access and writes verified remote responses to it.
 
 Keep `config.json`, `codex-bridge.json`, the installed code and workflow, and the bridge queue
 database read-only to the dispatcher. Do **not** add the entire data home or bridge state directory
@@ -44,11 +49,11 @@ YOBIRU_DATA="$HOME/.tailmsg"
 YOBIRU_BRIDGE="$YOBIRU_DATA/codex-bridge"
 test -f "$YOBIRU_DATA/config.json" && test -f "$YOBIRU_DATA/codex-bridge.json" || exit 1
 umask 077
-mkdir -p "$YOBIRU_DATA/inbox" "$YOBIRU_DATA/outbox" "$YOBIRU_BRIDGE/handled"
+mkdir -p "$YOBIRU_DATA/inbox" "$YOBIRU_DATA/outbox" "$YOBIRU_DATA/requests" "$YOBIRU_BRIDGE/handled"
 mkdir -p "$HOME/yobiru-dispatcher"
 ```
 
-Pre-create **all three** directories, even when outbox will remain read-only. The Tailmsg CLI
+Pre-create **all four** directories, even when outbox will remain read-only. The Tailmsg CLI
 initializes its home, inbox and outbox on every invocation and creates `config.json` if missing.
 An established installation must already have that configuration; do not widen access just to let
 a dispatcher create it. The handled directory belongs to the workflow and is not created by the
@@ -66,7 +71,7 @@ cd /home/you/yobiru-dispatcher
 codex app-server --listen unix:///home/you/.codex/yobiru.sock \
   -c 'sandbox_mode="workspace-write"' \
   -c 'approval_policy="never"' \
-  -c 'sandbox_workspace_write.writable_roots=["/home/you/.tailmsg/inbox","/home/you/.tailmsg/codex-bridge/handled"]' \
+  -c 'sandbox_workspace_write.writable_roots=["/home/you/.tailmsg/inbox","/home/you/.tailmsg/requests","/home/you/.tailmsg/codex-bridge/handled"]' \
   -c 'sandbox_workspace_write.network_access=false'
 ```
 
@@ -78,7 +83,8 @@ that exact UUID as appropriate. Do not create a replacement thread or point the 
 Hosts and managed policies may impose additional restrictions.
 
 Only if the owner has authorized automatic replies, preserve/enable `allow_replies` through the
-bridge's normal installation options and allow the network access needed to reach Tailscale peers:
+bridge's normal installation options. Tracked responses need only local ledger writes: the receiver
+delivers them. Legacy direct replies and attachment downloads also need network access:
 
 ```text
 -c 'sandbox_workspace_write.network_access=true'
@@ -87,13 +93,15 @@ bridge's normal installation options and allow the network access needed to reac
 For authorized replies **with attachments**, also replace the writable-roots option with:
 
 ```text
--c 'sandbox_workspace_write.writable_roots=["/home/you/.tailmsg/inbox","/home/you/.tailmsg/codex-bridge/handled","/home/you/.tailmsg/outbox"]'
+-c 'sandbox_workspace_write.writable_roots=["/home/you/.tailmsg/inbox","/home/you/.tailmsg/requests","/home/you/.tailmsg/codex-bridge/handled","/home/you/.tailmsg/outbox"]'
 ```
 
 Network access is also needed for authorized attachment downloads (`fetch`). It is not required
 for `ack` or handled records. This Codex network switch is broader than a per-command or tailnet-only
 grant; keep it off when the workflow does not need networking. `allow_replies=false` must still mean
-**no outgoing reply**, even if networking is available for another task. Network availability alone
+**no agent-generated business reply**, even if networking is available for another task. For tracked
+requests the trusted bridge may persist a fixed `blocked` protocol result without starting the model;
+the receiver delivers minimal receipt/status metadata. Network availability alone
 never authorizes sending. Normal Tailscale CLI/daemon access and peer network policy must also work;
 do not work around a host denial by running the dispatcher with unrestricted permissions.
 
@@ -111,6 +119,7 @@ Then use an authorized test message: inspect its contents, persist its handled r
 configured directory, complete the bounded work and only then run:
 
 ```sh
+python3 /home/you/.tailmsg/tailmsg.py --home /home/you/.tailmsg request respond MESSAGE_ID 'Verified result' --state completed
 python3 /home/you/.tailmsg/tailmsg.py --home /home/you/.tailmsg ack MESSAGE_ID
 python3 /home/you/.tailmsg/tailmsg.py --home /home/you/.tailmsg show MESSAGE_ID
 ```
